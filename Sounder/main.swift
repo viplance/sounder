@@ -80,6 +80,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if CommandLine.arguments.contains("--ui-test") { uiTest() }
     }
     private func installTitlebarControls() {
+        let icon = Bundle.main.url(forResource: "AppIcon", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
+        if let icon { NSApp.applicationIconImage = icon }
         projectLabel = textButton("MY PROJECT", size: 10, action: #selector(renameProject), cursor: .iBeam)
         projectLabel.toolTip = "Rename project"; projectLabel.lineBreakMode = .byTruncatingTail
         projectLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 320).isActive = true

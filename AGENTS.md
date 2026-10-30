@@ -83,7 +83,7 @@
 
 ## Window header
 
-- Keep the editable project name, clickable project audio quality immediately after it, and Open project, Save project, Export controls in the native compact titlebar toolbar. Hide the system window title and omit the sounder logo/wordmark. Place the PLAYER/FRAGMENTS/TRACKS/VIEW panel directly below the titlebar, with no separate project header row or extra vertical gap.
+- Keep the editable project name, clickable project audio quality immediately after it, and Open project, Save project, Export controls in the native compact titlebar toolbar. Hide the system window title. Omit the app icon and Sounder wordmark from the titlebar; retain the application icon for the Dock and Finder. Place the PLAYER/FRAGMENTS/TRACKS/VIEW panel directly below the titlebar, with no separate project header row or extra vertical gap.
 
 ## Export
 

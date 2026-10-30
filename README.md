@@ -6,6 +6,7 @@ A native audio recorder and editor for macOS 14+ (Apple Silicon), built with App
 
 - `npm start` — terminates existing processes with the exact name `Sounder`, waits for them to exit, builds and launches the app, and verifies that exactly one process is running.
 - `npm run build:app` — creates a Release build at `build/Release/Sounder.app`. Uses Developer ID signing when the certificate is available; otherwise, explicitly reports that local ad-hoc signing is being used.
+- `npm run build:icons` — regenerates all ten macOS AppIcon sizes from the original artwork. See [icon artwork and generation prompt](Design/AppIcon/README.md).
 - `npm test` — builds the app and runs audio engine and editing tests.
 - `npm run release:local` — creates a signed DMG without notarization.
 - `npm run release` — creates a signed and notarized DMG; the Keychain profile is set through `NOTARY_PROFILE` (default: `falcon-notary`).
