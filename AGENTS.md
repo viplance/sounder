@@ -96,3 +96,11 @@
 - Show Metronome only in Tempo mode, horizontally to the left of the Tempo button. BPM uses exactly the timer font (25-point monospaced digits, light weight).
 - Tempo toggles a 4/4 bar/beat ruler and replaces the timer with clickable BPM (20–300, initially 120). A Metronome checkbox controls audible clicks during playback and recording, with a stronger first beat every four beats. Persist BPM, ruler mode and metronome choice in the project.
 - Derive metronome timing from audio frames and absolute timeline position, not UI timers. Seeking and recording restarts must preserve beat alignment. Mix playback clicks only after track effects; route recording clicks to the output mixer separately from the microphone input tap. Never include the metronome in recorded files or exports. Tempo and metronome changes must not stop active capture or playback.
+
+## Track dragging
+
+- Preview track order and nesting live during header dragging, including the entire child subtree and all waveforms. The top/bottom quarter of a target row inserts before/after its subtree; the middle nests under it. Empty space below the rows moves to the root at the bottom. Resolve targets against a stable drag baseline to avoid oscillation. Commit once on mouse-up with one Undo entry; Escape/Stop cancels without a model change, and never permit nesting into the dragged subtree.
+
+## Settings windows
+
+- Audio settings, Track effects, Export audio and Tempo show their title and controls without an app icon or descriptive introductory text. Remove the space reserved for those descriptions and icon area; keep a compact top margin above the heading. Use CompactSettingsAlert for modal settings forms rather than the standard alert icon layout. Keep actionable export validation errors visible only when needed.

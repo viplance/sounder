@@ -101,6 +101,8 @@ final class Timeline: NSView {
     var rangeAnchor: Double?
     var didDragRange = false
     var trackDrag: UUID?
+    private var trackDragRows: [(Track, Int)]?
+    private(set) var trackPreview: [Track]?
     var pendingTrackRename: UUID?
     let nameField = InlineNameField(frame: .zero)
     private(set) var renamingTrack: UUID?
@@ -143,12 +145,63 @@ final class Timeline: NSView {
         let magnitude = pow(10, floor(log10(max(1, required))))
         return [1.0, 2, 5, 10].map { $0 * magnitude }.first { $0 >= required } ?? magnitude * 10
     }
-    func refresh() {
-        rows = []
+    private func orderedRows(_ tracks: [Track]) -> [(Track, Int)] {
+        var result: [(Track, Int)] = []
         func append(_ parent: UUID?, depth: Int) {
-            for track in editor.project.tracks where track.parent == parent { rows.append((track, depth)); append(track.id, depth: depth + 1) }
+            for track in tracks where track.parent == parent {
+                result.append((track, depth)); append(track.id, depth: depth + 1)
+            }
         }
         append(nil, depth: 0)
+        return result
+    }
+    private func previewTrackMove(at point: NSPoint) {
+        guard let source = trackDrag, let baseline = trackDragRows else { return }
+        trackPreview = nil
+        guard isTrackPoint(point), visibleRect.contains(point) else { refresh(); return }
+        let tracks = baseline.map { $0.0 }
+        var movingIDs: Set<UUID> = [source]
+        var count = 0
+        while movingIDs.count != count {
+            count = movingIDs.count
+            for track in tracks where track.parent.map({ movingIDs.contains($0) }) == true { movingIDs.insert(track.id) }
+        }
+        var remaining = tracks.filter { !movingIDs.contains($0.id) }
+        let moving = tracks.filter { movingIDs.contains($0.id) }
+        let position = max(0, (point.y - ruler) / rowHeight)
+        let row = Int(position)
+        var parent: UUID?
+        var insertion: Int
+        if row >= baseline.count {
+            parent = nil; insertion = remaining.count
+        } else {
+            let target = baseline[row].0
+            guard !movingIDs.contains(target.id), let targetIndex = remaining.firstIndex(where: { $0.id == target.id }) else { refresh(); return }
+            let fraction = position - floor(position)
+            if fraction < 0.25 {
+                parent = target.parent; insertion = targetIndex
+            } else {
+                parent = fraction > 0.75 ? target.parent : target.id
+                // Append after the target's complete subtree, preserving its existing children.
+                var subtree: Set<UUID> = [target.id]
+                insertion = targetIndex + 1
+                while insertion < remaining.count, remaining[insertion].parent.map({ subtree.contains($0) }) == true {
+                    subtree.insert(remaining[insertion].id); insertion += 1
+                }
+            }
+        }
+        var block = moving
+        if let index = block.firstIndex(where: { $0.id == source }) { block[index].parent = parent }
+        remaining.insert(contentsOf: block, at: insertion)
+        trackPreview = remaining
+        refresh()
+    }
+    func cancelTrackDrag() {
+        trackPreview = nil; trackDragRows = nil; trackDrag = nil; pendingTrackRename = nil
+        refresh()
+    }
+    func refresh() {
+        rows = orderedRows(trackPreview ?? editor.project.tracks)
         window?.invalidateCursorRects(for: self)
         let visible = viewportSize
         editor.zoom = max(minimumZoom, editor.zoom)
@@ -490,7 +543,12 @@ final class Timeline: NSView {
             editor.update(); autoscrollRange(with: event); return
         }
         guard !editor.busy else { return }
-        if trackDrag != nil, hypot(p.x - dragStart.x, p.y - dragStart.y) > 4 { pendingTrackRename = nil; editor.hint(.nestTracks, "Drag tracks to nest") }
+        if trackDrag != nil, trackDragRows != nil || hypot(p.x - dragStart.x, p.y - dragStart.y) > 4 {
+            pendingTrackRename = nil
+            if trackDragRows == nil { trackDragRows = orderedRows(editor.project.tracks) }
+            editor.hint(.nestTracks, "Drag tracks to nest")
+            previewTrackMove(at: p)
+        }
         if let id = dragClip, hypot(p.x - dragStart.x, p.y - dragStart.y) > 2 || didCheckpoint {
             dragDestination = dropTrack(at: p)
             if !didCheckpoint { editor.checkpoint(); didCheckpoint = true }
@@ -517,7 +575,17 @@ final class Timeline: NSView {
            isTrackPoint(p), row >= 0, row < rows.count, rows[row].0.id == id, trackNameHitRect(row: row, depth: rows[row].1).contains(p) {
             renameID = id
         }
-        if let id = trackDrag, hypot(p.x - dragStart.x, p.y - dragStart.y) > 8, row >= 0, row < rows.count, isTrackPoint(p) { editor.reparent(id, to: rows[row].0.id) }
+        if trackDragRows != nil {
+            // Resolve against the unchanged drag baseline, never the reordered preview.
+            previewTrackMove(at: p)
+            let preview = trackPreview
+            trackPreview = nil; trackDragRows = nil
+            if let preview, !editor.busy,
+               preview.map({ $0.id }) != editor.project.tracks.map({ $0.id }) || preview.map({ $0.parent }) != editor.project.tracks.map({ $0.parent }) {
+                editor.checkpoint(); editor.project.tracks = preview; editor.update("Track hierarchy updated")
+            }
+            refresh()
+        }
         if let id = dragClip, let source = dragTrack, let destination = dropTrack(at: p), destination != source {
             if let i = editor.project.tracks.firstIndex(where: { $0.id == source }), let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == id }), let target = editor.project.tracks.firstIndex(where: { $0.id == destination }) {
                 if !didCheckpoint { editor.checkpoint() }

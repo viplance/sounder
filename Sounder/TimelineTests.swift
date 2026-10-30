@@ -76,3 +76,56 @@ extension AppDelegate {
         editor.dirty = false; refresh()
     }
 }
+
+extension AppDelegate {
+    func verifyTrackDragUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        let root = original.tracks[0], child = original.tracks[1], other = original.tracks[2]
+        func point(_ row: Int, fraction: CGFloat) -> NSPoint {
+            NSPoint(x: timeline.pinnedHeaderX + 165, y: timeline.ruler + (CGFloat(row) + fraction) * timeline.rowHeight)
+        }
+        func send(_ type: NSEvent.EventType, _ point: NSPoint) {
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            if type == .leftMouseDown { timeline.mouseDown(with: event) }
+            else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
+            else { timeline.mouseUp(with: event) }
+        }
+        refresh()
+        let top = point(0, fraction: 0.1)
+        send(.leftMouseDown, point(2, fraction: 0.4)); send(.leftMouseDragged, top)
+        try check(timeline.rows.map { $0.0.id } == [other.id, root.id, child.id] && editor.project.tracks.map { $0.id } == original.tracks.map { $0.id }, "Dragging above a track previews its new order before mouse-up without editing the project")
+        send(.leftMouseDragged, top)
+        try check(timeline.rows.map { $0.0.id } == [other.id, root.id, child.id], "Repeated drag events at the same position keep a stable preview")
+        send(.leftMouseUp, top)
+        try check(editor.project.tracks.map { $0.id } == [other.id, root.id, child.id], "Mouse-up commits exactly the previewed track order")
+        editor.undo()
+        try check(editor.project.tracks.map { $0.id } == original.tracks.map { $0.id }, "One Undo restores the full track arrangement")
+        editor.redo(); try check(editor.project.tracks.first?.id == other.id, "Redo restores the drag arrangement")
+        editor.undo()
+        let bottom = point(2, fraction: 0.9)
+        send(.leftMouseDown, point(0, fraction: 0.4)); send(.leftMouseDragged, bottom)
+        try check(timeline.rows.map { $0.0.id } == [other.id, root.id, child.id] && timeline.rows[2].1 == 1, "Dragging downward moves a parent and its complete subtree together in the preview")
+        send(.leftMouseUp, bottom); editor.undo()
+        let middle = point(2, fraction: 0.5)
+        send(.leftMouseDown, point(0, fraction: 0.4)); send(.leftMouseDragged, middle)
+        try check(timeline.rows.map { $0.0.id } == [other.id, root.id, child.id] && timeline.rows.map { $0.1 } == [0, 1, 2] && editor.project.tracks[0].parent == nil, "Dragging into a row previews nesting and updates indentation for the entire subtree")
+        send(.leftMouseUp, middle)
+        try check(editor.project.tracks.first(where: { $0.id == root.id })?.parent == other.id && editor.project.tracks.first(where: { $0.id == child.id })?.parent == root.id, "Nesting commits the preview while preserving existing child relationships")
+        editor.undo()
+        send(.leftMouseDown, point(0, fraction: 0.4)); send(.leftMouseDragged, point(1, fraction: 0.5))
+        try check(timeline.trackPreview == nil && timeline.rows.map { $0.0.id } == original.tracks.map { $0.id }, "A parent cannot be dragged into its own descendant")
+        send(.leftMouseUp, point(1, fraction: 0.5))
+        send(.leftMouseDown, point(2, fraction: 0.4)); send(.leftMouseDragged, top)
+        stop()
+        try check(timeline.trackDrag == nil && timeline.trackPreview == nil && editor.project.tracks.map { $0.id } == original.tracks.map { $0.id }, "Escape/Stop cancels the preview without changing the project")
+        let blank = point(3, fraction: 0.3)
+        send(.leftMouseDown, point(1, fraction: 0.4)); send(.leftMouseDragged, blank)
+        try check(timeline.rows.last?.0.id == child.id && timeline.rows.last?.1 == 0, "Dragging into empty space previews moving a nested track to the root at the bottom")
+        send(.leftMouseUp, blank)
+        try check(editor.project.tracks.last?.id == child.id && editor.project.tracks.last?.parent == nil, "Moving a nested track to the bottom commits the shown root position")
+        editor.undo(); editor.dirty = false; refresh()
+    }
+}

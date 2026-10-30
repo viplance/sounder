@@ -119,7 +119,6 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     var window: NSWindow!
     let table = NSTableView()
     let plugins = NSPopUpButton()
-    let routing = NSTextField(wrappingLabelWithString: "")
     var installed: [URL] = []
     var snapshotMode = false
     var index: Int? { editor.project.tracks.firstIndex { $0.id == trackID } }
@@ -130,11 +129,10 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         if let existing = editor.effectsWindows[trackID] { existing.window.makeKeyAndOrderFront(nil); return }
         snapshotMode = snapshot != nil
         editor.effectsWindows[trackID] = self
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 470), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 399), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "FX · " + editor.project.tracks[index].name; window.delegate = self; window.isReleasedWhenClosed = false
         let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
-        let heading = NSTextField(labelWithString: "Track effects"); heading.font = .systemFont(ofSize: 23, weight: .semibold); heading.frame = NSRect(x: 22, y: 414, width: 350, height: 35); root.addSubview(heading)
-        routing.frame = NSRect(x: 22, y: 354, width: 716, height: 54); routing.textColor = .secondaryLabelColor; routing.font = .systemFont(ofSize: 12); root.addSubview(routing)
+        let heading = NSTextField(labelWithString: "Track effects"); heading.font = .systemFont(ofSize: 23, weight: .semibold); heading.frame = NSRect(x: 22, y: 354, width: 350, height: 35); root.addSubview(heading)
         let scroll = NSScrollView(frame: NSRect(x: 22, y: 142, width: 716, height: 204)); scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("effect")); column.title = "Processing order · top to bottom"; column.width = 690; table.addTableColumn(column); table.rowHeight = 34; table.dataSource = self; table.delegate = self; table.target = self; table.doubleAction = #selector(configure); scroll.documentView = table; root.addSubview(scroll)
         let actions: [(String, Selector)] = [("Open editor…", #selector(configure)), ("Parameters…", #selector(parameters)), ("Bypass", #selector(bypass)), ("↑", #selector(up)), ("↓", #selector(down)), ("Remove", #selector(remove))]
@@ -161,10 +159,6 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     }
     func reload() {
         table.reloadData()
-        guard let index else { return }
-        var names: [String] = []; var parent = editor.project.tracks[index].parent
-        while let id = parent, let track = editor.project.tracks.first(where: { $0.id == id }) { names.append(track.name + " (\(track.effects.filter { !$0.bypassed }.count) FX)"); parent = track.parent }
-        routing.stringValue = "This track + processed children → this FX chain → " + (names.isEmpty ? "Master" : names.joined(separator: " → ") + " → Master")
         editor.update()
     }
     func numberOfRows(in tableView: NSTableView) -> Int { effects.count }

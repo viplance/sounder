@@ -69,6 +69,54 @@ final class ProjectNameView: NSView {
     }
 }
 
+// Settings use a compact form layout rather than NSAlert's reserved icon area.
+final class CompactSettingsAlert: NSAlert {
+    private var prepared = false
+    override func layout() {
+        if !prepared { prepared = true; super.layout() }
+        let panel = super.window
+        let form = accessoryView
+        let errorHeight: CGFloat = informativeText.isEmpty ? 0 : 38
+        let width = max(340, (form?.frame.width ?? 0) + 40, CGFloat(buttons.count) * 108 + 40)
+        let formY: CGFloat = 66 + errorHeight
+        let titleY = formY + (form?.frame.height ?? 0) + 12
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: titleY + 24 + 16))
+        panel.setContentSize(root.frame.size); panel.contentView = root
+        let heading = NSTextField(labelWithString: messageText)
+        heading.font = .systemFont(ofSize: 17, weight: .semibold)
+        heading.frame = NSRect(x: 20, y: titleY, width: width - 40, height: 24); root.addSubview(heading)
+        if let form { form.removeFromSuperview(); form.frame.origin = NSPoint(x: 20, y: formY); root.addSubview(form) }
+        if !informativeText.isEmpty {
+            let error = NSTextField(wrappingLabelWithString: informativeText)
+            error.font = .systemFont(ofSize: 11); error.textColor = .secondaryLabelColor
+            error.frame = NSRect(x: 20, y: 56, width: width - 40, height: 36); root.addSubview(error)
+        }
+        var right = width - 20
+        // Preserve NSAlert response order while placing the primary action at the right.
+        for (index, button) in buttons.enumerated() {
+            let buttonWidth = max(96, button.intrinsicContentSize.width + 12)
+            right -= buttonWidth
+            button.removeFromSuperview(); button.frame = NSRect(x: right, y: 16, width: buttonWidth, height: 32)
+            button.target = self; button.action = #selector(chosen(_:)); button.tag = index
+            button.keyEquivalent = index == 0 ? "\r" : index == 1 ? "\u{1b}" : ""
+            root.addSubview(button); right -= 12
+        }
+    }
+    @objc private func chosen(_ sender: NSButton) {
+        NSApp.stopModal(withCode: NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + sender.tag))
+    }
+    override func runModal() -> NSApplication.ModalResponse {
+        let responder = window.initialFirstResponder
+        layout(); window.center()
+        if let responder { window.initialFirstResponder = responder }
+        window.makeKeyAndOrderFront(nil)
+        if let responder { window.makeFirstResponder(responder) }
+        let response = NSApp.runModal(for: window)
+        window.orderOut(nil)
+        return response
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate {
     var window: NSWindow!
     var editor: Editor!
@@ -213,6 +261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--track-name-ui-test") { try verifyTrackNameUI() }
             if CommandLine.arguments.contains("--settings-ui-test") { try verifySettingsUI() }
             if CommandLine.arguments.contains("--notifications-ui-test") { try verifyNotificationInteractions(); finishNotificationUITest(audioURL: url); return }
+            if CommandLine.arguments.contains("--track-drag-ui-test") { try verifyTrackDragUI() }
             if CommandLine.arguments.contains("--pinned-ruler-ui-test") { try verifyPinnedRulerUI() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                 self.window.contentView!.layoutSubtreeIfNeeded()
@@ -477,7 +526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func toggleTempo() { editor.toggleTempoMode() }
     @objc func toggleMetronome() { editor.toggleMetronome() }
     @objc func editTempo() {
-        let alert = NSAlert(); alert.messageText = "Tempo"; alert.informativeText = "Beats per minute · 4 beats per bar (4/4)"
+        let alert = CompactSettingsAlert(); alert.messageText = "Tempo"
         let field = NSTextField(string: String(format: "%g", editor.project.tempo))
         field.frame = NSRect(x: 0, y: 0, width: 220, height: 26); field.setAccessibilityLabel("BPM")
         alert.accessoryView = field; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field
@@ -489,8 +538,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     @objc func audioSettings() {
         guard !editor.busy else { return }
-        let alert = NSAlert(); alert.messageText = "Audio settings"
-        alert.informativeText = "Choose the sample rate and channels. Bit depth applies to new recordings and WAV export. Existing audio files are preserved."
+        let alert = CompactSettingsAlert(); alert.messageText = "Audio settings"
+        alert.icon = NSImage(size: .zero)
         let form = NSView(frame: NSRect(x: 0, y: 0, width: 350, height: 122))
         let rateLabel = NSTextField(labelWithString: "Sample rate"); rateLabel.frame = NSRect(x: 0, y: 90, width: 115, height: 22); form.addSubview(rateLabel)
         let rates = NSPopUpButton(frame: NSRect(x: 124, y: 86, width: 220, height: 28)); rates.setAccessibilityLabel("Sample rate")
@@ -601,7 +650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func seekForward() { timeline.movePlayhead(direction: 1) }
     @objc func restartPlayback() { editor.restartFromLastStart() }
     @objc func play() { editor.playPause() }
-    @objc func stop() { editor.stop() }
+    @objc func stop() { if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stop() } }
     @objc func record() { editor.record() }
     @objc func rewind() { if editor.isRecording { editor.stop() }; editor.seek(to: 0) }
     @objc func split() { editor.split() }

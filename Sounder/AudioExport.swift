@@ -22,17 +22,19 @@ struct ExportSettings: Codable, Equatable {
     }
 }
 final class ExportOptionsController: NSObject {
-    let alert = NSAlert()
+    let alert = CompactSettingsAlert()
     let formats = NSPopUpButton(), rates = NSPopUpButton(), depths = NSPopUpButton(), bitrates = NSPopUpButton()
     let note = NSTextField(wrappingLabelWithString: "")
+    private var showsRateError = false
     init(settings: ExportSettings) {
         super.init()
         alert.messageText = "Export audio"
+        alert.icon = NSImage(size: .zero)
         alert.addButton(withTitle: "Export…"); alert.addButton(withTitle: "Cancel")
-        let form = NSView(frame: NSRect(x: 0, y: 0, width: 390, height: 208))
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 390, height: 154))
         let rows: [(String, NSPopUpButton)] = [("Format", formats), ("Sample rate", rates), ("Bit depth", depths), ("MP3 bitrate", bitrates)]
         for (index, row) in rows.enumerated() {
-            let y = CGFloat(174 - index * 36)
+            let y = CGFloat(120 - index * 36)
             let label = NSTextField(labelWithString: row.0); label.frame = NSRect(x: 0, y: y + 3, width: 115, height: 22); form.addSubview(label)
             row.1.frame = NSRect(x: 124, y: y, width: 260, height: 28)
             row.1.setAccessibilityLabel(row.0); row.1.target = self; row.1.action = #selector(changed)
@@ -55,7 +57,15 @@ final class ExportOptionsController: NSObject {
         depths.isEnabled = settings.format == .wav; bitrates.isEnabled = settings.format == .mp3
         let invalidMP3Rate = settings.format == .mp3 && settings.sampleRate > 48_000
         alert.buttons[0].isEnabled = !invalidMP3Rate
-        note.stringValue = invalidMP3Rate ? "MP3 supports up to 48 kHz. Choose 44.1 or 48 kHz, or select WAV/OGG." : "Bit depth applies to WAV. MP3 uses the selected bitrate; OGG uses Vorbis quality 7. Export settings do not change the project audio format."
+        note.stringValue = invalidMP3Rate ? "MP3 supports up to 48 kHz. Choose 44.1 or 48 kHz, or select WAV/OGG." : ""
+        note.isHidden = !invalidMP3Rate
+        if invalidMP3Rate != showsRateError, let form = alert.accessoryView {
+            let shift: CGFloat = invalidMP3Rate ? 54 : -54
+            for view in form.subviews where view !== note { view.frame.origin.y += shift }
+            form.frame.size.height += shift
+            showsRateError = invalidMP3Rate
+            alert.layout()
+        }
     }
     func runModal() -> ExportSettings? { alert.runModal() == .alertFirstButtonReturn ? settings : nil }
 }
