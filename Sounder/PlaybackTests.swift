@@ -170,9 +170,9 @@ extension AppDelegate {
         func check(_ condition: Bool, _ message: String) throws {
             guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
         }
-        func send(_ type: NSEvent.EventType, _ time: Double) {
-            let point = NSPoint(x: timeline.header + time * editor.zoom, y: timeline.ruler / 2)
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        func send(_ type: NSEvent.EventType, _ time: Double, clicks: Int = 1, y: CGFloat? = nil) {
+            let point = NSPoint(x: timeline.header + time * editor.zoom, y: y ?? timeline.ruler / 2)
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
             switch type {
             case .leftMouseDown: timeline.mouseDown(with: event)
             case .leftMouseDragged: timeline.mouseDragged(with: event)
@@ -200,7 +200,21 @@ extension AppDelegate {
         send(.leftMouseDown, 7)
         try check(editor.cursor == 5.8, "A potential ruler click defers seeking until mouse-up")
         send(.leftMouseUp, 7)
-        try check(editor.range == nil && editor.cursor == 7, "An ordinary ruler click still selects the playback position")
+        try check(editor.range == 2...5 && editor.cursor == 7, "A single ruler click seeks while preserving the range")
+        send(.leftMouseDown, 2, clicks: 2); send(.leftMouseUp, 2, clicks: 2)
+        try check(editor.range == nil && editor.cursor == 2, "A double click clears the range even at a range handle")
+        let blankY = timeline.ruler + timeline.rowHeight * 2.5
+        editor.range = 2...5
+        send(.leftMouseDown, 7, y: blankY); send(.leftMouseUp, 7, y: blankY)
+        try check(editor.range == 2...5 && editor.cursor == 7, "A single empty-area click preserves the range")
+        send(.leftMouseDown, 7, clicks: 2, y: blankY); send(.leftMouseUp, 7, clicks: 2, y: blankY)
+        try check(editor.range == nil, "A double empty-area click clears the range")
+        let fragmentY = timeline.ruler + timeline.rowHeight / 2
+        editor.range = 2...5
+        send(.leftMouseDown, 3, y: fragmentY); send(.leftMouseUp, 3, y: fragmentY)
+        try check(editor.range == 2...5, "A single fragment click preserves the range")
+        send(.leftMouseDown, 3, clicks: 2, y: fragmentY); send(.leftMouseUp, 3, clicks: 2, y: fragmentY)
+        try check(editor.range == nil, "A double fragment click clears the range")
         editor.seek(to: 1); editor.playPause()
         guard let playback = editor.player else { throw SounderError.message("Range UI playback did not start") }
         drag(2, 4); drag(4, 5)

@@ -28,6 +28,26 @@ struct Track: Codable, Identifiable {
     var effects: [PluginEffect] = []
     var nextTakeNumber = 1
 }
+enum TrackHierarchy {
+    static let maximumDepth = 2
+    static let limitMessage = "Tracks can be nested at most 2 levels"
+
+    static func validate(_ tracks: [Track]) throws {
+        let ids = Set(tracks.map(\.id))
+        guard ids.count == tracks.count else { throw SounderError.message("Invalid track IDs") }
+        for track in tracks {
+            var visited: Set<UUID> = [track.id]
+            var parent = track.parent
+            var depth = 0
+            while let id = parent {
+                guard ids.contains(id), visited.insert(id).inserted else { throw SounderError.message("Invalid track hierarchy") }
+                depth += 1
+                guard depth <= maximumDepth else { throw SounderError.message(limitMessage) }
+                parent = tracks.first(where: { $0.id == id })?.parent
+            }
+        }
+    }
+}
 // Keep projects saved before effects and per-track take numbering readable.
 extension Track {
     enum CodingKeys: String, CodingKey { case id, name, parent, muted, clips, effects, nextTakeNumber }

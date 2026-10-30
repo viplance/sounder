@@ -38,6 +38,25 @@ func runAudioTests() throws {
     try check(editor.project.tracks[0].parent == nil, "Hierarchy cycles are rejected")
     let decoded = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(editor.project))
     try check(decoded.tracks[1].parent == track.id, "Project round-trip preserves nesting")
+    let hierarchyEditor = Editor(store: store)
+    hierarchyEditor.addTrack(nested: true)
+    let levelOne = hierarchyEditor.selectedTrack!
+    hierarchyEditor.addTrack(nested: true)
+    let levelTwo = hierarchyEditor.selectedTrack!
+    try check(hierarchyEditor.project.tracks.count == 3 && hierarchyEditor.project.tracks.last?.parent == levelOne, "Two nested levels can be created")
+    let historyCount = hierarchyEditor.undoStack.count
+    hierarchyEditor.addTrack(nested: true)
+    try check(hierarchyEditor.project.tracks.count == 3 && hierarchyEditor.selectedTrack == levelTwo && hierarchyEditor.undoStack.count == historyCount, "Third-level creation is rejected without changing selection or Undo history")
+    hierarchyEditor.addTrack()
+    let independent = hierarchyEditor.selectedTrack!
+    hierarchyEditor.reparent(independent, to: levelTwo)
+    try check(hierarchyEditor.project.tracks.last?.parent == nil, "Reparenting cannot create a third nested level")
+    hierarchyEditor.reparent(levelOne, to: independent)
+    try check(hierarchyEditor.project.tracks[1].parent == independent && hierarchyEditor.project.tracks[2].parent == levelOne, "A subtree may move when its deepest child remains at depth two")
+    hierarchyEditor.reparent(independent, to: hierarchyEditor.project.tracks[0].id)
+    try check(hierarchyEditor.project.tracks.last?.parent == nil, "Subtree height prevents an otherwise valid parent from creating a third level")
+    hierarchyEditor.reparent(levelTwo, to: nil)
+    try check(hierarchyEditor.project.tracks[2].parent == nil, "Moving a deepest nested track back to the root remains available")
     var fxParent = Track(name: "Bus", clips: [track.clips[0]], effects: [PluginEffect(name: "half", path: "test", classID: "half")])
     var fxChild = Track(name: "Child", parent: fxParent.id, clips: [track.clips[0]], effects: [PluginEffect(name: "half", path: "test", classID: "half")])
     store.processEffects = { samples, effects in

@@ -81,8 +81,11 @@ final class Editor: NSObject {
         update("Audio format: " + format.label)
     }
     func addTrack(nested: Bool = false) {
-        guard !busy else { return }; checkpoint()
+        guard !busy else { return }
         let track = Track(name: "Audio " + String(format: "%02d", project.tracks.count + 1), parent: nested ? selectedTrack : nil)
+        do { try TrackHierarchy.validate(project.tracks + [track]) }
+        catch { notifications.show(TrackHierarchy.limitMessage, style: .hint); return }
+        checkpoint()
         project.tracks.append(track); selectedTrack = track.id; selection = []; update(nested ? "Nested track added" : "Track added")
     }
     func descendants(of id: UUID) -> Set<UUID> {
@@ -93,7 +96,11 @@ final class Editor: NSObject {
     }
     func reparent(_ child: UUID, to parent: UUID?) {
         guard !busy, let index = project.tracks.firstIndex(where: { $0.id == child }), parent == nil || !descendants(of: child).contains(parent!) else { return }
-        checkpoint(); project.tracks[index].parent = parent; update("Track hierarchy updated")
+        var tracks = project.tracks; tracks[index].parent = parent
+        do { try TrackHierarchy.validate(tracks) }
+        catch { notifications.show(TrackHierarchy.limitMessage, style: .hint); return }
+        guard project.tracks[index].parent != parent else { return }
+        checkpoint(); project.tracks = tracks; update("Track hierarchy updated")
     }
     func removeTrack() {
         guard !busy else { return }
@@ -413,15 +420,9 @@ final class Editor: NSObject {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             var loaded = try JSONDecoder().decode(Project.self, from: Data(contentsOf: url.appendingPathComponent("project.json")))
-            let ids = Set(loaded.tracks.map(\.id))
+            try TrackHierarchy.validate(loaded.tracks)
             audio.configure(loaded.audioFormat)
-            guard ids.count == loaded.tracks.count else { throw SounderError.message("Invalid track IDs") }
             for i in loaded.tracks.indices {
-                var visited: Set<UUID> = [loaded.tracks[i].id]; var parent = loaded.tracks[i].parent
-                while let id = parent {
-                    guard ids.contains(id), visited.insert(id).inserted else { throw SounderError.message("Invalid track hierarchy") }
-                    parent = loaded.tracks.first(where: { $0.id == id })?.parent
-                }
                 for j in loaded.tracks[i].clips.indices {
                     let c = loaded.tracks[i].clips[j]
                     guard c.start.isFinite, c.offset.isFinite, c.duration.isFinite, c.start >= 0, c.offset >= 0, c.duration > 0 else { throw SounderError.message("Invalid fragment timing") }

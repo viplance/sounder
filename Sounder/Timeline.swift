@@ -100,6 +100,11 @@ final class Timeline: NSView {
     var selectingRange = false
     var rangeAnchor: Double?
     var didDragRange = false
+    private(set) var marqueeAnchor: NSPoint?
+    private(set) var marqueeRect: NSRect?
+    private var marqueeInitialSelection = Set<UUID>()
+    private var marqueeInitialRange: ClosedRange<Double>?
+    private var marqueeAdditive = false
     var trackDrag: UUID?
     private var trackDragRows: [(Track, Int)]?
     private(set) var trackPreview: [Track]?
@@ -204,6 +209,7 @@ final class Timeline: NSView {
         var block = moving
         if let index = block.firstIndex(where: { $0.id == source }) { block[index].parent = parent }
         remaining.insert(contentsOf: block, at: insertion)
+        guard (try? TrackHierarchy.validate(remaining)) != nil else { refresh(); return }
         trackPreview = remaining
         refresh()
     }
@@ -406,6 +412,14 @@ final class Timeline: NSView {
         }
         let playX = header + editor.cursor * editor.zoom
         line(NSPoint(x: playX, y: ruler), NSPoint(x: playX, y: bounds.height), editor.isRecording ? .systemRed : accent, width: 1.5)
+        if let rect = marqueeRect {
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: visibleFragmentRect.intersection(visibleTrackRect)).addClip()
+            fill(rect, accent.withAlphaComponent(0.12))
+            accent.withAlphaComponent(0.9).setStroke()
+            let outline = NSBezierPath(rect: rect); outline.lineWidth = 1; outline.stroke()
+            NSGraphicsContext.restoreGraphicsState()
+        }
         drawTrackHeaders(in: dirtyRect)
         drawRuler(in: dirtyRect)
     }
@@ -485,7 +499,7 @@ final class Timeline: NSView {
         if pinnedRulerRect.contains(point) {
             guard canSelectRange, point.x >= fragmentLeft else { return }
             dragStart = point; selectingRange = true; didDragRange = false; rangeAnchor = nil
-            if let range = editor.range {
+            if let range = editor.range, event.clickCount < 2 {
                 let handles = rangeHandleRects()
                 let hits = handles.indices.filter { handles[$0].contains(point) }
                 if let edge = hits.min(by: { abs(handles[$0].midX - point.x) < abs(handles[$1].midX - point.x) }) {
@@ -505,13 +519,14 @@ final class Timeline: NSView {
                 EffectsWindow(editor: editor, trackID: rows[row].0.id).run(); return
             }
         }
-        if point.x >= fragmentLeft && point.y >= 0 {
-            editor.seek(to: (point.x - header) / editor.zoom)
-        }
         guard !editor.busy || (editor.isPlaying && point.x >= fragmentLeft) else { return }
         let p = point; dragStart = p; didCheckpoint = false; pendingTrackRename = nil
         let row = Int((p.y - ruler) / rowHeight)
-        guard isTrackPoint(p), row >= 0, row < rows.count else { return }
+        guard isTrackPoint(p), row >= 0 else { return }
+        guard row < rows.count else {
+            if p.x >= fragmentLeft { beginMarquee(at: p, additive: event.modifierFlags.contains(.shift)) }
+            return
+        }
         let (track, depth) = rows[row]; editor.selectedTrack = track.id
         if p.x < fragmentLeft {
             if trackFXRect(row: row, depth: depth).contains(p) {
@@ -529,6 +544,8 @@ final class Timeline: NSView {
         for (layer, clip) in clips.enumerated().reversed() {
             let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
             if clipRect(clip, row: row, layer: overlaps).contains(p) {
+                if event.clickCount == 2 { editor.range = nil }
+                editor.seek(to: (p.x - header) / editor.zoom)
                 if event.modifierFlags.contains(.shift) { if editor.selection.contains(clip.id) { editor.selection.remove(clip.id) } else { editor.selection.insert(clip.id) } }
                 else if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
                 if editor.selection.contains(clip.id) { editor.hint(.selectFragments, "Shift click to multi select") }
@@ -536,7 +553,40 @@ final class Timeline: NSView {
                 editor.update(); return
             }
         }
-        editor.selection = []; editor.range = nil; editor.update()
+        beginMarquee(at: p, additive: event.modifierFlags.contains(.shift))
+    }
+    private func beginMarquee(at point: NSPoint, additive: Bool) {
+        marqueeAnchor = point; marqueeRect = nil
+        marqueeInitialSelection = editor.selection; marqueeInitialRange = editor.range
+        marqueeAdditive = additive
+    }
+    private func updateMarquee(to point: NSPoint) {
+        guard let anchor = marqueeAnchor else { return }
+        guard marqueeRect != nil || hypot(point.x - anchor.x, point.y - anchor.y) > 3 else { return }
+        let end = NSPoint(x: min(bounds.maxX, max(fragmentLeft, point.x)), y: min(bounds.maxY, max(pinnedRulerRect.maxY, point.y)))
+        let rect = NSRect(x: min(anchor.x, end.x), y: min(anchor.y, end.y), width: max(1, abs(end.x - anchor.x)), height: max(1, abs(end.y - anchor.y)))
+        marqueeRect = rect
+        var hits = Set<UUID>()
+        for (row, item) in rows.enumerated() {
+            let clips = item.0.clips.sorted { $0.order < $1.order }
+            for (layer, clip) in clips.enumerated() {
+                let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
+                if clipRect(clip, row: row, layer: overlaps).intersects(rect) { hits.insert(clip.id) }
+            }
+        }
+        editor.selection = marqueeAdditive ? marqueeInitialSelection.union(hits) : hits
+        editor.range = nil
+        if !hits.isEmpty { editor.hint(.selectFragments, "Shift click to multi select") }
+        editor.update()
+    }
+    private func clearMarquee() {
+        marqueeAnchor = nil; marqueeRect = nil; marqueeInitialSelection = []; marqueeInitialRange = nil
+        needsDisplay = true
+    }
+    @discardableResult func cancelMarqueeSelection() -> Bool {
+        guard marqueeAnchor != nil else { return false }
+        editor.selection = marqueeInitialSelection; editor.range = marqueeInitialRange
+        clearMarquee(); editor.update(); return true
     }
     private func autoscrollRange(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
@@ -547,6 +597,12 @@ final class Timeline: NSView {
     }
     override func mouseDragged(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if marqueeAnchor != nil {
+            guard canSelectRange else { cancelMarqueeSelection(); return }
+            autoscroll(with: event)
+            updateMarquee(to: convert(event.locationInWindow, from: nil))
+            return
+        }
         if selectingRange {
             guard canSelectRange else { return }
             guard didDragRange || abs(p.x - dragStart.x) > 3 else { return }
@@ -576,9 +632,21 @@ final class Timeline: NSView {
     }
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
+        if marqueeAnchor != nil {
+            guard canSelectRange else { cancelMarqueeSelection(); return }
+            if marqueeRect == nil {
+                editor.selection = marqueeAdditive ? marqueeInitialSelection : []
+                if event.clickCount == 2 { editor.range = nil }
+                clearMarquee()
+                editor.seek(to: max(0, (p.x - header) / editor.zoom))
+            } else {
+                updateMarquee(to: p); clearMarquee()
+            }
+            return
+        }
         if selectingRange {
             if canSelectRange && !didDragRange && rangeAnchor == nil {
-                editor.range = nil
+                if event.clickCount == 2 { editor.range = nil }
                 editor.seek(to: max(0, (p.x - header) / editor.zoom))
             }
             selectingRange = false; rangeAnchor = nil; didDragRange = false
@@ -594,7 +662,7 @@ final class Timeline: NSView {
             previewTrackMove(at: p)
             let preview = trackPreview
             trackPreview = nil; trackDragRows = nil
-            if let preview, !editor.busy,
+            if let preview, !editor.busy, (try? TrackHierarchy.validate(preview)) != nil,
                preview.map({ $0.id }) != editor.project.tracks.map({ $0.id }) || preview.map({ $0.parent }) != editor.project.tracks.map({ $0.parent }) {
                 editor.checkpoint(); editor.project.tracks = preview; editor.update("Track hierarchy updated")
             }

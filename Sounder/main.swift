@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 
 final class PointerButton: NSButton {
+    private var pointerTracking: NSTrackingArea?
     var interactionCursor: NSCursor = .pointingHand {
         didSet { window?.invalidateCursorRects(for: self) }
     }
@@ -13,6 +14,16 @@ final class PointerButton: NSButton {
     override func resetCursorRects() {
         super.resetCursorRects()
         if isEnabled { addCursorRect(bounds, cursor: interactionCursor) }
+    }
+    override func updateTrackingAreas() {
+        if let pointerTracking { removeTrackingArea(pointerTracking) }
+        super.updateTrackingAreas()
+        let area = NSTrackingArea(rect: .zero, options: [.cursorUpdate, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area); pointerTracking = area
+    }
+    override func cursorUpdate(with event: NSEvent) {
+        // Native toolbar tracking can supersede the custom view's cursor rectangles.
+        (isEnabled ? interactionCursor : NSCursor.arrow).set()
     }
 }
 
@@ -164,13 +175,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let spacer2 = NSView(); spacer2.setContentHuggingPriority(.defaultLow, for: .horizontal); toolbar.addArrangedSubview(spacer2)
         metronomeButton = PointerButton(image: NSImage(systemSymbolName: "metronome", accessibilityDescription: "Metronome")!, target: self, action: #selector(toggleMetronome))
         metronomeButton.setButtonType(.pushOnPushOff); metronomeButton.isBordered = false; metronomeButton.imagePosition = .imageOnly
-        metronomeButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        metronomeButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
         metronomeButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         metronomeButton.setAccessibilityLabel("Metronome")
         tempoButton = PointerButton(title: "Tempo", target: self, action: #selector(toggleTempo))
         tempoButton.bezelStyle = .rounded; tempoButton.setButtonType(.pushOnPushOff); tempoButton.controlSize = .small
         tempoButton.font = .systemFont(ofSize: 11, weight: .semibold)
-        tempoButton.widthAnchor.constraint(equalToConstant: 55).isActive = true
+        tempoButton.widthAnchor.constraint(equalToConstant: 47).isActive = true
         bpmButton = textButton("120 BPM", size: 18, action: #selector(editTempo), cursor: .iBeam)
         bpmButton.contentTintColor = accent; bpmButton.toolTip = "Edit tempo (4/4)"; bpmButton.isHidden = true
         timeLabel = NSTextField(labelWithString: "00:00.000"); timeLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .light); timeLabel.textColor = accent
@@ -179,12 +190,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let tempoSpacer = NSView()
         tempoSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let tempoRow = NSStackView(views: [positionDisplay, metronomeButton, tempoSpacer, tempoButton])
-        tempoRow.orientation = .horizontal; tempoRow.alignment = .centerY; tempoRow.spacing = 5
+        tempoRow.orientation = .horizontal; tempoRow.alignment = .centerY; tempoRow.spacing = 2
         let timelineControls = NSView()
         tempoRow.translatesAutoresizingMaskIntoConstraints = false; timelineControls.addSubview(tempoRow)
         NSLayoutConstraint.activate([
-            tempoRow.leadingAnchor.constraint(equalTo: timelineControls.leadingAnchor, constant: 10),
-            tempoRow.trailingAnchor.constraint(equalTo: timelineControls.trailingAnchor, constant: -8),
+            tempoRow.leadingAnchor.constraint(equalTo: timelineControls.leadingAnchor, constant: 22),
+            tempoRow.trailingAnchor.constraint(equalTo: timelineControls.trailingAnchor, constant: -22),
             tempoRow.centerYAnchor.constraint(equalTo: timelineControls.centerYAnchor)
         ])
         add(toolbar, to: stack, height: 84 - (10 - toolbarTopInset))
@@ -275,6 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--track-name-ui-test") { try verifyTrackNameUI() }
             if CommandLine.arguments.contains("--settings-ui-test") { try verifySettingsUI() }
             if CommandLine.arguments.contains("--notifications-ui-test") { try verifyNotificationInteractions(); finishNotificationUITest(audioURL: url); return }
+            if CommandLine.arguments.contains("--marquee-ui-test") { try verifyMarqueeUI() }
             if CommandLine.arguments.contains("--track-drag-ui-test") { try verifyTrackDragUI() }
             if CommandLine.arguments.contains("--pinned-ruler-ui-test") { try verifyPinnedRulerUI() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
@@ -669,7 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func seekForward() { timeline.movePlayhead(direction: 1) }
     @objc func restartPlayback() { editor.restartFromLastStart() }
     @objc func play() { editor.playPause() }
-    @objc func stop() { if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stop() } }
+    @objc func stop() { if timeline.cancelMarqueeSelection() { return }; if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stop() } }
     @objc func record() { editor.record() }
     @objc func rewind() { if editor.isRecording { editor.stop() }; editor.seek(to: 0) }
     @objc func split() { editor.split() }

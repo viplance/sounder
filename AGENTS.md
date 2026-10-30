@@ -5,6 +5,7 @@
 - Do not add permanent status messages or instructional captions to the main interface (including the footer, timeline heading, and empty timeline).
 - Present action feedback as rectangular notifications in the upper-right corner of the active application window.
 - Successful edits and saves: green background, white text. Errors: red background, white text. UX hints: yellow background, dark readable text.
+- Size each notification to its text plus horizontal padding, align right edges, and wrap long messages at the viewport-aware maximum width.
 - Every message remains for 5 seconds independently. Append newer messages below older messages. Animate remaining messages upward when earlier messages expire.
 - UX hints trigger at the relevant interaction and appear only once per running app session. Do not persist their seen-state across launches, and do not reset it on project open, save, or Undo/Redo.
 - First actual drag of a track header: "Drag tracks to nest". First selection of an audio fragment: "Shift click to multi select".
@@ -57,6 +58,8 @@
 
 ## Playhead and seeking
 
+- Single timeline clicks seek while preserving the selected time range. Only a double click clears the range, including on its handles, fragments and empty space.
+
 - Dragging on the ruler selects a time range without seeking or stopping playback. Defer ruler click seeking until mouse-up without a drag. Highlight the range on the ruler and fragment area; its ruler edges are draggable with the horizontal resize cursor, without moving the playhead.
 - Clicking the timeline ruler, a fragment, or empty timeline space places the playhead at that time and discards any previous paused/playing stream. If playback is active, immediately continue playing from the selected time; if stopped, only reposition the cursor. Play starts from the selected playhead, independent of scrolling or the previous playback position.
 - Stopping (including the Play/Pause button) captures the current render position, clears the stream and freezes the cursor. The next Play always builds a new stream from that one cursor position. Never retain a separate paused position or resume old queued audio. While playing, the cursor follows the render clock monotonically; missing timestamps must not reset it. Do not silently reset a selected position beyond the project end to zero.
@@ -103,8 +106,14 @@
 
 ## Track dragging
 
+- Limit nesting to two levels below a root (depths 0, 1, 2). Validate the whole moved subtree for both live previews and commits, and reject adding a third nested level without an Undo entry. Never silently change routing in an over-depth project loaded from disk.
+
 - Preview track order and nesting live during header dragging, including the entire child subtree and all waveforms. The top/bottom quarter of a target row inserts before/after its subtree; the middle nests under it. Empty space below the rows moves to the root at the bottom. Resolve targets against a stable drag baseline to avoid oscillation. Commit once on mouse-up with one Undo entry; Escape/Stop cancels without a model change, and never permit nesting into the dragged subtree.
 
 ## Settings windows
 
 - Audio settings, Track effects, Export audio and Tempo show their title and controls without an app icon or descriptive introductory text. Remove the space reserved for those descriptions and icon area; keep a compact top margin above the heading. Use CompactSettingsAlert for modal settings forms rather than the standard alert icon layout. Keep actionable export validation errors visible only when needed.
+
+## Fragment marquee selection
+
+- Drag on empty fragment-area space (including below all tracks) to select intersecting fragments with a live rectangular marquee. Shift adds to the selection captured at drag start. Preserve the playhead and active playback during marquee selection; only a background click without a drag seeks on mouse-up. Keep ruler range gestures and fragment dragging intact. Clip the marquee behind pinned headers, autoscroll at viewport edges, and restore the original selection/range on Escape. Selection changes do not create Undo entries.

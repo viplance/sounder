@@ -72,8 +72,12 @@ private final class ToastCard: NSView {
         setAccessibilityElement(true); setAccessibilityRole(.staticText); setAccessibilityLabel(message.text)
     }
     required init?(coder: NSCoder) { fatalError() }
+    func width(maximum: CGFloat) -> CGFloat {
+        let measured = (message.text as NSString).size(withAttributes: [.font: text.font!])
+        return min(maximum, ceil(measured.width) + 32)
+    }
     func height(for width: CGFloat) -> CGFloat {
-        let measured = (message.text as NSString).boundingRect(with: NSSize(width: width - 28, height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: text.font!])
+        let measured = (message.text as NSString).boundingRect(with: NSSize(width: max(1, width - 32), height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: text.font!])
         return max(44, ceil(measured.height) + 24)
     }
     override func layout() { super.layout(); text.frame = bounds.insetBy(dx: 14, dy: 12) }
@@ -121,12 +125,13 @@ final class ToastOverlay: NSView {
         positionCards(animated: true)
     }
     private func positionCards(animated: Bool) {
-        let width = min(340, max(0, bounds.width - 32))
+        let maximumWidth = min(340, max(0, bounds.width - 32))
         var y: CGFloat = 16
         NSAnimationContext.runAnimationGroup { context in
             context.duration = animated ? 0.2 : 0
             for message in center.messages {
                 guard let card = cards[message.id] else { continue }
+                let width = card.width(maximum: maximumWidth)
                 let rect = NSRect(x: bounds.width - width - 16, y: y, width: width, height: card.height(for: width))
                 if card.frame == .zero { card.frame = rect }
                 if animated { card.animator().frame = rect; card.animator().alphaValue = 1 }

@@ -126,6 +126,78 @@ extension AppDelegate {
         try check(timeline.rows.last?.0.id == child.id && timeline.rows.last?.1 == 0, "Dragging into empty space previews moving a nested track to the root at the bottom")
         send(.leftMouseUp, blank)
         try check(editor.project.tracks.last?.id == child.id && editor.project.tracks.last?.parent == nil, "Moving a nested track to the bottom commits the shown root position")
-        editor.undo(); editor.dirty = false; refresh()
+        editor.undo()
+        let grandchild = Track(name: "Grandchild", parent: child.id)
+        let otherChild = Track(name: "Other child", parent: other.id)
+        let fixture = [root, child, grandchild, other, otherChild]
+        editor.project.tracks = fixture; refresh()
+        let initialUndoCount = editor.undoStack.count
+        send(.leftMouseDown, point(3, fraction: 0.4)); send(.leftMouseDragged, point(1, fraction: 0.5))
+        try check(timeline.trackPreview == nil && timeline.rows.map { $0.0.id } == fixture.map { $0.id }, "Live drag rejects a subtree whose child would reach depth three")
+        send(.leftMouseUp, point(1, fraction: 0.5))
+        try check(editor.undoStack.count == initialUndoCount && editor.project.tracks[3].parent == nil, "Invalid subtree drop leaves routing and Undo history unchanged")
+        send(.leftMouseDown, point(4, fraction: 0.4)); send(.leftMouseDragged, point(2, fraction: 0.5))
+        try check(timeline.trackPreview == nil, "A leaf cannot preview nesting under a second-level child")
+        send(.leftMouseUp, point(2, fraction: 0.5))
+        send(.leftMouseDown, point(4, fraction: 0.4)); send(.leftMouseDragged, point(1, fraction: 0.5))
+        try check(timeline.rows.last(where: { $0.0.id == otherChild.id })?.1 == 2, "Dragging a leaf to the second nested level still previews live")
+        send(.leftMouseUp, point(1, fraction: 0.5))
+        try check(editor.project.tracks.first(where: { $0.id == otherChild.id })?.parent == child.id, "A valid second-level drop commits successfully")
+        editor.undo(); editor.project = original; editor.dirty = false; refresh()
+    }
+}
+
+extension AppDelegate {
+    func verifyMarqueeUI() throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        func point(_ time: Double, _ row: CGFloat, _ offset: CGFloat) -> NSPoint {
+            NSPoint(x: timeline.header + time * editor.zoom, y: timeline.ruler + row * timeline.rowHeight + offset)
+        }
+        func send(_ type: NSEvent.EventType, _ p: NSPoint, shift: Bool = false) {
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(p, to: nil), modifierFlags: shift ? [.shift] : [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            if type == .leftMouseDown { timeline.mouseDown(with: event) }
+            else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
+            else { timeline.mouseUp(with: event) }
+        }
+        let all = Set(editor.project.tracks.flatMap { $0.clips.map { $0.id } })
+        let first = editor.project.tracks[0].clips[0].id, child = editor.project.tracks[1].clips[0].id
+        let initialUndo = editor.undoStack.count
+        editor.seek(to: 4); editor.selection = []; refresh()
+        let start = point(0.5, 0, 1), end = point(6, 2, 20)
+        send(.leftMouseDown, start); send(.leftMouseDragged, end)
+        try check(timeline.marqueeRect != nil && editor.selection == all && editor.cursor == 4, "Marquee selects intersecting fragments across tracks live without moving the playhead")
+        send(.leftMouseUp, end)
+        try check(timeline.marqueeRect == nil && editor.selection == all && editor.undoStack.count == initialUndo, "Mouse-up removes the rectangle while retaining selection without an Undo entry")
+        editor.selection = []; send(.leftMouseDown, end); send(.leftMouseDragged, start); send(.leftMouseUp, start)
+        try check(editor.selection == all, "Rectangle selection works when dragging upward and leftward")
+        editor.selection = [child]
+        let oneEnd = point(3, 0, timeline.rowHeight - 1)
+        send(.leftMouseDown, start, shift: true); send(.leftMouseDragged, oneEnd, shift: true)
+        try check(editor.selection == Set([child, first]), "Shift-marquee adds intersecting fragments to the original selection")
+        send(.leftMouseUp, oneEnd, shift: true)
+        editor.selection = [child]; editor.range = 1...2; refresh()
+        send(.leftMouseDown, start); send(.leftMouseDragged, oneEnd); stop()
+        try check(editor.selection == [child] && editor.range == 1...2 && timeline.marqueeAnchor == nil && editor.cursor == 4, "Escape/Stop restores selection and range without seeking")
+        editor.range = nil; editor.selection = []
+        let horizontal = point(0.5, 0, 30), horizontalEnd = point(3, 0, 30)
+        send(.leftMouseDown, horizontal); send(.leftMouseDragged, horizontalEnd); send(.leftMouseUp, horizontalEnd)
+        try check(editor.selection == [first], "A thin horizontal marquee still selects crossed fragments")
+        let below = point(12, 3, 30)
+        send(.leftMouseDown, below); send(.leftMouseDragged, start); send(.leftMouseUp, start)
+        try check(editor.selection == all && editor.cursor == 4, "Marquee can start below all tracks and reach the fragment rows")
+        editor.seek(to: 1); editor.playPause()
+        guard let player = editor.player else { throw SounderError.message("Marquee playback test did not start") }
+        send(.leftMouseDown, start); send(.leftMouseDragged, end); send(.leftMouseUp, end)
+        try check(editor.isPlaying && editor.player === player && editor.selection == all, "Marquee selection leaves active playback running without replacing its stream")
+        editor.stop()
+        let click = point(11, 2, 25)
+        send(.leftMouseDown, click); send(.leftMouseUp, click)
+        try check(editor.cursor == 11 && editor.selection.isEmpty, "A plain background click still seeks and clears selection")
+        let clipPoint = point(2, 0, 30), movedPoint = point(3, 0, 30)
+        send(.leftMouseDown, clipPoint); send(.leftMouseDragged, movedPoint); send(.leftMouseUp, movedPoint)
+        try check(editor.project.tracks[0].clips[0].start == 2 && timeline.marqueeAnchor == nil, "Dragging a fragment still moves it instead of starting a marquee")
+        editor.undo(); editor.selection = []; editor.seek(to: 5.8); editor.dirty = false; refresh()
     }
 }
