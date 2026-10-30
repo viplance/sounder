@@ -11,12 +11,53 @@ func label(_ text: String, _ rect: NSRect, size: CGFloat = 12, color: NSColor = 
 func fill(_ rect: NSRect, _ color: NSColor, radius: CGFloat = 0) { color.setFill(); NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill() }
 func line(_ from: NSPoint, _ to: NSPoint, _ color: NSColor, width: CGFloat = 1) { color.setStroke(); let p = NSBezierPath(); p.lineWidth = width; p.move(to: from); p.line(to: to); p.stroke() }
 
-private final class TrackNameValidator: NSObject, NSTextFieldDelegate {
-    weak var button: NSButton?
-    init(button: NSButton) { self.button = button }
-    func controlTextDidChange(_ notification: Notification) {
-        guard let field = notification.object as? NSTextField else { return }
-        button?.isEnabled = !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+// Shared inline editor: only committed, nonempty names reach the model.
+final class InlineNameField: NSTextField, NSTextFieldDelegate {
+    private var commitName: ((String) -> Void)?
+    private var ended: (() -> Void)?
+    private(set) var isRenaming = false
+    var textChanged: (() -> Void)?
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        delegate = self; isHidden = true; isBezeled = false; drawsBackground = false
+        backgroundColor = panelColor; textColor = .labelColor; focusRingType = .none
+        usesSingleLineMode = true; lineBreakMode = .byClipping
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func begin(_ name: String, commit: @escaping (String) -> Void, end: @escaping () -> Void) {
+        guard !isRenaming else { return }
+        stringValue = name; commitName = commit; ended = end; isRenaming = true; isHidden = false
+        textChanged?()
+        window?.makeFirstResponder(self)
+        if let input = currentEditor() as? NSTextView {
+            input.drawsBackground = false
+            input.setSelectedRange(NSRange(location: (input.string as NSString).length, length: 0))
+        }
+    }
+    @discardableResult func finish(commit: Bool, requireValid: Bool = false) -> Bool {
+        guard isRenaming else { return true }
+        let name = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if commit && requireValid && name.isEmpty { NSSound.beep(); return false }
+        let save = commitName, end = ended
+        isRenaming = false; commitName = nil; ended = nil
+        // Clear the field editor before hiding the field; end-editing may reenter.
+        window?.endEditing(for: self)
+        isHidden = true; end?()
+        if commit && !name.isEmpty { save?(name) }
+        return true
+    }
+    func controlTextDidChange(_ notification: Notification) { textChanged?() }
+    func controlTextDidEndEditing(_ notification: Notification) { finish(commit: true) }
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            let parent = superview
+            if finish(commit: true, requireValid: true) { window?.makeFirstResponder(parent) }
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            let parent = superview; finish(commit: false); window?.makeFirstResponder(parent); return true
+        }
+        return false
     }
 }
 
@@ -37,10 +78,12 @@ final class Timeline: NSView {
     var didDragRange = false
     var trackDrag: UUID?
     var pendingTrackRename: UUID?
+    let nameField = InlineNameField(frame: .zero)
+    private(set) var renamingTrack: UUID?
     private var scrollObserver: NSObjectProtocol?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    init(_ editor: Editor) { self.editor = editor; super.init(frame: .zero) }
+    init(_ editor: Editor) { self.editor = editor; super.init(frame: .zero); addSubview(nameField); nameField.font = .systemFont(ofSize: 13, weight: .semibold); nameField.setAccessibilityLabel("Track name"); nameField.textChanged = { [weak self] in self?.layoutNameField() } }
     required init?(coder: NSCoder) { fatalError() }
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
@@ -50,6 +93,7 @@ final class Timeline: NSView {
         clip.postsBoundsChangedNotifications = true
         scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
             guard let self else { return }
+            self.layoutNameField()
             self.setNeedsDisplay(self.visibleRect)
             self.window?.invalidateCursorRects(for: self)
         }
@@ -86,6 +130,7 @@ final class Timeline: NSView {
         editor.zoom = max(minimumZoom, editor.zoom)
         let width = editor.zoom <= minimumZoom ? visible.width : max(visible.width, header + timelineDuration * editor.zoom)
         frame.size = NSSize(width: width, height: max(visible.height, ruler + CGFloat(rows.count) * rowHeight + 110))
+        layoutNameField()
         needsDisplay = true
         if editor.isRecording, let scroll = enclosingScrollView {
             let visible = scroll.documentVisibleRect, x = header + editor.cursor * editor.zoom
@@ -165,17 +210,28 @@ final class Timeline: NSView {
     }
     func renameTrack(_ id: UUID) {
         guard !editor.busy, let index = editor.project.tracks.firstIndex(where: { $0.id == id }) else { return }
-        let currentName = editor.project.tracks[index].name
-        let alert = NSAlert(); alert.messageText = "Rename track"
-        let field = NSTextField(string: currentName); field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
-        field.setAccessibilityLabel("Track name"); alert.accessoryView = field
-        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field
-        let validator = TrackNameValidator(button: alert.buttons[0]); field.delegate = validator
-        alert.buttons[0].isEnabled = !currentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        guard withExtendedLifetime(validator, { alert.runModal() }) == .alertFirstButtonReturn else { return }
-        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name != currentName, let index = editor.project.tracks.firstIndex(where: { $0.id == id }) else { return }
-        editor.checkpoint(); editor.project.tracks[index].name = name; editor.update("Track renamed")
+        nameField.finish(commit: true)
+        renamingTrack = id
+        layoutNameField()
+        guard renamingTrack != nil else { return }
+        nameField.begin(editor.project.tracks[index].name, commit: { [weak self] name in
+            guard let self, let index = self.editor.project.tracks.firstIndex(where: { $0.id == id }), self.editor.project.tracks[index].name != name else { return }
+            self.editor.checkpoint(); self.editor.project.tracks[index].name = name; self.editor.update("Track renamed")
+        }, end: { [weak self] in self?.renamingTrack = nil; self?.needsDisplay = true })
+    }
+    private func layoutNameField() {
+        guard let id = renamingTrack else { return }
+        guard let row = rows.firstIndex(where: { $0.0.id == id }) else {
+            nameField.finish(commit: false); renamingTrack = nil; return
+        }
+        let rect = trackNameHitRect(row: row, depth: rows[row].1)
+        let name = nameField.isRenaming ? nameField.stringValue : rows[row].0.name
+        let width = ceil((name as NSString).size(withAttributes: [.font: nameField.font!]).width) + 4
+        let frame = NSRect(x: rect.minX - 2, y: rect.minY, width: min(max(4, width), fragmentLeft - rect.minX - 10), height: 22)
+        guard visibleTrackRect.contains(frame) else {
+            nameField.finish(commit: true); renamingTrack = nil; return
+        }
+        nameField.frame = frame
     }
     func drawWaveform(_ peaks: [Float], partialPeak: Float? = nil, sampleRate: Double, offset: Double, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
         let top = rect.minY + 1, bottom = rect.maxY - 1
@@ -275,7 +331,9 @@ final class Timeline: NSView {
             fill(NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight), selected ? NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.19, alpha: 1) : panelColor)
             let color = trackColors[index % trackColors.count]
             fill(NSRect(x: pinnedHeaderX, y: y + 1, width: 3, height: rowHeight - 2), selected ? color : .clear)
-            label(depth > 0 ? "↳  \(track.name)" : track.name, trackNameRect(row: index, depth: depth), size: 13, weight: .semibold)
+            let editing = renamingTrack == track.id && nameField.isRenaming
+            let title = editing ? (depth > 0 ? "↳  " : "") : (depth > 0 ? "↳  \(track.name)" : track.name)
+            label(title, trackNameRect(row: index, depth: depth), size: 13, weight: .semibold)
             let muteRect = trackMuteRect(row: index, depth: depth)
             fill(muteRect, track.muted ? NSColor.systemOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
             label(track.muted ? "MUTED" : "MUTE", NSRect(x: muteRect.minX, y: muteRect.minY + 5, width: muteRect.width, height: 15), size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, weight: .semibold, alignment: .center)

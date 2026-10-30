@@ -16,6 +16,48 @@ final class PointerButton: NSButton {
     }
 }
 
+final class ProjectNameLabel: NSTextField {
+    override func mouseDown(with event: NSEvent) {
+        if isEnabled { sendAction(action, to: target) }
+    }
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled { addCursorRect(bounds, cursor: .iBeam) }
+    }
+}
+
+// Both display and editing occupy the same text geometry; no stack-view swap.
+final class ProjectNameView: NSView {
+    let label: ProjectNameLabel
+    let field: InlineNameField
+    private let dirtyMark = NSTextField(labelWithString: "  •")
+    init(label: ProjectNameLabel, field: InlineNameField) {
+        self.label = label; self.field = field
+        super.init(frame: .zero)
+        addSubview(label); addSubview(field); addSubview(dirtyMark)
+        dirtyMark.font = label.font; dirtyMark.textColor = label.textColor; dirtyMark.isHidden = true
+        field.textChanged = { [weak self] in self?.updateSize() }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    private var showsDirtyMark: Bool { field.isRenaming && label.stringValue.hasSuffix("  •") }
+    private var editingWidth: CGFloat {
+        (field.stringValue as NSString).size(withAttributes: [.font: field.font!]).width
+    }
+    override var intrinsicContentSize: NSSize {
+        let width = field.isRenaming ? editingWidth + (showsDirtyMark ? dirtyMark.intrinsicContentSize.width : 0) : label.intrinsicContentSize.width
+        return NSSize(width: min(320, max(4, width)), height: label.intrinsicContentSize.height)
+    }
+    func updateSize() { invalidateIntrinsicContentSize(); needsLayout = true }
+    override func layout() {
+        super.layout()
+        label.frame = bounds
+        let suffix = showsDirtyMark ? dirtyMark.intrinsicContentSize.width : 0
+        field.frame = NSRect(x: 0, y: 0, width: max(4, bounds.width - suffix), height: bounds.height)
+        dirtyMark.isHidden = !showsDirtyMark
+        dirtyMark.frame = NSRect(x: field.frame.maxX, y: 0, width: suffix, height: bounds.height)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate {
     var window: NSWindow!
     var editor: Editor!
@@ -25,7 +67,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var tempoButton: NSButton!
     var bpmButton: NSButton!
     var metronomeButton: NSButton!
-    var projectLabel: NSButton!
+    var projectLabel: ProjectNameLabel!
+    let projectNameField = InlineNameField(frame: .zero)
+    var projectNameView: ProjectNameView!
     var qualityButton: NSButton!
     var playButton: NSButton!
     var recordButton: NSButton!
@@ -46,7 +90,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 0; stack.alignment = .leading; stack.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: content.leadingAnchor), stack.trailingAnchor.constraint(equalTo: content.trailingAnchor), stack.topAnchor.constraint(equalTo: content.safeAreaLayoutGuide.topAnchor), stack.bottomAnchor.constraint(equalTo: content.bottomAnchor)])
         installTitlebarControls()
-        let toolbar = NSStackView(); toolbar.orientation = .horizontal; toolbar.spacing = 14; toolbar.edgeInsets = NSEdgeInsets(top: 10, left: 22, bottom: 12, right: 22)
+        let toolbarTopInset: CGFloat = 10 / 1.5
+        let toolbar = NSStackView(); toolbar.orientation = .horizontal; toolbar.spacing = 14; toolbar.edgeInsets = NSEdgeInsets(top: toolbarTopInset, left: 22, bottom: 12, right: 22)
         playButton = button("Play / pause · Space", "play.fill", #selector(play))
         recordButton = button("Record · R", "record.circle", #selector(record)); recordButton.contentTintColor = .systemRed
         toolbar.addArrangedSubview(section("PLAYER", [button("Return to start", "backward.end.fill", #selector(rewind)), playButton, button("Stop · Escape", "stop.fill", #selector(stop)), recordButton]))
@@ -70,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         timeLabel = NSTextField(labelWithString: "00:00.000"); timeLabel.font = .monospacedDigitSystemFont(ofSize: 25, weight: .light); timeLabel.textColor = accent
         bpmButton.font = timeLabel.font
         let positionDisplay = NSStackView(views: [timeLabel, bpmButton]); positionDisplay.spacing = 6
-        toolbar.addArrangedSubview(positionDisplay); add(toolbar, to: stack, height: 84)
+        toolbar.addArrangedSubview(positionDisplay); add(toolbar, to: stack, height: 84 - (10 - toolbarTopInset))
         let scroll = NSScrollView(); scroll.hasHorizontalScroller = true; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
         timeline = Timeline(editor); scroll.documentView = timeline; add(scroll, to: stack)
         notificationOverlay = ToastOverlay.install(in: content, center: editor.notifications)
@@ -82,15 +127,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func installTitlebarControls() {
         let icon = Bundle.main.url(forResource: "AppIcon", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
         if let icon { NSApp.applicationIconImage = icon }
-        projectLabel = textButton("MY PROJECT", size: 10, action: #selector(renameProject), cursor: .iBeam)
+        projectLabel = ProjectNameLabel(labelWithString: "MY PROJECT")
+        projectLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        projectLabel.textColor = .secondaryLabelColor
+        projectLabel.target = self; projectLabel.action = #selector(renameProject)
+        projectLabel.setAccessibilityLabel("Project name")
+        projectLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         projectLabel.toolTip = "Rename project"; projectLabel.lineBreakMode = .byTruncatingTail
-        projectLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 320).isActive = true
+        projectNameField.font = projectLabel.font; projectNameField.setAccessibilityLabel("Project name")
+        projectNameField.textColor = projectLabel.textColor
+        projectNameView = ProjectNameView(label: projectLabel, field: projectNameField)
         qualityButton = textButton(ProjectAudioFormat().label, size: 9, action: #selector(audioSettings)); qualityButton.toolTip = "Project audio settings"
         let export = PointerButton(title: "Export", target: self, action: #selector(exportAudio)); export.bezelStyle = .rounded
         export.widthAnchor.constraint(equalToConstant: export.intrinsicContentSize.width + 16).isActive = true
         exportButton = export
         let controls: [(String, String, NSView)] = [
-            ("project", "Project name", projectLabel),
+            ("project", "Project name", projectNameView),
             ("quality", "Project audio settings", qualityButton),
             ("open", "Open project", button("Open project", "folder", #selector(openProject))),
             ("save", "Save project", button("Save project", "square.and.arrow.down", #selector(saveProject))),
@@ -100,6 +152,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let identifier = NSToolbarItem.Identifier(id)
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.label = label; item.toolTip = label; item.view = view
+            // Custom toolbar views still receive the system glass bezel unless explicitly opted out.
+            if id == "project" { item.isBordered = false }
             if id == "export" || id == "quality" { item.autovalidates = false }
             item.visibilityPriority = .high
             titlebarItems[identifier] = item
@@ -151,7 +205,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--pinned-ruler-ui-test") { try verifyPinnedRulerUI() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                 self.window.contentView!.layoutSubtreeIfNeeded()
-                let view = self.window.contentView!
+                let content = self.window.contentView!
+                let view = CommandLine.arguments.contains("--snapshot-window") ? (content.superview ?? content) : content
                 if let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
                     view.cacheDisplay(in: view.bounds, to: bitmap)
                     if let pathIndex = CommandLine.arguments.firstIndex(of: "--snapshot"), pathIndex + 1 < CommandLine.arguments.count {
@@ -214,33 +269,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
             NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
         }
-        func answerRename(_ response: NSApplication.ModalResponse) {
-            let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
-                func findField(_ view: NSView) -> NSTextField? {
-                    if let field = view as? NSTextField, field.isEditable { return field }
-                    for child in view.subviews { if let field = findField(child) { return field } }
-                    return nil
-                }
-                if let root = NSApp.modalWindow?.contentView { findField(root)?.stringValue = "Lead Voice" }
-                NSApp.stopModal(withCode: response)
-            }
-            RunLoop.main.add(timer, forMode: .modalPanel)
+        func type(_ text: String, into field: InlineNameField) {
+            if let input = field.currentEditor() as? NSTextView { input.selectAll(nil); input.insertText(text, replacementRange: input.selectedRange()) }
+            else { field.stringValue = text }
         }
-        let name = NSPoint(x: 45, y: timeline.ruler + 28)
-        timeline.mouseDown(with: event(.leftMouseDown, name)); answerRename(.alertFirstButtonReturn)
-        timeline.mouseUp(with: event(.leftMouseUp, name))
-        guard editor.project.tracks[0].name == "Lead Voice", editor.dirty else { throw SounderError.message("Single click on track name did not open rename") }
+        func nameInkRows() throws -> ClosedRange<Int> {
+            let nameRect = timeline.trackNameHitRect(row: 0, depth: 0)
+            let crop = NSRect(x: nameRect.minX, y: nameRect.minY - 3, width: max(1, nameRect.width - 3), height: nameRect.height + 6)
+            timeline.displayIfNeeded()
+            guard let bitmap = timeline.bitmapImageRepForCachingDisplay(in: crop) else { throw SounderError.message("Could not capture the track name") }
+            timeline.cacheDisplay(in: crop, to: bitmap)
+            var rows: [Int] = []
+            for y in 0..<bitmap.pixelsHigh {
+                for x in 0..<bitmap.pixelsWide {
+                    if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB), color.redComponent > 0.65 && color.greenComponent > 0.65 && color.blueComponent > 0.65 {
+                        rows.append(y); break
+                    }
+                }
+            }
+            guard let low = rows.min(), let high = rows.max() else { throw SounderError.message("Track-name capture contains no text") }
+            return low...high
+        }
+        let inkBefore = try nameInkRows()
+        let name = NSPoint(x: 45, y: timeline.ruler + 20)
+        timeline.mouseDown(with: event(.leftMouseDown, name)); timeline.mouseUp(with: event(.leftMouseUp, name))
+        guard timeline.nameField.isRenaming, NSApp.modalWindow == nil else { throw SounderError.message("Track name did not open inline: track=\(String(describing: timeline.renamingTrack)), field=\(timeline.nameField.isRenaming), frame=\(timeline.nameField.frame), visible=\(timeline.visibleRect), name=\(timeline.trackNameHitRect(row: 0, depth: 0)), modal=\(String(describing: NSApp.modalWindow))") }
+        let inkDuring = try nameInkRows()
+        guard inkBefore == inkDuring else { throw SounderError.message("Track-name glyphs shift when editing begins: \(inkBefore) → \(inkDuring)") }
+        print("PASS: Track-name glyphs retain identical vertical pixel bounds when editing begins")
+        let initialNameWidth = timeline.nameField.frame.width
+        guard !timeline.nameField.drawsBackground, initialNameWidth <= timeline.trackNameHitRect(row: 0, depth: 0).width + 5,
+              (timeline.nameField.currentEditor() as? NSTextView)?.selectedRange().length == 0 else { throw SounderError.message("Track editor changes the label appearance or selects its text") }
+        type("Lead Voice", into: timeline.nameField)
+        guard timeline.nameField.frame.width > initialNameWidth else { throw SounderError.message("Track editor does not grow with its text") }
+        _ = timeline.nameField.control(timeline.nameField, textView: timeline.nameField.currentEditor() as! NSTextView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+        guard editor.project.tracks[0].name == "Lead Voice", editor.dirty else { throw SounderError.message("Inline track rename did not save") }
         editor.undo(); guard editor.project.tracks[0].name == "Voice" else { throw SounderError.message("Track rename cannot be undone") }
-        timeline.mouseDown(with: event(.leftMouseDown, name)); answerRename(.alertSecondButtonReturn)
-        timeline.mouseUp(with: event(.leftMouseUp, name))
+        timeline.renameTrack(editor.project.tracks[0].id)
+        type("Cancelled", into: timeline.nameField)
+        _ = timeline.nameField.control(timeline.nameField, textView: timeline.nameField.currentEditor() as! NSTextView, doCommandBy: #selector(NSResponder.cancelOperation(_:)))
         guard editor.project.tracks[0].name == "Voice" else { throw SounderError.message("Cancelling track rename changed the name") }
+        timeline.renameTrack(editor.project.tracks[0].id); type("   ", into: timeline.nameField)
+        guard !timeline.nameField.finish(commit: true, requireValid: true), timeline.nameField.isRenaming, editor.project.tracks[0].name == "Voice" else { throw SounderError.message("Empty track name was accepted") }
+        type("Focus name", into: timeline.nameField); window.makeFirstResponder(timeline)
+        guard editor.project.tracks[0].name == "Focus name", !timeline.nameField.isRenaming else { throw SounderError.message("Track rename did not commit on focus loss") }
+        editor.undo()
+        if let scroll = timeline.enclosingScrollView {
+            scroll.contentView.scroll(to: NSPoint(x: 400, y: 0)); scroll.reflectScrolledClipView(scroll.contentView)
+            timeline.renameTrack(editor.project.tracks[0].id)
+            guard timeline.nameField.isRenaming, timeline.nameField.frame.minX >= timeline.visibleRect.minX else { throw SounderError.message("Inline editor does not follow pinned track column") }
+            timeline.nameField.finish(commit: false)
+            scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        }
         let childID = editor.project.tracks[1].id, targetID = editor.project.tracks[2].id
         let childName = NSPoint(x: 60, y: timeline.ruler + timeline.rowHeight + 28)
         let target = NSPoint(x: 60, y: timeline.ruler + timeline.rowHeight * 2 + 55)
         timeline.mouseDown(with: event(.leftMouseDown, childName)); timeline.mouseDragged(with: event(.leftMouseDragged, target)); timeline.mouseUp(with: event(.leftMouseUp, target))
         guard editor.project.tracks.first(where: { $0.id == childID })?.parent == targetID else { throw SounderError.message("Dragging a track name no longer nests the track") }
         editor.undo(); editor.dirty = false; refresh()
-        print("PASS: single-click track rename, Cancel, Undo and dragging the name to nest")
+        print("PASS: inline track rename, Enter, Escape, empty-name validation, focus loss, horizontal scrolling, Undo and nesting drag")
     }
     func verifyNotificationInteractions() throws {
         func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
@@ -303,19 +390,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         return alert.runModal()
     }
     func verifySettingsUI() throws {
-        dialogAutomation = { alert in
-            (alert.accessoryView as? NSTextField)?.stringValue = "Studio Session"
-            NSApp.stopModal(withCode: .alertFirstButtonReturn)
-        }
-        projectLabel.performClick(nil)
-        guard editor.projectName == "Studio Session", projectLabel.title.contains("Studio Session") else { throw SounderError.message("Project title click did not rename the project") }
-        print("PASS: clicking project title edits its name")
-        dialogAutomation = { alert in
-            (alert.accessoryView as? NSTextField)?.stringValue = "Cancelled name"
-            NSApp.stopModal(withCode: .alertSecondButtonReturn)
-        }
-        projectLabel.performClick(nil)
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+        let initialWidth = projectNameView.frame.width
+        let qualityPosition = qualityButton.convert(NSPoint.zero, to: nil)
+        projectLabel.sendAction(projectLabel.action, to: projectLabel.target)
+        guard projectNameField.isRenaming, projectLabel.isHidden, NSApp.modalWindow == nil else { throw SounderError.message("Project name did not open inline") }
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+        guard abs(projectNameView.frame.width - initialWidth) < 1,
+              abs(qualityButton.convert(NSPoint.zero, to: nil).x - qualityPosition.x) < 1,
+              !projectNameField.drawsBackground,
+              (projectNameField.currentEditor() as? NSTextView)?.selectedRange().length == 0 else { throw SounderError.message("Beginning project rename changes layout or text appearance: \(initialWidth) → \(projectNameView.frame.width)") }
+        if let input = projectNameField.currentEditor() as? NSTextView { input.insertText(" Extended", replacementRange: input.selectedRange()) }
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+        guard projectNameView.frame.width > initialWidth else { throw SounderError.message("Project editor does not grow with its text") }
+        projectNameField.stringValue = "Studio Session"; projectNameField.finish(commit: true, requireValid: true)
+        guard editor.projectName == "Studio Session", projectLabel.stringValue.contains("Studio Session"), !projectLabel.isHidden else { throw SounderError.message("Inline project rename did not save") }
+        projectLabel.sendAction(projectLabel.action, to: projectLabel.target)
+        projectNameField.stringValue = "Cancelled name"; projectNameField.finish(commit: false)
         guard editor.projectName == "Studio Session" else { throw SounderError.message("Cancelling a rename changed the project") }
+        projectLabel.sendAction(projectLabel.action, to: projectLabel.target); projectNameField.stringValue = " "
+        guard !projectNameField.finish(commit: true, requireValid: true), editor.projectName == "Studio Session" else { throw SounderError.message("Empty project name was accepted") }
+        projectNameField.finish(commit: false)
+        editor.undo(); guard editor.projectName == "MY PROJECT" else { throw SounderError.message("Inline project rename cannot be undone") }
+        editor.redo()
+        print("PASS: inline project name editing, Cancel, empty-name validation, Undo and Redo")
         dialogAutomation = { alert in
             let popups = alert.accessoryView!.subviews.compactMap { $0 as? NSPopUpButton }
             popups[0].selectItem(at: 3); popups[1].selectItem(at: 1); popups[2].selectItem(at: 1)
@@ -338,13 +436,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     @objc func renameProject() {
         guard !editor.busy else { return }
-        let alert = NSAlert(); alert.messageText = "Project name"; alert.informativeText = "Enter a name for this project."
-        let field = NSTextField(string: editor.projectName); field.frame = NSRect(x: 0, y: 0, width: 320, height: 26)
-        field.setAccessibilityLabel("Project name"); alert.accessoryView = field
-        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = field
-        guard showSettingsDialog(alert) == .alertFirstButtonReturn else { return }
-        editor.renameProject(field.stringValue)
+        projectLabel.isHidden = true
+        projectNameField.begin(editor.projectName, commit: { [weak self] name in self?.editor.renameProject(name) },
+                               end: { [weak self] in self?.projectLabel.isHidden = false; self?.projectNameView.updateSize() })
     }
     @objc func toggleTempo() { editor.toggleTempoMode() }
     @objc func toggleMetronome() { editor.toggleMetronome() }
@@ -409,7 +503,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         editButtons.forEach { $0.isEnabled = !editor.busy }
         exportButton.isEnabled = editor.canExport
         titlebarItems[NSToolbarItem.Identifier("export")]?.isEnabled = editor.canExport
-        projectLabel.title = editor.projectName + (editor.dirty ? "  •" : "")
+        projectLabel.stringValue = editor.projectName + (editor.dirty ? "  •" : "")
+        projectNameView.updateSize()
         projectLabel.isEnabled = !editor.busy; qualityButton.isEnabled = !editor.busy
         titlebarItems[NSToolbarItem.Identifier("quality")]?.isEnabled = !editor.busy
         qualityButton.title = editor.project.audioFormat.label
@@ -448,8 +543,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
     }
     @objc func openProject() { editor.open() }
-    @objc func saveProject() { _ = editor.save() }
-    @objc func saveAs() { _ = editor.save(as: true) }
+    private func finishNameEditing() { projectNameField.finish(commit: true); timeline.nameField.finish(commit: true) }
+    @objc func saveProject() { finishNameEditing(); _ = editor.save() }
+    @objc func saveAs() { finishNameEditing(); _ = editor.save(as: true) }
     @objc func importAudio() { editor.importAudio() }
     @objc func exportAudio() { editor.export() }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
@@ -457,7 +553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if [#selector(zoomIn), #selector(zoomOut)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
         }
-        if [#selector(restartPlayback), #selector(play), #selector(seekBackward), #selector(seekForward)].contains(menuItem.action) {
+        if [#selector(restartPlayback), #selector(play), #selector(seekBackward), #selector(seekForward), #selector(stop), #selector(record), #selector(rewind)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
                 && (!editor.isRecording || menuItem.action == #selector(restartPlayback) || menuItem.action == #selector(play))
                 && !editor.requestingMic && !editor.isImporting
@@ -480,8 +576,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func nest() { editor.addTrack(nested: true) }
     @objc func removeTrack() { editor.removeTrack() }
     @objc func unparent() { if let id = editor.selectedTrack { editor.reparent(id, to: nil) } }
-    @objc func undo() { editor.undo() }
-    @objc func redo() { editor.redo() }
+    @objc func undo() { if let input = window.firstResponder as? NSTextView { input.undoManager?.undo() } else { editor.undo() } }
+    @objc func redo() { if let input = window.firstResponder as? NSTextView { input.undoManager?.redo() } else { editor.redo() } }
     @objc func zoomIn() { editor.zoom = min(500, editor.zoom * 1.4); refresh(); timeline.centerOnPlayhead() }
     @objc func zoomOut() { editor.zoom = max(timeline.minimumZoom, editor.zoom / 1.4); refresh(); timeline.centerOnPlayhead() }
     @objc func quit() { NSApp.terminate(nil) }
