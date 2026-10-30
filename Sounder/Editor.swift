@@ -69,7 +69,7 @@ final class Editor: NSObject {
         selection = selection.intersection(Set(project.tracks.flatMap(\.clips).map(\.id)))
     }
     func renameProject(_ name: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = NameRules.normalized(name)
         guard !trimmed.isEmpty, trimmed != projectName else { return }
         checkpoint(); project.name = trimmed; update("Project renamed")
     }

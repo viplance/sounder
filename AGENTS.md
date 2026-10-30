@@ -19,7 +19,7 @@
 ## Button cursors
 
 - Use PointerButton for app-owned clickable buttons, including all icon buttons. Enabled buttons show the pointing-hand cursor; disabled buttons retain the standard cursor.
-- Track rename hit areas and I-beam regions cover only the rendered name text, not the rest of the header or the nesting arrow. Edit project and track names inline at the label position, without a popup, field background, border or automatic select-all. Activation must preserve text geometry and neighboring positions; grow the editor with the typed text, capped at its existing layout boundary. Enter commits a nonempty trimmed name, Escape cancels, and leaving the field commits a valid name (an empty field retains the previous name). Keep transport shortcuts inactive while typing.
+- Track rename hit areas and I-beam regions cover only the rendered name text, not the rest of the header or the nesting arrow. Edit project and track names inline at the label position, without a popup, field background, border or automatic select-all. Activation must preserve text geometry and neighboring positions; grow the editor with the typed text, capped at its existing layout boundary. Limit project and track names to 100 Swift Characters (including spaces; do not split emoji). Scroll overflowing inline text horizontally to keep the insertion point and latest typed character visible after layout. Enter commits a nonempty trimmed name, Escape cancels, and leaving the field commits a valid name (an empty field retains the previous name). Keep transport shortcuts inactive while typing.
 - Project and track rename targets use the I-beam text cursor. Track MUTE and FX controls use the pointing-hand cursor. Refresh timeline cursor regions when tracks, layout, or editing availability change.
 
 ## Project audio format
@@ -83,7 +83,7 @@
 
 ## Window header
 
-- Render the project name as plain text with an I-beam cursor, without button chrome. Explicitly set the project NSToolbarItem.isBordered to false so macOS does not wrap the custom title view in a glass bezel. Keep the editable project name, clickable project audio quality immediately after it, and Open project, Save project, Export controls in the native compact titlebar toolbar. Hide the system window title. Omit the app icon and Sounder wordmark from the titlebar; retain the application icon for the Dock and Finder. Place the PLAYER/FRAGMENTS/TRACKS/VIEW panel directly below the titlebar, with no separate project header row or extra vertical gap.
+- Render the project name as plain text with an I-beam cursor, without button chrome. Allow up to 640 pt for the project name; use 13 pt semibold for both display and editing, and a smaller 10 pt audio-quality caption. Explicitly set the project NSToolbarItem.isBordered to false so macOS does not wrap the custom title view in a glass bezel. Keep the editable project name, clickable project audio quality immediately after it, and Open project, Save project, Export controls in the native compact titlebar toolbar. Hide the system window title. Omit the app icon and Sounder wordmark from the titlebar; retain the application icon for the Dock and Finder. Place the PLAYER/FRAGMENTS/TRACKS/VIEW panel directly below the titlebar, with no separate project header row or extra vertical gap.
 
 ## Export
 

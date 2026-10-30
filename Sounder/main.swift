@@ -31,23 +31,34 @@ final class ProjectNameView: NSView {
     let label: ProjectNameLabel
     let field: InlineNameField
     private let dirtyMark = NSTextField(labelWithString: "  •")
+    private var nameWidth: NSLayoutConstraint!
     init(label: ProjectNameLabel, field: InlineNameField) {
         self.label = label; self.field = field
         super.init(frame: .zero)
         addSubview(label); addSubview(field); addSubview(dirtyMark)
         dirtyMark.font = label.font; dirtyMark.textColor = label.textColor; dirtyMark.isHidden = true
+        nameWidth = widthAnchor.constraint(equalToConstant: intrinsicContentSize.width)
+        nameWidth.isActive = true
         field.textChanged = { [weak self] in self?.updateSize() }
     }
     required init?(coder: NSCoder) { fatalError() }
     private var showsDirtyMark: Bool { field.isRenaming && label.stringValue.hasSuffix("  •") }
     private var editingWidth: CGFloat {
-        (field.stringValue as NSString).size(withAttributes: [.font: field.font!]).width
+        let measurement = NSTextField(labelWithString: field.stringValue)
+        measurement.font = field.font
+        return measurement.intrinsicContentSize.width + 4
     }
     override var intrinsicContentSize: NSSize {
-        let width = field.isRenaming ? editingWidth + (showsDirtyMark ? dirtyMark.intrinsicContentSize.width : 0) : label.intrinsicContentSize.width
-        return NSSize(width: min(320, max(4, width)), height: label.intrinsicContentSize.height)
+        let display = NSTextField(labelWithString: label.stringValue)
+        display.font = label.font
+        let width = field.isRenaming ? editingWidth + (showsDirtyMark ? dirtyMark.intrinsicContentSize.width : 0) : display.intrinsicContentSize.width + 4
+        return NSSize(width: min(640, max(4, width)), height: display.intrinsicContentSize.height)
     }
-    func updateSize() { invalidateIntrinsicContentSize(); needsLayout = true }
+    func updateSize() { nameWidth.constant = intrinsicContentSize.width; invalidateIntrinsicContentSize(); needsLayout = true }
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsLayout = true
+    }
     override func layout() {
         super.layout()
         label.frame = bounds
@@ -128,7 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let icon = Bundle.main.url(forResource: "AppIcon", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
         if let icon { NSApp.applicationIconImage = icon }
         projectLabel = ProjectNameLabel(labelWithString: "MY PROJECT")
-        projectLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        projectLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         projectLabel.textColor = .secondaryLabelColor
         projectLabel.target = self; projectLabel.action = #selector(renameProject)
         projectLabel.setAccessibilityLabel("Project name")
@@ -137,7 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         projectNameField.font = projectLabel.font; projectNameField.setAccessibilityLabel("Project name")
         projectNameField.textColor = projectLabel.textColor
         projectNameView = ProjectNameView(label: projectLabel, field: projectNameField)
-        qualityButton = textButton(ProjectAudioFormat().label, size: 9, action: #selector(audioSettings)); qualityButton.toolTip = "Project audio settings"
+        qualityButton = textButton(ProjectAudioFormat().label, size: 10, action: #selector(audioSettings)); qualityButton.toolTip = "Project audio settings"
         let export = PointerButton(title: "Export", target: self, action: #selector(exportAudio)); export.bezelStyle = .rounded
         export.widthAnchor.constraint(equalToConstant: export.intrinsicContentSize.width + 16).isActive = true
         exportButton = export
@@ -265,6 +276,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             self.editor.dirty = false; NSApp.terminate(nil)
         }
     }
+    func verifyLongInlineName(_ field: InlineNameField) throws {
+        guard let input = field.currentEditor() as? NSTextView else { throw SounderError.message("Name field has no text editor") }
+        let original = input.string
+        func replace(_ value: String) { input.selectAll(nil); input.insertText(value, replacementRange: input.selectedRange()) }
+        replace(String(repeating: "W", count: 105))
+        guard input.string.count == 100, field.stringValue.count == 100 else { throw SounderError.message("Name input exceeds 100 characters") }
+        input.insertText("Z", replacementRange: input.selectedRange())
+        guard input.string.count == 100 else { throw SounderError.message("Typing beyond 100 characters is accepted") }
+        field.revealCaret()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+        let end = NSRange(location: (input.string as NSString).length, length: 0)
+        let caret = input.firstRect(forCharacterRange: end, actualRange: nil)
+        let visible = window.convertToScreen(field.convert(field.bounds, to: nil))
+        guard caret.minX >= visible.minX - 1 && caret.maxX <= visible.maxX + 1 else { throw SounderError.message("End caret is clipped: caret=\(caret), field=\(visible), editor=\(input.visibleRect)") }
+        replace(String(repeating: "👩🏽‍💻", count: 101))
+        guard input.string.count == 100, input.string == String(repeating: "👩🏽‍💻", count: 100) else { throw SounderError.message("Name limit splits composed Unicode characters") }
+        replace(original)
+        print("PASS: 100-character name limit, paste, typing, emoji and visible end caret in \(field.accessibilityLabel() ?? "name")")
+    }
     func verifyTrackNameUI() throws {
         func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
             NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
@@ -300,6 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let initialNameWidth = timeline.nameField.frame.width
         guard !timeline.nameField.drawsBackground, initialNameWidth <= timeline.trackNameHitRect(row: 0, depth: 0).width + 5,
               (timeline.nameField.currentEditor() as? NSTextView)?.selectedRange().length == 0 else { throw SounderError.message("Track editor changes the label appearance or selects its text") }
+        try verifyLongInlineName(timeline.nameField)
         type("Lead Voice", into: timeline.nameField)
         guard timeline.nameField.frame.width > initialNameWidth else { throw SounderError.message("Track editor does not grow with its text") }
         _ = timeline.nameField.control(timeline.nameField, textView: timeline.nameField.currentEditor() as! NSTextView, doCommandBy: #selector(NSResponder.insertNewline(_:)))
@@ -399,10 +430,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard abs(projectNameView.frame.width - initialWidth) < 1,
               abs(qualityButton.convert(NSPoint.zero, to: nil).x - qualityPosition.x) < 1,
               !projectNameField.drawsBackground,
-              (projectNameField.currentEditor() as? NSTextView)?.selectedRange().length == 0 else { throw SounderError.message("Beginning project rename changes layout or text appearance: \(initialWidth) → \(projectNameView.frame.width)") }
+              (projectNameField.currentEditor() as? NSTextView)?.selectedRange().length == 0 else { throw SounderError.message("Beginning project rename changes layout or text appearance: \(initialWidth) → \(projectNameView.frame.width), quality \(qualityPosition.x) → \(qualityButton.convert(NSPoint.zero, to: nil).x), selection \(String(describing: (projectNameField.currentEditor() as? NSTextView)?.selectedRange()))") }
         if let input = projectNameField.currentEditor() as? NSTextView { input.insertText(" Extended", replacementRange: input.selectedRange()) }
         window.contentView?.superview?.layoutSubtreeIfNeeded()
         guard projectNameView.frame.width > initialWidth else { throw SounderError.message("Project editor does not grow with its text") }
+        try verifyLongInlineName(projectNameField)
         projectNameField.stringValue = "Studio Session"; projectNameField.finish(commit: true, requireValid: true)
         guard editor.projectName == "Studio Session", projectLabel.stringValue.contains("Studio Session"), !projectLabel.isHidden else { throw SounderError.message("Inline project rename did not save") }
         projectLabel.sendAction(projectLabel.action, to: projectLabel.target)
@@ -424,6 +456,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         dialogAutomation = nil
         editor.undo(); guard qualityButton.title.contains("48 kHz STEREO · 24 bit") else { throw SounderError.message("Undo did not update the audio label") }
         editor.redo(); editor.dirty = false; refresh()
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+        guard projectNameView.frame.width >= min(640, projectLabel.intrinsicContentSize.width) - 0.5 else { throw SounderError.message("Toolbar clips the committed project name despite available space") }
         print("PASS: clicking audio label edits rate/channels; Undo/Redo updates the label")
     }
     func textButton(_ title: String, size: CGFloat, action: Selector, cursor: NSCursor = .pointingHand) -> NSButton {
@@ -507,7 +541,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         projectNameView.updateSize()
         projectLabel.isEnabled = !editor.busy; qualityButton.isEnabled = !editor.busy
         titlebarItems[NSToolbarItem.Identifier("quality")]?.isEnabled = !editor.busy
-        qualityButton.title = editor.project.audioFormat.label
+        qualityButton.attributedTitle = NSAttributedString(string: editor.project.audioFormat.label, attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ])
         window.title = editor.projectName + " — Sounder"
         window.isDocumentEdited = editor.dirty
     }

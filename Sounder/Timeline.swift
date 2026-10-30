@@ -22,21 +22,23 @@ final class InlineNameField: NSTextField, NSTextFieldDelegate {
         delegate = self; isHidden = true; isBezeled = false; drawsBackground = false
         backgroundColor = panelColor; textColor = .labelColor; focusRingType = .none
         usesSingleLineMode = true; lineBreakMode = .byClipping
+        (cell as? NSTextFieldCell)?.isScrollable = true
     }
     required init?(coder: NSCoder) { fatalError() }
     func begin(_ name: String, commit: @escaping (String) -> Void, end: @escaping () -> Void) {
         guard !isRenaming else { return }
-        stringValue = name; commitName = commit; ended = end; isRenaming = true; isHidden = false
+        stringValue = String(name.prefix(NameRules.maximumLength)); commitName = commit; ended = end; isRenaming = true; isHidden = false
         textChanged?()
         window?.makeFirstResponder(self)
         if let input = currentEditor() as? NSTextView {
             input.drawsBackground = false
             input.setSelectedRange(NSRange(location: (input.string as NSString).length, length: 0))
         }
+        revealCaret()
     }
     @discardableResult func finish(commit: Bool, requireValid: Bool = false) -> Bool {
         guard isRenaming else { return true }
-        let name = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = NameRules.normalized(stringValue)
         if commit && requireValid && name.isEmpty { NSSound.beep(); return false }
         let save = commitName, end = ended
         isRenaming = false; commitName = nil; ended = nil
@@ -46,7 +48,29 @@ final class InlineNameField: NSTextField, NSTextFieldDelegate {
         if commit && !name.isEmpty { save?(name) }
         return true
     }
-    func controlTextDidChange(_ notification: Notification) { textChanged?() }
+    func controlTextDidChange(_ notification: Notification) {
+        if let input = currentEditor() as? NSTextView, !input.hasMarkedText(), input.string.count > NameRules.maximumLength {
+            let selection = input.selectedRange()
+            let limited = String(input.string.prefix(NameRules.maximumLength))
+            input.string = limited
+            let length = (limited as NSString).length
+            input.setSelectedRange(NSRange(location: min(selection.location, length), length: min(selection.length, max(0, length - min(selection.location, length)))))
+            stringValue = limited
+        }
+        textChanged?()
+        revealCaret()
+    }
+    func revealCaret() {
+        guard isRenaming else { return }
+        // The toolbar and the track editor may resize after a keystroke. Scroll after
+        // that layout, so AppKit keeps the insertion point inside the final field width.
+        window?.contentView?.superview?.layoutSubtreeIfNeeded()
+        if let input = currentEditor() as? NSTextView { input.scrollRangeToVisible(input.selectedRange()) }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRenaming, let input = self.currentEditor() as? NSTextView else { return }
+            input.scrollRangeToVisible(input.selectedRange())
+        }
+    }
     func controlTextDidEndEditing(_ notification: Notification) { finish(commit: true) }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {

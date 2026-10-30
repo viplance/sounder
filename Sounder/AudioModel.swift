@@ -1,6 +1,13 @@
 import Foundation
 import AVFoundation
 
+enum NameRules {
+    static let maximumLength = 100
+    static func normalized(_ value: String) -> String {
+        String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maximumLength)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 let sampleRate = 48_000.0
 struct Clip: Codable, Identifiable {
     var id = UUID()
