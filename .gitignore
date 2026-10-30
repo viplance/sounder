@@ -1,0 +1,33 @@
+build/
+.build/
+.DS_Store
+*.xcuserstate
+xcuserdata/
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.p8
+*.key
+*.pem
+*.keychain
+*.keychain-db
+*.mobileprovision
+*.provisionprofile
+credentials.json
+secrets.json
+
+# Local recordings, projects, logs and editor state
+*.sounder
+*.wav
+*.mp3
+*.ogg
+*.aiff
+*.m4a
+*.log
+.vscode/
+.idea/
+node_modules/

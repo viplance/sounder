@@ -1,0 +1,500 @@
+import AppKit
+
+let background = NSColor(calibratedRed: 0.055, green: 0.065, blue: 0.085, alpha: 1)
+let panelColor = NSColor(calibratedRed: 0.085, green: 0.10, blue: 0.13, alpha: 1)
+let accent = NSColor(calibratedRed: 0.40, green: 0.88, blue: 0.75, alpha: 1)
+let trackColors: [NSColor] = [accent, .init(calibratedRed: 0.57, green: 0.62, blue: 0.98, alpha: 1), .init(calibratedRed: 0.94, green: 0.67, blue: 0.41, alpha: 1), .init(calibratedRed: 0.82, green: 0.53, blue: 0.81, alpha: 1)]
+func label(_ text: String, _ rect: NSRect, size: CGFloat = 12, color: NSColor = .labelColor, weight: NSFont.Weight = .regular, alignment: NSTextAlignment = .left) {
+    let style = NSMutableParagraphStyle(); style.lineBreakMode = .byTruncatingTail; style.alignment = alignment
+    (text as NSString).draw(in: rect, withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: weight), .foregroundColor: color, .paragraphStyle: style])
+}
+func fill(_ rect: NSRect, _ color: NSColor, radius: CGFloat = 0) { color.setFill(); NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill() }
+func line(_ from: NSPoint, _ to: NSPoint, _ color: NSColor, width: CGFloat = 1) { color.setStroke(); let p = NSBezierPath(); p.lineWidth = width; p.move(to: from); p.line(to: to); p.stroke() }
+
+private final class TrackNameValidator: NSObject, NSTextFieldDelegate {
+    weak var button: NSButton?
+    init(button: NSButton) { self.button = button }
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField else { return }
+        button?.isEnabled = !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+final class Timeline: NSView {
+    let editor: Editor
+    let header: CGFloat = 220
+    let rowHeight: CGFloat = 116 / 1.5
+    let ruler: CGFloat = 42
+    var rows: [(Track, Int)] = []
+    var dragClip: UUID?
+    var dragStart = NSPoint.zero
+    var originalStart = 0.0
+    var dragTrack: UUID?
+    var dragDestination: UUID?
+    var didCheckpoint = false
+    var selectingRange = false
+    var rangeAnchor: Double?
+    var didDragRange = false
+    var trackDrag: UUID?
+    var pendingTrackRename: UUID?
+    private var scrollObserver: NSObjectProtocol?
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+    init(_ editor: Editor) { self.editor = editor; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError() }
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
+        scrollObserver = nil
+        guard let clip = enclosingScrollView?.contentView else { return }
+        clip.postsBoundsChangedNotifications = true
+        scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.setNeedsDisplay(self.visibleRect)
+            self.window?.invalidateCursorRects(for: self)
+        }
+    }
+    deinit { if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) } }
+    var pinnedRulerRect: NSRect { NSRect(x: 0, y: max(0, visibleRect.minY), width: bounds.width, height: ruler) }
+    var pinnedHeaderX: CGFloat { max(0, visibleRect.minX) }
+    var fragmentLeft: CGFloat { pinnedHeaderX + header }
+    var visibleFragmentRect: NSRect {
+        let visible = visibleRect
+        return NSRect(x: fragmentLeft, y: visible.minY, width: max(0, visible.width - header), height: visible.height)
+    }
+    var visibleTrackRect: NSRect {
+        let visible = visibleRect, top = pinnedRulerRect.maxY
+        return NSRect(x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
+    }
+    func isTrackPoint(_ point: NSPoint) -> Bool { point.y >= ruler && !pinnedRulerRect.contains(point) }
+    var timelineDuration: Double { max(30, editor.duration + 8, editor.cursor + 5) }
+    var viewportSize: NSSize { enclosingScrollView?.contentSize ?? NSSize(width: 1000, height: 600) }
+    var minimumZoom: Double { max(1, viewportSize.width - header) / timelineDuration }
+    var rulerStep: Double {
+        let required = 80 / editor.zoom
+        let magnitude = pow(10, floor(log10(max(1, required))))
+        return [1.0, 2, 5, 10].map { $0 * magnitude }.first { $0 >= required } ?? magnitude * 10
+    }
+    func refresh() {
+        rows = []
+        func append(_ parent: UUID?, depth: Int) {
+            for track in editor.project.tracks where track.parent == parent { rows.append((track, depth)); append(track.id, depth: depth + 1) }
+        }
+        append(nil, depth: 0)
+        window?.invalidateCursorRects(for: self)
+        let visible = viewportSize
+        editor.zoom = max(minimumZoom, editor.zoom)
+        let width = editor.zoom <= minimumZoom ? visible.width : max(visible.width, header + timelineDuration * editor.zoom)
+        frame.size = NSSize(width: width, height: max(visible.height, ruler + CGFloat(rows.count) * rowHeight + 110))
+        needsDisplay = true
+        if editor.isRecording, let scroll = enclosingScrollView {
+            let visible = scroll.documentVisibleRect, x = header + editor.cursor * editor.zoom
+            if x > visible.maxX - 40 {
+                scroll.contentView.scroll(to: NSPoint(x: max(0, x - visible.width + 80), y: visible.minY))
+                scroll.reflectScrolledClipView(scroll.contentView)
+            }
+        }
+    }
+    func clipRect(_ clip: Clip, row: Int, layer: Int) -> NSRect {
+        NSRect(x: header + clip.start * editor.zoom, y: ruler + CGFloat(row) * rowHeight + 8 + CGFloat(min(layer, 4)) * 2, width: max(2, clip.duration * editor.zoom), height: rowHeight - 16 - CGFloat(min(layer, 4)) * 2)
+    }
+    func dropTrack(at point: NSPoint) -> UUID? {
+        guard isTrackPoint(point), !rows.isEmpty else { return nil }
+        let row = min(rows.count - 1, Int((point.y - ruler) / rowHeight))
+        return rows[row].0.id
+    }
+    func displayedClips(for track: Track) -> [Clip] {
+        var clips = track.clips
+        if let id = dragClip, let source = dragTrack, let target = dragDestination, source != target,
+           let clip = editor.project.tracks.first(where: { $0.id == source })?.clips.first(where: { $0.id == id }) {
+            if track.id == source { clips.removeAll { $0.id == id } }
+            if track.id == target { clips.append(clip) }
+        }
+        clips.sort { $0.order < $1.order }
+        // Keep the moving fragment visible above existing destination fragments.
+        if dragDestination != nil, let id = dragClip, let index = clips.firstIndex(where: { $0.id == id }) {
+            clips.append(clips.remove(at: index))
+        }
+        return clips
+    }
+    func trackNameRect(row: Int, depth: Int) -> NSRect {
+        let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
+        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 12, height: 22)
+    }
+    func trackNameHitRect(row: Int, depth: Int) -> NSRect {
+        guard rows.indices.contains(row) else { return .zero }
+        var rect = trackNameRect(row: row, depth: depth)
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]
+        let prefix = depth > 0 ? ("↳  " as NSString).size(withAttributes: attributes).width : 0
+        rect.origin.x += prefix
+        rect.size.width = max(0, min(rect.width - prefix, ceil((rows[row].0.name as NSString).size(withAttributes: attributes).width)))
+        return rect
+    }
+    func trackMuteRect(row: Int, depth: Int) -> NSRect {
+        NSRect(x: pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18, y: ruler + CGFloat(row) * rowHeight + 42, width: 46, height: 23)
+    }
+    func trackFXRect(row: Int, depth: Int) -> NSRect {
+        let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
+        return NSRect(x: min(fragmentLeft - 72, x + 54), y: ruler + CGFloat(row) * rowHeight + 42, width: 46, height: 23)
+    }
+    func rangeHandleRects() -> [NSRect] {
+        guard let range = editor.range else { return [] }
+        return [range.lowerBound, range.upperBound].map {
+            NSRect(x: header + $0 * editor.zoom - 5, y: pinnedRulerRect.minY, width: 10, height: ruler)
+                .intersection(NSRect(x: fragmentLeft, y: pinnedRulerRect.minY, width: max(0, visibleRect.width - header), height: ruler))
+        }
+    }
+    var canSelectRange: Bool { !editor.isRecording && !editor.requestingMic && !editor.isImporting }
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if canSelectRange {
+            for rect in rangeHandleRects() {
+                let visible = rect.intersection(visibleRect)
+                if !visible.isEmpty { addCursorRect(visible, cursor: .resizeLeftRight) }
+            }
+        }
+        for (row, item) in rows.enumerated() {
+            let depth = item.1
+            for (rect, cursor) in [(trackNameHitRect(row: row, depth: depth), NSCursor.iBeam),
+                                   (trackMuteRect(row: row, depth: depth), NSCursor.pointingHand),
+                                   (trackFXRect(row: row, depth: depth), NSCursor.pointingHand)] {
+                let visible = rect.intersection(visibleTrackRect)
+                if !visible.isEmpty && (!editor.busy || ((rect == trackFXRect(row: row, depth: depth) || rect == trackMuteRect(row: row, depth: depth)) && !editor.isRecording && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
+            }
+        }
+    }
+    func renameTrack(_ id: UUID) {
+        guard !editor.busy, let index = editor.project.tracks.firstIndex(where: { $0.id == id }) else { return }
+        let currentName = editor.project.tracks[index].name
+        let alert = NSAlert(); alert.messageText = "Rename track"
+        let field = NSTextField(string: currentName); field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        field.setAccessibilityLabel("Track name"); alert.accessoryView = field
+        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field
+        let validator = TrackNameValidator(button: alert.buttons[0]); field.delegate = validator
+        alert.buttons[0].isEnabled = !currentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard withExtendedLifetime(validator, { alert.runModal() }) == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != currentName, let index = editor.project.tracks.firstIndex(where: { $0.id == id }) else { return }
+        editor.checkpoint(); editor.project.tracks[index].name = name; editor.update("Track renamed")
+    }
+    func drawWaveform(_ peaks: [Float], partialPeak: Float? = nil, sampleRate: Double, offset: Double, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
+        let top = rect.minY + 1, bottom = rect.maxY - 1
+        let mid = (top + bottom) / 2, amplitude = max(1, (bottom - top) / 2)
+        let lowX = max(rect.minX, dirtyRect.minX), highX = min(rect.maxX, dirtyRect.maxX)
+        let count = peaks.count + (partialPeak == nil ? 0 : 1)
+        let path = NSBezierPath(); path.lineWidth = 1
+        for x in stride(from: lowX, to: highX, by: 2) {
+            let seconds = offset + (x - rect.minX) / editor.zoom
+            let first = max(0, Int(seconds * sampleRate) / 128)
+            let last = min(count, max(first + 1, Int((seconds + 2 / editor.zoom) * sampleRate) / 128))
+            var peak: Float = 0
+            if first < last { for index in first..<last { peak = max(peak, index < peaks.count ? peaks[index] : (partialPeak ?? 0)) } }
+            let h = CGFloat(min(1, peak)) * amplitude
+            path.move(to: NSPoint(x: x, y: mid - h)); path.line(to: NSPoint(x: x, y: mid + max(0.4, h)))
+        }
+        color.setStroke(); path.stroke()
+    }
+    func drawChannelWaveforms(_ peaks: [[Float]], partialPeaks: [Float?] = [], sampleRate: Double, offset: Double, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
+        let count = min(2, peaks.count)
+        guard count > 0 else { return }
+        let top = rect.minY + 2, bottom = rect.maxY - 2
+        let gap: CGFloat = count == 2 ? 2 : 0
+        let height = max(0, (bottom - top - gap) / CGFloat(count))
+        for channel in 0..<count {
+            let lane = NSRect(x: rect.minX, y: top + CGFloat(channel) * (height + gap), width: rect.width, height: height)
+            drawWaveform(peaks[channel], partialPeak: partialPeaks.indices.contains(channel) ? partialPeaks[channel] : nil, sampleRate: sampleRate, offset: offset, in: lane, dirtyRect: dirtyRect, color: color)
+        }
+        if count == 2 {
+            let y = top + height + gap / 2
+            line(NSPoint(x: rect.minX + 1, y: y), NSPoint(x: rect.maxX - 1, y: y), color.withAlphaComponent(0.15))
+        }
+    }
+    func drawFragmentTitle(_ text: String, in rect: NSRect, color: NSColor, weight: NSFont.Weight = .medium) {
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow(); shadow.shadowColor = NSColor.black; shadow.shadowOffset = .zero
+        let titleRect = NSRect(x: rect.minX + 9, y: rect.minY + 6, width: max(0, rect.width - 18), height: 16)
+        for radius: CGFloat in [10, 8, 6, 4, 2] {
+            shadow.shadowBlurRadius = radius; shadow.set()
+            label(text, titleRect, size: 10, color: color, weight: weight)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        fill(bounds, background)
+        for tick in rulerTicks(in: dirtyRect) {
+            let x = header + tick.time * editor.zoom
+            let alpha = editor.project.tempoMode ? (tick.isBar ? 0.10 : 0.035) : 0.045
+            line(NSPoint(x: x, y: ruler), NSPoint(x: x, y: bounds.height), NSColor.white.withAlphaComponent(alpha))
+        }
+        for (index, item) in rows.enumerated() {
+            let track = item.0; let y = ruler + CGFloat(index) * rowHeight
+            if !NSRect(x: 0, y: y, width: bounds.width, height: rowHeight).intersects(dirtyRect) { continue }
+            let color = trackColors[index % trackColors.count]
+            line(NSPoint(x: 0, y: y + rowHeight), NSPoint(x: bounds.width, y: y + rowHeight), .white.withAlphaComponent(0.065))
+            let clips = displayedClips(for: track)
+            for (layer, clip) in clips.enumerated() {
+                let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
+                let rect = clipRect(clip, row: index, layer: overlaps)
+                guard rect.intersects(dirtyRect) else { continue }
+                fill(rect.offsetBy(dx: 0, dy: 3), .black.withAlphaComponent(0.4), radius: 6)
+                fill(rect, color.blended(withFraction: 0.78, of: background)!, radius: 6)
+                let outline = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6); outline.lineWidth = editor.selection.contains(clip.id) ? 2 : 1
+                (editor.selection.contains(clip.id) ? color : color.withAlphaComponent(0.45)).setStroke(); outline.stroke()
+                NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
+                if let data = try? editor.audio.load(clip.source) {
+                    drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(track.muted ? 0.3 : 0.9))
+                }
+                drawFragmentTitle(clip.name, in: rect, color: color)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            if editor.isRecording && editor.recordingTrack == track.id {
+                let rect = NSRect(x: header + editor.recordingStart * editor.zoom, y: y + 8, width: max(10, (editor.cursor - editor.recordingStart) * editor.zoom), height: rowHeight - 16)
+                fill(rect, NSColor.systemRed.blended(withFraction: 0.85, of: background)!, radius: 6)
+                NSColor.systemRed.setStroke(); NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).stroke()
+                NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
+                drawChannelWaveforms(editor.recordingChannelPeaks, partialPeaks: editor.recordingPartialChannelPeaks, sampleRate: editor.recorder?.format.sampleRate ?? editor.audio.sampleRate, offset: 0, in: rect, dirtyRect: dirtyRect, color: .systemRed)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        }
+        if let range = editor.range {
+            fill(NSRect(x: header + range.lowerBound * editor.zoom, y: ruler, width: (range.upperBound - range.lowerBound) * editor.zoom, height: bounds.height - ruler), accent.withAlphaComponent(0.09))
+        }
+        let playX = header + editor.cursor * editor.zoom
+        line(NSPoint(x: playX, y: ruler), NSPoint(x: playX, y: bounds.height), editor.isRecording ? .systemRed : accent, width: 1.5)
+        drawTrackHeaders(in: dirtyRect)
+        drawRuler(in: dirtyRect)
+    }
+    private func drawTrackHeaders(in dirtyRect: NSRect) {
+        let column = NSRect(x: pinnedHeaderX, y: ruler, width: header, height: max(0, bounds.height - ruler))
+        fill(column, panelColor)
+        NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: column).addClip()
+        for (index, item) in rows.enumerated() {
+            let (track, depth) = item; let y = ruler + CGFloat(index) * rowHeight
+            guard NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight).intersects(dirtyRect) else { continue }
+            let selected = editor.selectedTrack == track.id
+            fill(NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight), selected ? NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.19, alpha: 1) : panelColor)
+            let color = trackColors[index % trackColors.count]
+            fill(NSRect(x: pinnedHeaderX, y: y + 1, width: 3, height: rowHeight - 2), selected ? color : .clear)
+            label(depth > 0 ? "↳  \(track.name)" : track.name, trackNameRect(row: index, depth: depth), size: 13, weight: .semibold)
+            let muteRect = trackMuteRect(row: index, depth: depth)
+            fill(muteRect, track.muted ? NSColor.systemOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+            label(track.muted ? "MUTED" : "MUTE", NSRect(x: muteRect.minX, y: muteRect.minY + 5, width: muteRect.width, height: 15), size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, weight: .semibold, alignment: .center)
+            let fxRect = trackFXRect(row: index, depth: depth)
+            fill(fxRect, track.effects.isEmpty ? NSColor.white.withAlphaComponent(0.06) : color.withAlphaComponent(0.18), radius: 5)
+            label("FX", NSRect(x: fxRect.minX, y: fxRect.minY + 5, width: fxRect.width, height: 15), size: 10, color: track.effects.isEmpty ? .secondaryLabelColor : color, weight: .semibold, alignment: .center)
+            line(NSPoint(x: pinnedHeaderX, y: y + rowHeight), NSPoint(x: fragmentLeft, y: y + rowHeight), .white.withAlphaComponent(0.065))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        line(NSPoint(x: fragmentLeft, y: ruler), NSPoint(x: fragmentLeft, y: bounds.height), .white.withAlphaComponent(0.10))
+    }
+    func rulerTicks(in rect: NSRect) -> [TempoTick] {
+        let start = max(0, (rect.minX - header) / editor.zoom)
+        let end = max(start, (rect.maxX - header) / editor.zoom)
+        if editor.project.tempoMode { return TempoGrid.ticks(from: start, to: end, zoom: editor.zoom, bpm: editor.project.tempo) }
+        let step = rulerStep, first = floor(start / step) * step
+        return stride(from: first, through: end, by: step).map {
+            TempoTick(time: $0, label: String(format: "%02d:%02d", Int($0) / 60, Int($0) % 60), isBar: true)
+        }
+    }
+    private func drawRuler(in dirtyRect: NSRect) {
+        let rect = pinnedRulerRect, top = rect.minY
+        fill(rect, panelColor)
+        NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: visibleFragmentRect).addClip()
+        if let range = editor.range {
+            fill(NSRect(x: header + range.lowerBound * editor.zoom, y: top, width: (range.upperBound - range.lowerBound) * editor.zoom, height: ruler), accent.withAlphaComponent(0.09))
+        }
+        for tick in rulerTicks(in: dirtyRect) {
+            let x = header + tick.time * editor.zoom
+            if editor.project.tempoMode {
+                line(NSPoint(x: x, y: rect.maxY - (tick.isBar ? 10 : 5)), NSPoint(x: x, y: rect.maxY), NSColor.white.withAlphaComponent(tick.isBar ? 0.10 : 0.035))
+            }
+            if !tick.label.isEmpty { label(tick.label, NSRect(x: x + 7, y: top + 13, width: editor.project.tempoMode ? 70 : 60, height: 18), size: 10, color: editor.project.tempoMode && tick.isBar ? .labelColor : .secondaryLabelColor) }
+        }
+        if let range = editor.range {
+            for time in [range.lowerBound, range.upperBound] {
+                let x = header + time * editor.zoom
+                line(NSPoint(x: x, y: top), NSPoint(x: x, y: rect.maxY), accent.withAlphaComponent(0.8), width: 2)
+                fill(NSRect(x: x - 3, y: top + ruler / 2 - 6, width: 6, height: 12), accent, radius: 2)
+            }
+        }
+        let playX = header + editor.cursor * editor.zoom
+        line(NSPoint(x: playX, y: top), NSPoint(x: playX, y: rect.maxY), editor.isRecording ? .systemRed : accent, width: 1.5)
+        fill(NSRect(x: playX - 4, y: top, width: 8, height: 8), editor.isRecording ? .systemRed : accent, radius: 2)
+        if let start = editor.lastPlaybackStart {
+            let x = header + start * editor.zoom
+            line(NSPoint(x: x, y: rect.maxY - 15), NSPoint(x: x, y: rect.maxY), .systemOrange, width: 2)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        fill(NSRect(x: pinnedHeaderX, y: top, width: header, height: ruler), panelColor)
+        label("TRACKS", NSRect(x: pinnedHeaderX + 20, y: top + 14, width: 150, height: 18), size: 10, color: .secondaryLabelColor, weight: .semibold)
+    }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        let point = convert(event.locationInWindow, from: nil)
+        // A ruler press is only a seek once released without dragging.
+        // Range selection and handle resizing never touch the transport.
+        if pinnedRulerRect.contains(point) {
+            guard canSelectRange, point.x >= fragmentLeft else { return }
+            dragStart = point; selectingRange = true; didDragRange = false; rangeAnchor = nil
+            if let range = editor.range {
+                let handles = rangeHandleRects()
+                let hits = handles.indices.filter { handles[$0].contains(point) }
+                if let edge = hits.min(by: { abs(handles[$0].midX - point.x) < abs(handles[$1].midX - point.x) }) {
+                    rangeAnchor = edge == 0 ? range.upperBound : range.lowerBound
+                }
+            }
+            return
+        }
+        if !editor.isRecording && !editor.requestingMic && !editor.isImporting && isTrackPoint(point) && point.x < fragmentLeft {
+            let row = Int((point.y - ruler) / rowHeight)
+            if rows.indices.contains(row), trackMuteRect(row: row, depth: rows[row].1).contains(point) {
+                editor.selectedTrack = rows[row].0.id
+                editor.toggleMute(rows[row].0.id); return
+            }
+            if rows.indices.contains(row), trackFXRect(row: row, depth: rows[row].1).contains(point) {
+                editor.selectedTrack = rows[row].0.id; editor.update()
+                EffectsWindow(editor: editor, trackID: rows[row].0.id).run(); return
+            }
+        }
+        if point.x >= fragmentLeft && point.y >= 0 {
+            editor.seek(to: (point.x - header) / editor.zoom)
+        }
+        guard !editor.busy || (editor.isPlaying && point.x >= fragmentLeft) else { return }
+        let p = point; dragStart = p; didCheckpoint = false; pendingTrackRename = nil
+        let row = Int((p.y - ruler) / rowHeight)
+        guard isTrackPoint(p), row >= 0, row < rows.count else { return }
+        let (track, depth) = rows[row]; editor.selectedTrack = track.id
+        if p.x < fragmentLeft {
+            if trackFXRect(row: row, depth: depth).contains(p) {
+                EffectsWindow(editor: editor, trackID: track.id).run(); return
+            }
+            if trackMuteRect(row: row, depth: depth).contains(p) {
+                editor.toggleMute(track.id)
+            } else {
+                trackDrag = track.id
+                if trackNameHitRect(row: row, depth: depth).contains(p) { pendingTrackRename = track.id }
+            }
+            editor.update(); return
+        }
+        let clips = track.clips.sorted { $0.order < $1.order }
+        for (layer, clip) in clips.enumerated().reversed() {
+            let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
+            if clipRect(clip, row: row, layer: overlaps).contains(p) {
+                if event.modifierFlags.contains(.shift) { if editor.selection.contains(clip.id) { editor.selection.remove(clip.id) } else { editor.selection.insert(clip.id) } }
+                else if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
+                if editor.selection.contains(clip.id) { editor.hint(.selectFragments, "Shift click to multi select") }
+                if !editor.busy { dragClip = clip.id; originalStart = clip.start; dragTrack = track.id; dragDestination = nil }
+                editor.update(); return
+            }
+        }
+        editor.selection = []; editor.range = nil; editor.update()
+    }
+    private func autoscrollRange(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let horizontalPoint = NSPoint(x: point.x, y: visibleRect.midY)
+        if let horizontalEvent = NSEvent.mouseEvent(with: .leftMouseDragged, location: convert(horizontalPoint, to: nil), modifierFlags: event.modifierFlags, timestamp: event.timestamp, windowNumber: event.windowNumber, context: nil, eventNumber: event.eventNumber, clickCount: event.clickCount, pressure: event.pressure) {
+            autoscroll(with: horizontalEvent)
+        }
+    }
+    override func mouseDragged(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if selectingRange {
+            guard canSelectRange else { return }
+            guard didDragRange || abs(p.x - dragStart.x) > 3 else { return }
+            didDragRange = true
+            let a = rangeAnchor ?? max(0, (dragStart.x - header) / editor.zoom)
+            let b = max(0, (p.x - header) / editor.zoom)
+            editor.range = min(a, b)...max(a, b)
+            editor.update(); autoscrollRange(with: event); return
+        }
+        guard !editor.busy else { return }
+        if trackDrag != nil, hypot(p.x - dragStart.x, p.y - dragStart.y) > 4 { pendingTrackRename = nil; editor.hint(.nestTracks, "Drag tracks to nest") }
+        if let id = dragClip, hypot(p.x - dragStart.x, p.y - dragStart.y) > 2 || didCheckpoint {
+            dragDestination = dropTrack(at: p)
+            if !didCheckpoint { editor.checkpoint(); didCheckpoint = true }
+            for i in editor.project.tracks.indices { if let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == id }) { editor.project.tracks[i].clips[j].start = max(0, originalStart + (p.x - dragStart.x) / editor.zoom) } }
+            editor.update()
+        }
+        if trackDrag != nil {
+            let point = NSPoint(x: visibleRect.midX, y: p.y)
+            if let verticalEvent = NSEvent.mouseEvent(with: .leftMouseDragged, location: convert(point, to: nil), modifierFlags: event.modifierFlags, timestamp: event.timestamp, windowNumber: event.windowNumber, context: nil, eventNumber: event.eventNumber, clickCount: event.clickCount, pressure: event.pressure) { autoscroll(with: verticalEvent) }
+        } else { autoscroll(with: event) }
+    }
+    override func mouseUp(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
+        if selectingRange {
+            if canSelectRange && !didDragRange && rangeAnchor == nil {
+                editor.range = nil
+                editor.seek(to: max(0, (p.x - header) / editor.zoom))
+            }
+            selectingRange = false; rangeAnchor = nil; didDragRange = false
+            return
+        }
+        var renameID: UUID?
+        if let id = pendingTrackRename, hypot(p.x - dragStart.x, p.y - dragStart.y) <= 4,
+           isTrackPoint(p), row >= 0, row < rows.count, rows[row].0.id == id, trackNameHitRect(row: row, depth: rows[row].1).contains(p) {
+            renameID = id
+        }
+        if let id = trackDrag, hypot(p.x - dragStart.x, p.y - dragStart.y) > 8, row >= 0, row < rows.count, isTrackPoint(p) { editor.reparent(id, to: rows[row].0.id) }
+        if let id = dragClip, let source = dragTrack, let destination = dropTrack(at: p), destination != source {
+            if let i = editor.project.tracks.firstIndex(where: { $0.id == source }), let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == id }), let target = editor.project.tracks.firstIndex(where: { $0.id == destination }) {
+                if !didCheckpoint { editor.checkpoint() }
+                didCheckpoint = true
+                let clip = editor.project.tracks[i].clips.remove(at: j); editor.project.tracks[target].clips.append(clip); editor.selectedTrack = destination; editor.update()
+            }
+        }
+        dragClip = nil; dragTrack = nil; dragDestination = nil; trackDrag = nil; pendingTrackRename = nil; selectingRange = false
+        needsDisplay = true
+        if let renameID { renameTrack(renameID) }
+    }
+    func centerOnPlayhead() {
+        guard let scroll = enclosingScrollView else { return }
+        let width = scroll.contentSize.width
+        let position = editor.player?.currentTime ?? editor.cursor
+        let x = header + position * editor.zoom
+        var origin = x - header - (width - header) / 2
+        origin = min(max(0, frame.width - width), max(0, origin))
+        scroll.contentView.scroll(to: NSPoint(x: origin, y: scroll.contentView.bounds.minY))
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+    func movePlayhead(direction: Double) {
+        guard canSelectRange else { return }
+        let visible = visibleRect
+        let fragmentWidth = max(0, visible.width - header)
+        guard fragmentWidth > 0 else { return }
+        let step = Double(fragmentWidth) / editor.zoom * 0.01
+        let position = editor.player?.currentTime ?? editor.cursor
+        editor.seek(to: position + direction * step)
+    }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 123 { movePlayhead(direction: -1) }
+        else if event.keyCode == 124 { movePlayhead(direction: 1) }
+        else if event.keyCode == 126 { NSApp.sendAction(#selector(AppDelegate.zoomIn), to: NSApp.delegate, from: self) }
+        else if event.keyCode == 125 { NSApp.sendAction(#selector(AppDelegate.zoomOut), to: NSApp.delegate, from: self) }
+        else if event.keyCode == 36 || event.keyCode == 76 { editor.restartFromLastStart() }
+        else if event.keyCode == 49 { editor.playPause() }
+        else if event.keyCode == 51 || event.keyCode == 117 { editor.deleteClips() }
+        else { super.keyDown(with: event) }
+    }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard !editor.busy else { return nil }
+        let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
+        guard isTrackPoint(p), row >= 0 else { return nil }
+        if row >= rows.count {
+            guard p.x >= 0, p.x < fragmentLeft else { return nil }
+            let menu = NSMenu()
+            let item = NSMenuItem(title: "Add track", action: #selector(addTrack), keyEquivalent: "")
+            item.target = self; menu.addItem(item)
+            return menu
+        }
+        editor.selectedTrack = rows[row].0.id; editor.update()
+        let menu = NSMenu()
+        for (title, action) in [("Track effects…", #selector(effects)), ("Add nested track", #selector(nest)), ("Move to root", #selector(unparent)), ("Delete track…", #selector(remove))] { let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item) }
+        return menu
+    }
+    @objc func effects() { if let id = editor.selectedTrack { EffectsWindow(editor: editor, trackID: id).run() } }
+    @objc func addTrack() { editor.addTrack() }
+    @objc func nest() { editor.addTrack(nested: true) }
+    @objc func unparent() { if let id = editor.selectedTrack { editor.reparent(id, to: nil) } }
+    @objc func remove() { editor.removeTrack() }
+}

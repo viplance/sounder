@@ -1,0 +1,20 @@
+[
+  "Vendor/VST3/pluginterfaces/base/funknown.cpp",
+  "Vendor/VST3/pluginterfaces/base/ustring.cpp",
+  "Vendor/VST3/public.sdk/source/vst/vstinitiids.cpp",
+  "Vendor/VST3/public.sdk/source/common/commoniids.cpp",
+  "Vendor/VST3/public.sdk/source/common/memorystream.cpp",
+  "Vendor/VST3/public.sdk/source/vst/utility/stringconvert.cpp",
+  "Vendor/VST3/public.sdk/source/vst/hosting/module.cpp",
+  "Vendor/VST3/public.sdk/source/vst/hosting/module_mac.mm",
+  "Vendor/VST3/public.sdk/source/vst/hosting/plugprovider.cpp",
+  "Vendor/VST3/public.sdk/source/vst/hosting/connectionproxy.cpp",
+  "Vendor/VST3/public.sdk/source/vst/hosting/hostclasses.cpp",
+  "Vendor/VST3/public.sdk/source/vst/hosting/pluginterfacesupport.cpp",
+  "Vendor/VST3/public.sdk/source/vst/hosting/parameterchanges.cpp",
+  "Vendor/VST3/public.sdk/source/vst/hosting/processdata.cpp",
+  "Vendor/VST3/public.sdk/source/vst/hosting/eventlist.cpp",
+  "Vendor/VST3/pluginterfaces/base/coreiids.cpp",
+  "Vendor/VST3/public.sdk/source/common/commonstringconvert.cpp",
+  "Vendor/VST3/public.sdk/source/common/threadchecker_mac.mm"
+]

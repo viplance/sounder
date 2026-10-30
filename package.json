@@ -1,0 +1,17 @@
+{
+  "name": "sounder",
+  "version": "1.1.0",
+  "description": "Sounder \u2014 native macOS audio recorder and multitrack editor.",
+  "private": true,
+  "author": "Dzmitry Sharko",
+  "license": "MIT",
+  "scripts": {
+    "start": "node ./scripts/start.mjs",
+    "build:app": "node ./scripts/build.mjs",
+    "test": "node ./scripts/test.mjs",
+    "release": "node ./scripts/build-release.mjs",
+    "release:local": "node ./scripts/build-release.mjs --skip-notarize",
+    "clean": "rm -rf build .build",
+    "test:plugins": "node ./scripts/test-plugins.mjs"
+  }
+}

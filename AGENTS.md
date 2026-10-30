@@ -1,0 +1,98 @@
+# Sounder project preferences
+
+## Notifications and UX hints
+
+- Do not add permanent status messages or instructional captions to the main interface (including the footer, timeline heading, and empty timeline).
+- Present action feedback as rectangular notifications in the upper-right corner of the active application window.
+- Successful edits and saves: green background, white text. Errors: red background, white text. UX hints: yellow background, dark readable text.
+- Every message remains for 5 seconds independently. Append newer messages below older messages. Animate remaining messages upward when earlier messages expire.
+- UX hints trigger at the relevant interaction and appear only once per running app session. Do not persist their seen-state across launches, and do not reset it on project open, save, or Undo/Redo.
+- First actual drag of a track header: "Drag tracks to nest". First selection of an audio fragment: "Shift click to multi select".
+- Opening or refreshing an editor or effects panel is not a successful edit and must not emit a success notification. Transport state belongs in transport controls, not success notifications.
+- Use the shared ToastCenter and ToastOverlay for future features. Keep decision dialogs for actions requiring a choice; operational errors use notifications.
+
+- Muting or unmuting a track must not emit notifications; the MUTE control shows its state. MUTE remains clickable with a pointing-hand cursor during playback. Update the streaming graph on its worker without stopping audio, seeking, rebuilding the graph or resetting plug-ins. Parent mute silences its subtree; unmute also works for tracks muted before Play.
+- Track and fragment deletion notifications use a red background with white text.
+- Successful splitting or moving audio fragments must not emit success notifications or UX hints.
+- Invalid FRAGMENTS actions (Split, Trim, Delete, Join) show a yellow selection/instruction notification on every attempt, including repeated clicks. Successful Split and fragment moves remain silent. Only first-drag and first-selection onboarding hints are limited to once per session.
+
+## Button cursors
+
+- Use PointerButton for app-owned clickable buttons, including all icon buttons. Enabled buttons show the pointing-hand cursor; disabled buttons retain the standard cursor.
+- Track rename hit areas and I-beam regions cover only the rendered name text, not the rest of the header or the nesting arrow. Track Rename requires at least one non-whitespace character; disable Rename while the trimmed name is empty.
+- Project and track rename targets use the I-beam text cursor. Track MUTE and FX controls use the pointing-hand cursor. Refresh timeline cursor regions when tracks, layout, or editing availability change.
+
+## Project audio format
+
+- Tracks inherit the project's sample rate, Mono/Stereo mode, and recording/export bit depth. Do not show per-track fragment counts or format captions.
+- Preserve imported and recorded source files. Convert from each original source directly to the current project rate while preparing the mix; changing format must not accumulate resampling losses.
+- Use AVAudioConverter's Mastering algorithm with maximum quality and proper priming. Verify passband fidelity, alias rejection, timing, and mixed-source formats when changing conversion code.
+- Mix and run effects in Float32; apply the chosen PCM bit depth once to final playback/export and use it for new recordings.
+
+## Waveforms
+
+- Waveforms fill the fragment height. Draw fragment names over the waveform, with no reserved title row. Do not draw a RECORDING label or indicator icon inside the live recording fragment.
+- Draw stereo fragments as separate waveforms: left channel above right, using actual per-channel PCM peaks for both imported audio and live recording. Mono sources use one waveform.
+
+## Live recording
+
+- During recording, Space finalizes and retains the take and returns the cursor to its recording start. Enter (including keypad Enter) discards the current unsaved take and its file, then immediately starts a fresh take on the same track at the same recording start. Discarded takes must not consume take numbers or create Undo entries; keep earlier fragments intact.
+
+- Draw the recording waveform incrementally from actual incoming PCM buffers before Stop. Do not substitute metering values or generated waveforms in production.
+- Keep capture conversion and file I/O off the UI thread; publish incremental peaks rather than repeatedly copying all previous waveform data.
+- Finalize the recorder before reading the finished WAV. Retain already captured audio on a recording error.
+
+## Live plug-in editing
+
+- Plug-in editors are nonmodal and have no Apply/Cancel controls. Parameter edits immediately affect the shared live processor; closing an editor retains changes in memory. Only project Save writes plug-in settings to disk.
+- Replenish queued playback buffers on consumption, not device presentation completion. Use presentation completion only for the final buffer, and retain a short render-ahead margin to prevent underruns.
+- Keep plug-in processing on the playback worker in short blocks, preserve child-to-parent routing and compensate parallel bus latency. Export uses current in-memory parameter state.
+- Opening an editor must not mark the project dirty; actual parameter changes do. Saving with an editor open must capture its latest settings.
+
+## Audio import
+
+- Show a nonmodal import window immediately after file selection, with each file's own progress and outcome. Keep copy, decoding, resampling and waveform preparation on a worker queue.
+- Publish prepared PCM and waveform data into the main-thread audio cache under the final copied source path before inserting fragments. Timeline drawing must not decode imported files again.
+- Allow cancellation, remove incomplete copies, preserve source files and keep successful files when another file fails. Treat a completed batch as one Undo action.
+
+## Playhead and seeking
+
+- Dragging on the ruler selects a time range without seeking or stopping playback. Defer ruler click seeking until mouse-up without a drag. Highlight the range on the ruler and fragment area; its ruler edges are draggable with the horizontal resize cursor, without moving the playhead.
+- Clicking the timeline ruler, a fragment, or empty timeline space places the playhead at that time and discards any previous paused/playing stream. If playback is active, immediately continue playing from the selected time; if stopped, only reposition the cursor. Play starts from the selected playhead, independent of scrolling or the previous playback position.
+- Stopping (including the Play/Pause button) captures the current render position, clears the stream and freezes the cursor. The next Play always builds a new stream from that one cursor position. Never retain a separate paused position or resume old queued audio. While playing, the cursor follows the render clock monotonically; missing timestamps must not reset it. Do not silently reset a selected position beyond the project end to zero.
+
+- Natural playback completion (including effect tails) stops audio and returns the cursor to the last-start notch. Manual Stop/Pause and playback errors retain their current position; stale completion callbacks must not move the cursor.
+
+- Enter (Return or keypad Enter) always starts playback from the last successful user playback start, whether stopped or playing. Show that position as an orange vertical notch on the ruler. Play/Space and live timeline seeks update the marker; Stop, stopped seeking, range selection, and internal effect-chain restarts do not. Before the first start, Enter starts at zero; opening a project clears the marker.
+
+- Left/Right arrows seek by 1% of the currently visible fragment area width in timeline time, excluding the visible track-header portion. Respect zoom and horizontal scrolling, clamp at zero, and continue active playback. Do not intercept arrow keys in text fields, dialogs or plug-in windows.
+
+## Timeline ruler
+
+- Pin the track header column (names, nesting indicators, MUTE, FX and blank-space context menu) to the left while scrolling horizontally. It follows track rows vertically. Keep the TRACKS corner fixed on both axes and prevent hidden fragments or ruler controls from receiving sidebar clicks. Zoom centering and arrow seek distances use the viewport width minus the full pinned column.
+
+- Pin the ruler (including TRACKS, time/tempo labels, range handles, playhead marker and last-start notch) to the top of the visible timeline during vertical scrolling. Horizontal scrolling stays synchronized with fragments. Ruler interactions must not trigger track controls underneath or vertically autoscroll during range selection.
+
+## Timeline zoom
+
+- Zoom in and Zoom out center the playhead horizontally in the visible fragment area after scaling, accounting for any visible track-header portion and clamping to the timeline bounds. Preserve vertical scrolling and playback position.
+
+- Up arrow zooms in and Down arrow zooms out, using the same actions and limits as the View buttons. Preserve arrow navigation in text fields, dialogs and plug-in windows.
+
+- Zoom out stops when the complete timeline width fits the scroll viewport, including the track header. Derive the minimum zoom from the viewport width and timeline duration rather than a fixed pixels-per-second floor. All fragments must fit, reset horizontal scrolling at the limit, and keep ruler labels readable for long projects.
+
+## Window header
+
+- Keep the editable project name, clickable project audio quality immediately after it, and Open project, Save project, Export controls in the native compact titlebar toolbar. Hide the system window title and omit the sounder logo/wordmark. Place the PLAYER/FRAGMENTS/TRACKS/VIEW panel directly below the titlebar, with no separate project header row or extra vertical gap.
+
+## Export
+
+- Give the Export button comfortable horizontal padding. Disable both the titlebar button and File menu export action when the project has no audio fragments or editing is busy.
+- Label the titlebar button and File menu action Export. Open export options before choosing a destination; offer MP3 (default), WAV and OGG. First use inherits project rate and depth; remember export choices only after a file is successfully written, and save those last successful choices inside the project, independently from project audio settings. Cancel must not export a file.
+- PCM bit depth is editable for WAV only. MP3 offers supported rates up to 48 kHz and bitrate selection; explain codec constraints in the dialog. Use built-in encoders, preserve channels, process effects at the project rate and resample the finished mix only once using Mastering quality. Failed exports must not damage an existing destination.
+
+## Tempo and metronome
+
+- Show Metronome only in Tempo mode, horizontally to the left of the Tempo button. BPM uses exactly the timer font (25-point monospaced digits, light weight).
+- Tempo toggles a 4/4 bar/beat ruler and replaces the timer with clickable BPM (20–300, initially 120). A Metronome checkbox controls audible clicks during playback and recording, with a stronger first beat every four beats. Persist BPM, ruler mode and metronome choice in the project.
+- Derive metronome timing from audio frames and absolute timeline position, not UI timers. Seeking and recording restarts must preserve beat alignment. Mix playback clicks only after track effects; route recording clicks to the output mixer separately from the microphone input tap. Never include the metronome in recorded files or exports. Tempo and metronome changes must not stop active capture or playback.
