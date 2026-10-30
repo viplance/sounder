@@ -65,6 +65,8 @@
 
 - Enter (Return or keypad Enter) always starts playback from the last successful user playback start, whether stopped or playing. Show that position as an orange vertical notch on the ruler. Play/Space and live timeline seeks update the marker; Stop, stopped seeking, range selection, and internal effect-chain restarts do not. Before the first start, Enter starts at zero; opening a project clears the marker.
 
+- Command-Left seeks to time zero; Command-Right seeks to the end of project audio, showing the destination in the viewport and preserving active playback when audio remains. Keep native Command-arrow text navigation in editors.
+
 - Left/Right arrows seek by 1% of the currently visible fragment area width in timeline time, excluding the visible track-header portion. Respect zoom and horizontal scrolling, clamp at zero, and continue active playback. Do not intercept arrow keys in text fields, dialogs or plug-in windows.
 
 ## Timeline ruler
@@ -93,8 +95,10 @@
 
 ## Tempo and metronome
 
-- Show Metronome only in Tempo mode, horizontally to the left of the Tempo button. BPM uses exactly the timer font (25-point monospaced digits, light weight).
-- Tempo toggles a 4/4 bar/beat ruler and replaces the timer with clickable BPM (20–300, initially 120). A Metronome checkbox controls audible clicks during playback and recording, with a stronger first beat every four beats. Persist BPM, ruler mode and metronome choice in the project.
+- Place Tempo, Metronome and the timer/BPM display in the pinned top-left timeline corner in place of the TRACKS caption. Use one vertically centered row: timer/BPM, metronome icon, flexible space, then Tempo pinned to the right edge beside the timeline. Use matching 18 pt light monospaced timer/BPM fonts and pin the controls on both scroll axes. The metronome uses an outline icon when off and a filled accent-colored icon when on.
+
+- Show the metronome icon only in Tempo mode, to the right of Tempo. BPM uses exactly the timer font (18-point monospaced digits, light weight).
+- Tempo toggles a 4/4 bar/beat ruler and replaces the timer with clickable BPM (20–300, initially 120). A Metronome icon button controls audible clicks during playback and recording, with a stronger first beat every four beats. Persist BPM, ruler mode and metronome choice in the project.
 - Derive metronome timing from audio frames and absolute timeline position, not UI timers. Seeking and recording restarts must preserve beat alignment. Mix playback clicks only after track effects; route recording clicks to the output mixer separately from the microphone input tap. Never include the metronome in recorded files or exports. Tempo and metronome changes must not stop active capture or playback.
 
 ## Track dragging

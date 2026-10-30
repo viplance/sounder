@@ -106,6 +106,7 @@ final class Timeline: NSView {
     var pendingTrackRename: UUID?
     let nameField = InlineNameField(frame: .zero)
     private(set) var renamingTrack: UUID?
+    private(set) var headerControls: NSView?
     private var scrollObserver: NSObjectProtocol?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -119,10 +120,20 @@ final class Timeline: NSView {
         clip.postsBoundsChangedNotifications = true
         scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
             guard let self else { return }
+            self.positionHeaderControls()
             self.layoutNameField()
             self.setNeedsDisplay(self.visibleRect)
             self.window?.invalidateCursorRects(for: self)
         }
+    }
+    func installHeaderControls(_ view: NSView) {
+        headerControls?.removeFromSuperview(); headerControls = view
+        view.translatesAutoresizingMaskIntoConstraints = true
+        addSubview(view)
+        positionHeaderControls()
+    }
+    private func positionHeaderControls() {
+        headerControls?.frame = NSRect(x: pinnedHeaderX, y: pinnedRulerRect.minY, width: header, height: ruler)
     }
     deinit { if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) } }
     var pinnedRulerRect: NSRect { NSRect(x: 0, y: max(0, visibleRect.minY), width: bounds.width, height: ruler) }
@@ -207,6 +218,7 @@ final class Timeline: NSView {
         editor.zoom = max(minimumZoom, editor.zoom)
         let width = editor.zoom <= minimumZoom ? visible.width : max(visible.width, header + timelineDuration * editor.zoom)
         frame.size = NSSize(width: width, height: max(visible.height, ruler + CGFloat(rows.count) * rowHeight + 110))
+        positionHeaderControls()
         layoutNameField()
         needsDisplay = true
         if editor.isRecording, let scroll = enclosingScrollView {
@@ -443,7 +455,10 @@ final class Timeline: NSView {
             if editor.project.tempoMode {
                 line(NSPoint(x: x, y: rect.maxY - (tick.isBar ? 10 : 5)), NSPoint(x: x, y: rect.maxY), NSColor.white.withAlphaComponent(tick.isBar ? 0.10 : 0.035))
             }
-            if !tick.label.isEmpty { label(tick.label, NSRect(x: x + 7, y: top + 13, width: editor.project.tempoMode ? 70 : 60, height: 18), size: 10, color: editor.project.tempoMode && tick.isBar ? .labelColor : .secondaryLabelColor) }
+            if !tick.label.isEmpty {
+                let textHeight = ceil((tick.label as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 10)]).height)
+                label(tick.label, NSRect(x: x + 7, y: rect.midY - textHeight / 2, width: editor.project.tempoMode ? 70 : 60, height: textHeight), size: 10, color: editor.project.tempoMode && tick.isBar ? .labelColor : .secondaryLabelColor)
+            }
         }
         if let range = editor.range {
             for time in [range.lowerBound, range.upperBound] {
@@ -461,7 +476,6 @@ final class Timeline: NSView {
         }
         NSGraphicsContext.restoreGraphicsState()
         fill(NSRect(x: pinnedHeaderX, y: top, width: header, height: ruler), panelColor)
-        label("TRACKS", NSRect(x: pinnedHeaderX + 20, y: top + 14, width: 150, height: 18), size: 10, color: .secondaryLabelColor, weight: .semibold)
     }
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
@@ -616,9 +630,14 @@ final class Timeline: NSView {
         let position = editor.player?.currentTime ?? editor.cursor
         editor.seek(to: position + direction * step)
     }
+    func seekBoundary(end: Bool) {
+        guard canSelectRange else { return }
+        editor.seek(to: end ? editor.duration : 0)
+        centerOnPlayhead()
+    }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 123 { movePlayhead(direction: -1) }
-        else if event.keyCode == 124 { movePlayhead(direction: 1) }
+        if event.keyCode == 123 { if event.modifierFlags.contains(.command) { seekBoundary(end: false) } else { movePlayhead(direction: -1) } }
+        else if event.keyCode == 124 { if event.modifierFlags.contains(.command) { seekBoundary(end: true) } else { movePlayhead(direction: 1) } }
         else if event.keyCode == 126 { NSApp.sendAction(#selector(AppDelegate.zoomIn), to: NSApp.delegate, from: self) }
         else if event.keyCode == 125 { NSApp.sendAction(#selector(AppDelegate.zoomOut), to: NSApp.delegate, from: self) }
         else if event.keyCode == 36 || event.keyCode == 76 { editor.restartFromLastStart() }

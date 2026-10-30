@@ -162,21 +162,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toolbar.addArrangedSubview(section("TRACKS", [addTrack, nest, removeTrack])); editButtons = [split, trim, delete, join, addTrack, nest, removeTrack, importButton]
         toolbar.addArrangedSubview(section("VIEW", [button("Zoom out", "minus.magnifyingglass", #selector(zoomOut)), button("Zoom in", "plus.magnifyingglass", #selector(zoomIn))]))
         let spacer2 = NSView(); spacer2.setContentHuggingPriority(.defaultLow, for: .horizontal); toolbar.addArrangedSubview(spacer2)
-        metronomeButton = PointerButton(title: "Metronome", target: self, action: #selector(toggleMetronome))
-        metronomeButton.setButtonType(.switch); metronomeButton.font = .systemFont(ofSize: 10)
+        metronomeButton = PointerButton(image: NSImage(systemSymbolName: "metronome", accessibilityDescription: "Metronome")!, target: self, action: #selector(toggleMetronome))
+        metronomeButton.setButtonType(.pushOnPushOff); metronomeButton.isBordered = false; metronomeButton.imagePosition = .imageOnly
+        metronomeButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        metronomeButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         metronomeButton.setAccessibilityLabel("Metronome")
         tempoButton = PointerButton(title: "Tempo", target: self, action: #selector(toggleTempo))
-        tempoButton.bezelStyle = .rounded; tempoButton.setButtonType(.pushOnPushOff)
-        let tempoControls = NSStackView(views: [metronomeButton, tempoButton]); tempoControls.orientation = .horizontal; tempoControls.alignment = .centerY; tempoControls.spacing = 8
-        toolbar.addArrangedSubview(tempoControls)
-        bpmButton = textButton("120 BPM", size: 25, action: #selector(editTempo), cursor: .iBeam)
+        tempoButton.bezelStyle = .rounded; tempoButton.setButtonType(.pushOnPushOff); tempoButton.controlSize = .small
+        tempoButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        tempoButton.widthAnchor.constraint(equalToConstant: 55).isActive = true
+        bpmButton = textButton("120 BPM", size: 18, action: #selector(editTempo), cursor: .iBeam)
         bpmButton.contentTintColor = accent; bpmButton.toolTip = "Edit tempo (4/4)"; bpmButton.isHidden = true
-        timeLabel = NSTextField(labelWithString: "00:00.000"); timeLabel.font = .monospacedDigitSystemFont(ofSize: 25, weight: .light); timeLabel.textColor = accent
+        timeLabel = NSTextField(labelWithString: "00:00.000"); timeLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .light); timeLabel.textColor = accent
         bpmButton.font = timeLabel.font
-        let positionDisplay = NSStackView(views: [timeLabel, bpmButton]); positionDisplay.spacing = 6
-        toolbar.addArrangedSubview(positionDisplay); add(toolbar, to: stack, height: 84 - (10 - toolbarTopInset))
+        let positionDisplay = NSStackView(views: [timeLabel, bpmButton]); positionDisplay.spacing = 6; positionDisplay.alignment = .centerY
+        let tempoSpacer = NSView()
+        tempoSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let tempoRow = NSStackView(views: [positionDisplay, metronomeButton, tempoSpacer, tempoButton])
+        tempoRow.orientation = .horizontal; tempoRow.alignment = .centerY; tempoRow.spacing = 5
+        let timelineControls = NSView()
+        tempoRow.translatesAutoresizingMaskIntoConstraints = false; timelineControls.addSubview(tempoRow)
+        NSLayoutConstraint.activate([
+            tempoRow.leadingAnchor.constraint(equalTo: timelineControls.leadingAnchor, constant: 10),
+            tempoRow.trailingAnchor.constraint(equalTo: timelineControls.trailingAnchor, constant: -8),
+            tempoRow.centerYAnchor.constraint(equalTo: timelineControls.centerYAnchor)
+        ])
+        add(toolbar, to: stack, height: 84 - (10 - toolbarTopInset))
         let scroll = NSScrollView(); scroll.hasHorizontalScroller = true; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
-        timeline = Timeline(editor); scroll.documentView = timeline; add(scroll, to: stack)
+        timeline = Timeline(editor); scroll.documentView = timeline; timeline.installHeaderControls(timelineControls); add(scroll, to: stack)
         notificationOverlay = ToastOverlay.install(in: content, center: editor.notifications)
         editor.changed = { [weak self] in self?.refresh() }
         buildMenu(); window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refresh()
@@ -257,6 +270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--mute-ui-test") { try verifyMuteUI() }
             if CommandLine.arguments.contains("--zoom-ui-test") { try verifyZoomUI() }
             if CommandLine.arguments.contains("--range-ui-test") { try verifyRangeUI() }
+            if CommandLine.arguments.contains("--boundary-seek-ui-test") { try verifyBoundarySeekUI() }
             if CommandLine.arguments.contains("--playhead-ui-test") { try verifyPlayheadUI() }
             if CommandLine.arguments.contains("--track-name-ui-test") { try verifyTrackNameUI() }
             if CommandLine.arguments.contains("--settings-ui-test") { try verifySettingsUI() }
@@ -579,6 +593,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         bpmButton.title = (editor.project.tempo.rounded() == editor.project.tempo ? String(Int(editor.project.tempo)) : String(format: "%.1f", editor.project.tempo)) + " BPM"
         tempoButton.state = editor.project.tempoMode ? .on : .off
         metronomeButton.state = editor.project.metronomeEnabled ? .on : .off
+        metronomeButton.image = NSImage(systemSymbolName: editor.project.metronomeEnabled ? "metronome.fill" : "metronome", accessibilityDescription: "Metronome")
+        metronomeButton.contentTintColor = editor.project.metronomeEnabled ? accent : .secondaryLabelColor
+        metronomeButton.toolTip = editor.project.metronomeEnabled ? "Metronome on" : "Metronome off"
         tempoButton.isEnabled = !editor.isImporting && !editor.requestingMic
         bpmButton.isEnabled = tempoButton.isEnabled; metronomeButton.isEnabled = tempoButton.isEnabled
         playButton.image = NSImage(systemSymbolName: editor.isPlaying ? "pause.fill" : "play.fill", accessibilityDescription: "Play / pause")
@@ -623,8 +640,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         menu("File", [("Rename Project…", #selector(renameProject), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Import Audio…", #selector(importAudio), "i"), ("Export…", #selector(exportAudio), "e")])
         menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Split at Playhead", #selector(split), "b"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
         menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
-        menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Record", #selector(record), "r"), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
-        if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [] } }
+        menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
+        if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
         menu("View", [("Zoom In", #selector(zoomIn), "\u{f700}"), ("Zoom Out", #selector(zoomOut), "\u{f701}")])
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
     }
@@ -639,13 +656,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if [#selector(zoomIn), #selector(zoomOut)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
         }
-        if [#selector(restartPlayback), #selector(play), #selector(seekBackward), #selector(seekForward), #selector(stop), #selector(record), #selector(rewind)].contains(menuItem.action) {
+        if [#selector(restartPlayback), #selector(play), #selector(seekBackward), #selector(seekForward), #selector(seekToStart), #selector(seekToEnd), #selector(stop), #selector(record), #selector(rewind)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
                 && (!editor.isRecording || menuItem.action == #selector(restartPlayback) || menuItem.action == #selector(play))
                 && !editor.requestingMic && !editor.isImporting
         }
         return true
     }
+    @objc func seekToStart() { timeline.seekBoundary(end: false) }
+    @objc func seekToEnd() { timeline.seekBoundary(end: true) }
     @objc func seekBackward() { timeline.movePlayhead(direction: -1) }
     @objc func seekForward() { timeline.movePlayhead(direction: 1) }
     @objc func restartPlayback() { editor.restartFromLastStart() }

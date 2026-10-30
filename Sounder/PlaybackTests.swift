@@ -360,3 +360,37 @@ func runTransportPositionTests() throws {
     completing.finished?(nil)
     try check(editor.cursor == manualStop && manualStop > 2.25, "Manual Stop stays at its position and ignores stale completion callbacks")
 }
+
+
+extension AppDelegate {
+    func verifyBoundarySeekUI() throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        func key(_ code: UInt16, command: Bool = true) {
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: command ? [.command] : [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: code == 123 ? "\u{f702}" : "\u{f703}", charactersIgnoringModifiers: code == 123 ? "\u{f702}" : "\u{f703}", isARepeat: false, keyCode: code)!
+            timeline.keyDown(with: event)
+        }
+        editor.seek(to: 4); key(124)
+        try check(editor.cursor == editor.duration && !editor.isPlaying, "Command-Right seeks to the exact audio end while stopped")
+        let endX = timeline.header + editor.duration * editor.zoom
+        try check(endX >= timeline.visibleFragmentRect.minX && endX <= timeline.visibleFragmentRect.maxX, "Boundary seeking scrolls the destination into view")
+        key(123)
+        try check(editor.cursor == 0 && !editor.isPlaying, "Command-Left seeks to zero while stopped")
+        key(124, command: false)
+        try check(editor.cursor > 0 && editor.cursor < editor.duration, "Unmodified Right retains its one-percent seek step")
+        editor.seek(to: 3); editor.playPause(); key(123)
+        try check(editor.isPlaying && editor.player?.start == 0, "Command-Left restarts active playback at the beginning without pausing")
+        key(124)
+        try check(editor.cursor == editor.duration, "Command-Right places the cursor at the end during playback without jumping back")
+        let transport = NSApp.mainMenu!.items.compactMap { $0.submenu }.first { $0.title == "Transport" }!
+        for selector in [#selector(seekToStart), #selector(seekToEnd)] {
+            let item = transport.items.first { $0.action == selector }!
+            try check(item.keyEquivalentModifierMask == [.command], "Boundary menu shortcut uses the Command modifier")
+            projectLabel.sendAction(projectLabel.action, to: projectLabel.target)
+            try check(!validateMenuItem(item), "Boundary shortcut leaves Command-arrow text editing to the field editor")
+            projectNameField.finish(commit: false)
+        }
+        editor.stop(); editor.seek(to: 5.8); editor.dirty = false; refresh()
+    }
+}
