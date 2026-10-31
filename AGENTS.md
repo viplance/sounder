@@ -52,6 +52,8 @@
 
 ## Audio import
 
+- After selecting multiple files, show an English placement dialog with One track and Separate tracks options and Import/Cancel. Single-track placement is sequential; separate-track placement starts at the captured active track, follows visible hierarchy order below it, and gives all fragments the same captured cursor time. Create missing root tracks with the corresponding imported fragment names (respecting track name limits). Keep existing tracks/fragments intact; commit successful files and any new tracks together as one Undo action. Single-file import does not show this dialog.
+
 - Show a nonmodal import window immediately after file selection, with each file's own progress and outcome. Keep copy, decoding, resampling and waveform preparation on a worker queue.
 - Publish prepared PCM and waveform data into the main-thread audio cache under the final copied source path before inserting fragments. Timeline drawing must not decode imported files again.
 - Allow cancellation, remove incomplete copies, preserve source files and keep successful files when another file fails. Treat a completed batch as one Undo action.
@@ -117,3 +119,11 @@
 ## Fragment marquee selection
 
 - Drag on empty fragment-area space (including below all tracks) to select intersecting fragments with a live rectangular marquee. Shift adds to the selection captured at drag start. Preserve the playhead and active playback during marquee selection; only a background click without a drag seeks on mouse-up. Keep ruler range gestures and fragment dragging intact. Clip the marquee behind pinned headers, autoscroll at viewport edges, and restore the original selection/range on Escape. Selection changes do not create Undo entries.
+
+## Fragment edge resizing
+
+- Drag a fragment's left or right edge to trim or restore source audio non-destructively. Keep the opposite edge fixed, enforce a 10 ms minimum and source-file bounds, and never extend left of timeline zero. Show a horizontal resize cursor only on exposed edges. Preview live without seeking or changing tracks; commit once with one Undo entry and allow Escape/Stop to cancel. Keep body dragging and overlapping-fragment hit order intact.
+
+## Fragment alignment
+
+- While moving a fragment to another track, snap its start or end to other fragments' boundaries, and preserve its original time on near-vertical moves. Use the nearest match strictly within 1% of the visible fragment area's time span, excluding the pinned sidebar; derive the threshold again after zoom or viewport changes. Show a vertical dashed guide across all visible track rows while matched, clear it outside the threshold and on drop, and preserve source offsets/duration and single-step Undo.

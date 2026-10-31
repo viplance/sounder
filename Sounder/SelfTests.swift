@@ -19,6 +19,20 @@ func runAudioTests() throws {
     try check(mix[20_000] == 0, "New silent fragment replaces old sound")
     let waveform = try store.load(new.path)
     try check(waveform.peaks[0] == 0.5, "Waveform peaks come from decoded PCM")
+    let editable = Clip(name: "Trim edges", source: old.path, start: 2, offset: 0.2, duration: 0.5, order: 1)
+    let shorterLeft = editable.resized(leftEdge: true, by: 0.1, sourceDuration: 1)
+    try check(abs(shorterLeft.start - 2.1) < 1e-9 && abs(shorterLeft.offset - 0.3) < 1e-9 && shorterLeft.end == editable.end, "Left-edge trimming keeps the right edge and source audio aligned")
+    let extendedLeft = editable.resized(leftEdge: true, by: -10, sourceDuration: 1)
+    try check(extendedLeft.offset == 0 && extendedLeft.start == 1.8 && extendedLeft.end == editable.end, "Left extension stops at the beginning of the source recording")
+    var nearZero = editable; nearZero.start = 0.05
+    let zeroLimited = nearZero.resized(leftEdge: true, by: -10, sourceDuration: 1)
+    try check(zeroLimited.start == 0 && abs(zeroLimited.offset - 0.15) < 1e-9, "Left extension cannot cross timeline zero")
+    let extendedRight = editable.resized(leftEdge: false, by: 10, sourceDuration: 1)
+    try check(extendedRight.start == editable.start && extendedRight.offset + extendedRight.duration == 1, "Right extension stops at the real source end without moving the start")
+    for left in [true, false] {
+        let shortest = editable.resized(leftEdge: left, by: left ? 10 : -10, sourceDuration: 1)
+        try check(abs(shortest.duration - 0.010) < 1e-9, "Both fragment edges enforce a 10 ms minimum (left: \(left))")
+    }
     var child = Track(name: "Child", parent: track.id); child.clips = [Clip(name: "child", source: old.path, start: 0, duration: 1, order: 4)]
     project.tracks.append(child)
     let nested = try store.render(project); try check(nested[100] == 0.5, "Nested tracks mix with parent")

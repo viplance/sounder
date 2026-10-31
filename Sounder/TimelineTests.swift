@@ -201,3 +201,108 @@ extension AppDelegate {
         editor.undo(); editor.selection = []; editor.seek(to: 5.8); editor.dirty = false; refresh()
     }
 }
+
+extension AppDelegate {
+    func verifyFragmentResizeUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        var clip = original.tracks[0].clips[0]
+        clip.start = 2; clip.offset = 1; clip.duration = 3
+        let track = Track(name: "Resize", clips: [clip])
+        editor.project.tracks = [track]; editor.zoom = 70; editor.cursor = 6; editor.selection = []
+        refresh(); window.contentView?.layoutSubtreeIfNeeded()
+        let scroll = timeline.enclosingScrollView!
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        func current() -> Clip { editor.project.tracks[0].clips[0] }
+        func send(_ type: NSEvent.EventType, x: CGFloat, y: CGFloat? = nil) {
+            let point = NSPoint(x: x, y: y ?? timeline.clipRect(clip, row: 0, layer: 0).midY)
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            if type == .leftMouseDown { timeline.mouseDown(with: event) }
+            else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
+            else { timeline.mouseUp(with: event) }
+        }
+        let rect = timeline.clipRect(clip, row: 0, layer: 0)
+        let history = editor.undoStack.count
+        let left = rect.minX + 1
+        send(.leftMouseDown, x: left); send(.leftMouseDragged, x: left + 70)
+        try check(timeline.resizedFragment?.start == 3 && timeline.resizedFragment?.offset == 2 && timeline.resizedFragment?.duration == 2 && current().duration == 3 && editor.cursor == 6, "Left-edge drag previews trimmed audio live without changing the project or playhead")
+        send(.leftMouseUp, x: left + 70)
+        try check(current().start == 3 && current().offset == 2 && current().end == 5 && editor.undoStack.count == history + 1, "Resizing commits once and keeps the opposite edge fixed")
+        editor.undo(); try check(current().start == 2 && current().offset == 1 && current().duration == 3, "One Undo restores original fragment bounds")
+        editor.redo(); try check(current().duration == 2, "Redo restores resized fragment bounds"); editor.undo()
+        let right = rect.maxX - 1
+        send(.leftMouseDown, x: right); send(.leftMouseDragged, x: right + 700)
+        try check(abs((timeline.resizedFragment?.duration ?? 0) - 7) < 1e-9, "Right-edge preview cannot exceed the eight-second recording with a one-second source offset")
+        send(.leftMouseUp, x: right + 700)
+        try check(current().offset + current().duration == 8 && current().start == 2, "Right-edge drop remains bounded by the recording")
+        editor.undo(); scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        send(.leftMouseDown, x: right); send(.leftMouseDragged, x: left - 100)
+        try check(abs((timeline.resizedFragment?.duration ?? 0) - 0.010) < 1e-9, "Crossing the left edge clamps the live fragment to 10 ms")
+        send(.leftMouseUp, x: left - 100); editor.undo()
+        send(.leftMouseDown, x: left); send(.leftMouseDragged, x: right + 100)
+        try check(abs((timeline.resizedFragment?.duration ?? 0) - 0.010) < 1e-9, "Crossing the right edge also clamps the live fragment to 10 ms")
+        let beforeCancel = editor.undoStack.count
+        stop()
+        try check(timeline.resizedFragment == nil && current().duration == 3 && editor.undoStack.count == beforeCancel, "Escape/Stop cancels edge resizing without changing audio or Undo history")
+        send(.leftMouseDown, x: left); send(.leftMouseUp, x: left)
+        try check(editor.undoStack.count == beforeCancel, "An edge click without resizing does not create an Undo entry")
+        send(.leftMouseDown, x: rect.midX); send(.leftMouseDragged, x: rect.midX + 35); send(.leftMouseUp, x: rect.midX + 35)
+        try check(current().start == 2.5 && current().offset == 1 && current().duration == 3, "Dragging the fragment body still moves it without resizing")
+        editor.undo(); editor.project = original; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+    }
+}
+
+extension AppDelegate {
+    func verifyFragmentSnapUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        var moving = original.tracks[0].clips[0]; moving.start = 2; moving.offset = 1; moving.duration = 1
+        var target = moving; target.id = UUID(); target.start = 4; target.duration = 2
+        let sourceTrack = Track(name: "Source", clips: [moving])
+        let targetTrack = Track(name: "Target", clips: [target])
+        let emptyTrack = Track(name: "Empty")
+        editor.project.tracks = [sourceTrack, targetTrack, emptyTrack]; editor.zoom = 70; refresh()
+        let scroll = timeline.enclosingScrollView!
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        func send(_ type: NSEvent.EventType, proposed: Double, row: Int) {
+            let point = NSPoint(x: timeline.header + (proposed + moving.duration / 2) * editor.zoom,
+                                y: timeline.ruler + CGFloat(row) * timeline.rowHeight + 30)
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            if type == .leftMouseDown { timeline.mouseDown(with: event) }
+            else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
+            else { timeline.mouseUp(with: event) }
+        }
+        func liveStart() -> Double { editor.project.tracks[0].clips[0].start }
+        let tolerance = timeline.fragmentSnapTolerance
+        try check(abs(tolerance - (timeline.visibleRect.width - timeline.header) / editor.zoom * 0.01) < 1e-9, "Snap tolerance uses one percent of visible time excluding the pinned sidebar")
+        let history = editor.undoStack.count
+        send(.leftMouseDown, proposed: 2, row: 0)
+        send(.leftMouseDragged, proposed: 2 + tolerance / 2, row: 1)
+        timeline.displayIfNeeded()
+        try check(liveStart() == 2 && timeline.fragmentSnapTime == 2 && timeline.displayedClips(for: targetTrack).contains(where: { $0.id == moving.id }), "Cross-track drag preserves near-vertical alignment and displays a live guide with the fragment")
+        send(.leftMouseDragged, proposed: 2 + tolerance * 1.1, row: 1)
+        try check(abs(liveStart() - (2 + tolerance * 1.1)) < 1e-9 && timeline.fragmentSnapTime == nil, "Moving outside the threshold releases the fragment and removes the guide")
+        send(.leftMouseDragged, proposed: 4 - tolerance / 2, row: 1)
+        try check(liveStart() == 4 && timeline.fragmentSnapTime == 4, "Moving start snaps to another fragment start")
+        send(.leftMouseDragged, proposed: 5 + tolerance / 2, row: 1)
+        try check(liveStart() == 5 && timeline.fragmentSnapTime == 6, "Moving end snaps to another fragment end")
+        send(.leftMouseDragged, proposed: 3 + tolerance / 2, row: 2)
+        try check(liveStart() == 3 && timeline.fragmentSnapTime == 4, "Moving end can snap to a start boundary on a different track from the drop target")
+        send(.leftMouseUp, proposed: 3 + tolerance / 2, row: 2)
+        let dropped = editor.project.tracks[2].clips.first!
+        try check(dropped.start == 3 && dropped.offset == 1 && dropped.duration == 1 && timeline.fragmentSnapTime == nil && editor.undoStack.count == history + 1, "Drop keeps the exact aligned time and original audio bounds, clears the guide and adds one Undo step")
+        editor.undo()
+        try check(editor.project.tracks[0].clips[0].start == 2 && editor.project.tracks[2].clips.isEmpty, "One Undo restores the original time and track")
+        editor.zoom = 140; refresh()
+        try check(abs(timeline.fragmentSnapTolerance - tolerance / 2) < 1e-9, "Zoom updates snapping tolerance to the visible time span")
+        send(.leftMouseDown, proposed: 2, row: 0)
+        send(.leftMouseDragged, proposed: 2 + timeline.fragmentSnapTolerance / 2, row: 0)
+        try check(timeline.fragmentSnapTime == nil && liveStart() > 2, "Same-track body dragging retains free horizontal positioning")
+        send(.leftMouseUp, proposed: 2 + timeline.fragmentSnapTolerance / 2, row: 0)
+        editor.undo(); editor.project = original; editor.zoom = 70; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+    }
+}

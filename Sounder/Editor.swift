@@ -120,29 +120,51 @@ final class Editor: NSObject {
         guard !busy else { return }
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.audio]; panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
-        importAudio(urls: panel.urls)
+        var placement = AudioImportPlacement.singleTrack
+        if panel.urls.count > 1 {
+            guard let chosen = ImportPlacementDialog().runModal() else { return }
+            placement = chosen
+        }
+        importAudio(urls: panel.urls, placement: placement)
     }
-    func importAudio(urls: [URL]) {
+    func importAudio(urls: [URL], placement: AudioImportPlacement = .singleTrack) {
         guard !busy, !urls.isEmpty else { return }
         if player != nil { stop() }
         importer?.close()
-        let job = AudioImportController(editor: self, urls: urls)
+        let job = AudioImportController(editor: self, urls: urls, placement: placement)
         importer = job; job.startImport()
     }
-    func finishAudioImport(_ imported: [ImportedAudio], track: UUID?, start: Double) {
+    func finishAudioImport(_ imported: [ImportedAudio], track: UUID?, start: Double, placement: AudioImportPlacement = .singleTrack) {
         guard !imported.isEmpty else { update(); return }
         checkpoint()
-        var target = project.tracks.firstIndex { $0.id == track }
-        if target == nil { project.tracks.append(Track(name: "Audio 01")); target = project.tracks.count - 1 }
-        selectedTrack = project.tracks[target!].id
+        var targets: [UUID]
+        switch placement {
+        case .singleTrack:
+            var target = project.tracks.firstIndex { $0.id == track }
+            if target == nil { project.tracks.append(Track(name: "Audio 01")); target = project.tracks.count - 1 }
+            targets = Array(repeating: project.tracks[target!].id, count: imported.count)
+        case .separateTracks:
+            // Use the same hierarchy order as the visible timeline, including children.
+            let ordered = TrackHierarchy.orderedRows(project.tracks).map { $0.0.id }
+            let first = ordered.firstIndex(where: { $0 == track }) ?? 0
+            targets = Array(ordered.dropFirst(first).prefix(imported.count))
+            while targets.count < imported.count {
+                let name = NameRules.normalized(imported[targets.count].name)
+                let added = Track(name: name.isEmpty ? "Audio " + String(format: "%02d", project.tracks.count + 1) : name)
+                project.tracks.append(added); targets.append(added.id)
+            }
+        }
+        selectedTrack = targets[0]
         var position = start, clips: [Clip] = []
-        for item in imported {
+        for (index, item) in imported.enumerated() {
             // Publish prepared data under the final source path before the first draw.
             audio.cache[item.url.path] = item.data
-            let clip = Clip(name: item.name, source: item.url.path, start: position, duration: Double(item.data.frameCount) / audio.sampleRate, order: project.nextOrder + clips.count)
-            clips.append(clip); position += clip.duration
+            let clip = Clip(name: item.name, source: item.url.path, start: position, duration: Double(item.data.frameCount) / audio.sampleRate, order: project.nextOrder + index)
+            let target = project.tracks.firstIndex { $0.id == targets[index] }!
+            project.tracks[target].clips.append(clip); clips.append(clip)
+            if placement == .singleTrack { position += clip.duration }
         }
-        project.tracks[target!].clips.append(contentsOf: clips); project.nextOrder += clips.count
+        project.nextOrder += clips.count
         selection = Set(clips.map(\.id)); update("Imported \(clips.count) fragment(s)")
     }
     func record() {

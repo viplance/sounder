@@ -286,6 +286,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--track-name-ui-test") { try verifyTrackNameUI() }
             if CommandLine.arguments.contains("--settings-ui-test") { try verifySettingsUI() }
             if CommandLine.arguments.contains("--notifications-ui-test") { try verifyNotificationInteractions(); finishNotificationUITest(audioURL: url); return }
+            if CommandLine.arguments.contains("--import-placement-ui-test") { try verifyImportPlacementUI() }
+            if CommandLine.arguments.contains("--fragment-snap-ui-test") { try verifyFragmentSnapUI() }
+            if CommandLine.arguments.contains("--fragment-resize-ui-test") { try verifyFragmentResizeUI() }
             if CommandLine.arguments.contains("--marquee-ui-test") { try verifyMarqueeUI() }
             if CommandLine.arguments.contains("--track-drag-ui-test") { try verifyTrackDragUI() }
             if CommandLine.arguments.contains("--pinned-ruler-ui-test") { try verifyPinnedRulerUI() }
@@ -681,7 +684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func seekForward() { timeline.movePlayhead(direction: 1) }
     @objc func restartPlayback() { editor.restartFromLastStart() }
     @objc func play() { editor.playPause() }
-    @objc func stop() { if timeline.cancelMarqueeSelection() { return }; if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stop() } }
+    @objc func stop() { if timeline.cancelFragmentResize() || timeline.cancelMarqueeSelection() { return }; if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stop() } }
     @objc func record() { editor.record() }
     @objc func rewind() { if editor.isRecording { editor.stop() }; editor.seek(to: 0) }
     @objc func split() { editor.split() }

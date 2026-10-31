@@ -32,11 +32,41 @@ func runAudioImportTests() throws {
     editor.undo()
     try check(editor.project.tracks[0].clips.isEmpty, "A batch of imported fragments can be undone together")
     job.close()
+    let secondSource = directory.appendingPathComponent("Second instrument.wav")
+    let thirdSource = directory.appendingPathComponent("Third instrument.wav")
+    try FileManager.default.copyItem(at: source, to: secondSource)
+    try FileManager.default.copyItem(at: source, to: thirdSource)
+    let root = Track(name: "Root")
+    let child = Track(name: "Child", parent: root.id)
+    let tail = Track(name: "Last root")
+    // Serialized array order differs from visual hierarchy order.
+    editor.project = Project(tracks: [root, tail, child]); editor.selectedTrack = child.id; editor.cursor = 3.5
+    let beforeBatch = editor.undoStack.count
+    editor.importAudio(urls: [source, secondSource, thirdSource], placement: .separateTracks)
+    let separate = editor.importer!
+    editor.selectedTrack = root.id; editor.cursor = 7
+    try wait(separate)
+    let visual = TrackHierarchy.orderedRows(editor.project.tracks).map { $0.0 }
+    try check(visual.count == 4 && visual[0].clips.isEmpty && visual[1].id == child.id && visual[1].clips.first?.name == "Stereo source" && visual[2].id == tail.id && visual[2].clips.first?.name == "Second instrument", "Separate-track import starts at the captured active track and follows visual hierarchy order")
+    try check(visual[3].name == "Third instrument" && visual[3].parent == nil && visual[3].clips.first?.name == "Third instrument", "Missing destination tracks are created with the imported fragment name")
+    let parallelClips = visual.flatMap(\.clips)
+    try check(parallelClips.count == 3 && parallelClips.allSatisfy { $0.start == 3.5 } && editor.selectedTrack == child.id && editor.selection == Set(parallelClips.map(\.id)), "Separate-track files share the captured cursor time and are selected together")
+    try check(editor.undoStack.count == beforeBatch + 1 && parallelClips.allSatisfy { store.cache[$0.source]?.channelPeaks.count == 2 }, "Parallel import publishes prepared waveforms and creates one Undo entry")
+    editor.undo()
+    try check(editor.project.tracks.count == 3 && editor.project.tracks.allSatisfy { $0.clips.isEmpty }, "Undo removes imported fragments and auto-created tracks together")
+    editor.redo()
+    try check(editor.project.tracks.count == 4 && editor.project.tracks.flatMap(\.clips).count == 3, "Redo restores the complete parallel import")
+    editor.undo(); separate.close()
+    editor.project = Project(tracks: []); editor.selectedTrack = nil
+    let prepared = [ImportedAudio(name: "First", url: source, data: loaded), ImportedAudio(name: "Second", url: secondSource, data: loaded)]
+    editor.finishAudioImport(prepared, track: nil, start: 2, placement: .separateTracks)
+    try check(editor.project.tracks.map(\.name) == ["First", "Second"] && editor.project.tracks.flatMap(\.clips).allSatisfy { $0.start == 2 }, "An empty project creates one named track per imported file at the same time")
+    editor.undo()
     let pathsBeforeCancel = Set(try FileManager.default.contentsOfDirectory(atPath: store.directory.path))
-    editor.importAudio(urls: [source, source])
+    editor.importAudio(urls: [source, source], placement: .separateTracks)
     let cancelled = editor.importer!; cancelled.cancel()
     try wait(cancelled)
-    try check(editor.project.tracks[0].clips.isEmpty && cancelled.statuses.allSatisfy { $0 == "Cancelled" } && Set(try FileManager.default.contentsOfDirectory(atPath: store.directory.path)) == pathsBeforeCancel, "Cancellation removes partial copies and leaves the project untouched")
+    try check(editor.project.tracks.isEmpty && cancelled.statuses.allSatisfy { $0 == "Cancelled" } && Set(try FileManager.default.contentsOfDirectory(atPath: store.directory.path)) == pathsBeforeCancel, "Cancellation removes partial copies and leaves the project untouched")
     cancelled.close()
 }
 
@@ -78,5 +108,22 @@ extension AppDelegate {
             self.editor.dirty = false
             NSApp.terminate(nil)
         }
+    }
+}
+
+extension AppDelegate {
+    func verifyImportPlacementUI() throws {
+        for choice in [0, 1, 2] {
+            let dialog = ImportPlacementDialog()
+            guard dialog.single.title == "One track", dialog.separate.title == "Separate tracks", dialog.placement == .singleTrack else { throw SounderError.message("Import placement must show two English options with a single-track default") }
+            let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
+                if choice == 1 { dialog.separate.performClick(nil) }
+                dialog.alert.buttons[choice == 2 ? 1 : 0].performClick(nil)
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            let result = dialog.runModal()
+            guard choice == 0 ? result == .singleTrack : choice == 1 ? result == .separateTracks : result == nil else { throw SounderError.message("Import placement choice or cancellation failed") }
+        }
+        print("PASS: import placement dialog offers One track and Separate tracks, confirms either choice, and cancels without importing")
     }
 }

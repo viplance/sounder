@@ -1,5 +1,31 @@
 import AppKit
 
+enum AudioImportPlacement { case singleTrack, separateTracks }
+
+final class ImportPlacementDialog: NSObject {
+    let alert = CompactSettingsAlert()
+    let single = PointerButton(title: "One track", target: nil, action: nil)
+    let separate = PointerButton(title: "Separate tracks", target: nil, action: nil)
+    var placement: AudioImportPlacement { separate.state == .on ? .separateTracks : .singleTrack }
+    override init() {
+        super.init()
+        alert.messageText = "Import multiple files"
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 56))
+        for (index, button) in [single, separate].enumerated() {
+            button.setButtonType(.radio); button.target = self; button.action = #selector(selectPlacement(_:))
+            button.frame = NSRect(x: 0, y: index == 0 ? 32 : 0, width: 300, height: 24)
+            form.addSubview(button)
+        }
+        single.state = .on
+        alert.accessoryView = form; alert.addButton(withTitle: "Import"); alert.addButton(withTitle: "Cancel")
+    }
+    @objc private func selectPlacement(_ sender: NSButton) {
+        single.state = sender === single ? .on : .off
+        separate.state = sender === separate ? .on : .off
+    }
+    func runModal() -> AudioImportPlacement? { alert.runModal() == .alertFirstButtonReturn ? placement : nil }
+}
+
 struct ImportedAudio {
     let name: String
     let url: URL
@@ -30,6 +56,7 @@ final class AudioImportController: NSObject, NSWindowDelegate {
     let sampleRate: Double
     let targetTrack: UUID?
     let start: Double
+    let placement: AudioImportPlacement
     private(set) var isRunning = false
     private(set) var fractions: [Double]
     private(set) var statuses: [String]
@@ -43,8 +70,9 @@ final class AudioImportController: NSObject, NSWindowDelegate {
     private var lastProgressTime = 0.0
     private var lastPhase = ""
     var completed: (() -> Void)?
-    init(editor: Editor, urls: [URL]) {
+    init(editor: Editor, urls: [URL], placement: AudioImportPlacement = .singleTrack) {
         self.editor = editor; self.urls = urls; directory = editor.audio.directory
+        self.placement = placement
         sampleRate = editor.audio.sampleRate; targetTrack = editor.selectedTrack; start = editor.cursor
         fractions = Array(repeating: 0, count: urls.count); statuses = Array(repeating: "Waiting", count: urls.count)
     }
@@ -128,7 +156,7 @@ final class AudioImportController: NSObject, NSWindowDelegate {
         let results = imported, failed = failures
         DispatchQueue.main.async { [self] in
             isRunning = false
-            editor?.finishAudioImport(results, track: targetTrack, start: start)
+            editor?.finishAudioImport(results, track: targetTrack, start: start, placement: placement)
             if failed > 0 { editor?.error(SounderError.message("Could not import \(failed) file(s). See the import window for details.")) }
             button.title = "Close"; button.isEnabled = true
             let completion = completed; completed = nil; completion?()

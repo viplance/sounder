@@ -10,6 +10,7 @@ enum NameRules {
 
 let sampleRate = 48_000.0
 struct Clip: Codable, Identifiable {
+    static let minimumDuration = 0.010
     var id = UUID()
     var name: String
     var source: String
@@ -18,6 +19,19 @@ struct Clip: Codable, Identifiable {
     var duration: Double
     var order: Int
     var end: Double { start + duration }
+
+    func resized(leftEdge: Bool, by delta: Double, sourceDuration: Double) -> Clip {
+        var result = self
+        // A source shorter than 10 ms cannot be extended with invented audio.
+        let minimum = min(Self.minimumDuration, duration, sourceDuration)
+        if leftEdge {
+            let shift = max(-min(start, offset), min(delta, duration - minimum))
+            result.start += shift; result.offset += shift; result.duration -= shift
+        } else {
+            result.duration = max(minimum, min(duration + delta, sourceDuration - offset))
+        }
+        return result
+    }
 }
 struct Track: Codable, Identifiable {
     var id = UUID()
@@ -31,6 +45,17 @@ struct Track: Codable, Identifiable {
 enum TrackHierarchy {
     static let maximumDepth = 2
     static let limitMessage = "Tracks can be nested at most 2 levels"
+
+    static func orderedRows(_ tracks: [Track]) -> [(Track, Int)] {
+        var result: [(Track, Int)] = []
+        func append(_ parent: UUID?, depth: Int) {
+            for track in tracks where track.parent == parent {
+                result.append((track, depth)); append(track.id, depth: depth + 1)
+            }
+        }
+        append(nil, depth: 0)
+        return result
+    }
 
     static func validate(_ tracks: [Track]) throws {
         let ids = Set(tracks.map(\.id))
@@ -173,6 +198,12 @@ final class AudioStore {
         try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
     }
     func freshURL() -> URL { directory.appendingPathComponent(UUID().uuidString + ".wav") }
+    func sourceDuration(_ path: String) throws -> Double {
+        if let data = cache[path] { return Double(data.frameCount) / sampleRate }
+        // Read file metadata only; edge dragging must not decode a whole recording.
+        let file = try AVAudioFile(forReading: URL(fileURLWithPath: path))
+        return Double(file.length) / file.processingFormat.sampleRate
+    }
     func load(_ path: String) throws -> AudioData {
         if let data = cache[path] { return data }
         let data = try Self.decode(URL(fileURLWithPath: path), sampleRate: sampleRate)

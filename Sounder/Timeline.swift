@@ -96,7 +96,10 @@ final class Timeline: NSView {
     var originalStart = 0.0
     var dragTrack: UUID?
     var dragDestination: UUID?
+    private(set) var fragmentSnapTime: Double?
     var didCheckpoint = false
+    private var fragmentResize: (original: Clip, leftEdge: Bool, sourceDuration: Double)?
+    private(set) var resizedFragment: Clip?
     var selectingRange = false
     var rangeAnchor: Double?
     var didDragRange = false
@@ -153,7 +156,7 @@ final class Timeline: NSView {
         return NSRect(x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
     }
     func isTrackPoint(_ point: NSPoint) -> Bool { point.y >= ruler && !pinnedRulerRect.contains(point) }
-    var timelineDuration: Double { max(30, editor.duration + 8, editor.cursor + 5) }
+    var timelineDuration: Double { max(30, max(editor.duration, resizedFragment?.end ?? 0) + 8, editor.cursor + 5) }
     var viewportSize: NSSize { enclosingScrollView?.contentSize ?? NSSize(width: 1000, height: 600) }
     var minimumZoom: Double { max(1, viewportSize.width - header) / timelineDuration }
     var rulerStep: Double {
@@ -161,16 +164,7 @@ final class Timeline: NSView {
         let magnitude = pow(10, floor(log10(max(1, required))))
         return [1.0, 2, 5, 10].map { $0 * magnitude }.first { $0 >= required } ?? magnitude * 10
     }
-    private func orderedRows(_ tracks: [Track]) -> [(Track, Int)] {
-        var result: [(Track, Int)] = []
-        func append(_ parent: UUID?, depth: Int) {
-            for track in tracks where track.parent == parent {
-                result.append((track, depth)); append(track.id, depth: depth + 1)
-            }
-        }
-        append(nil, depth: 0)
-        return result
-    }
+    private func orderedRows(_ tracks: [Track]) -> [(Track, Int)] { TrackHierarchy.orderedRows(tracks) }
     private func previewTrackMove(at point: NSPoint) {
         guard let source = trackDrag, let baseline = trackDragRows else { return }
         trackPreview = nil
@@ -243,8 +237,40 @@ final class Timeline: NSView {
         let row = min(rows.count - 1, Int((point.y - ruler) / rowHeight))
         return rows[row].0.id
     }
+    var fragmentSnapTolerance: Double { max(0, visibleFragmentRect.width) / editor.zoom * 0.01 }
+    func snappedFragmentPosition(_ proposed: Double, clip: Clip, destination: UUID?) -> (start: Double, guide: Double?) {
+        let start = max(0, proposed)
+        guard let destination, destination != dragTrack else { return (start, nil) }
+        // The original position is stable even as the live drag changes the model.
+        var matches = [(start: originalStart, guide: originalStart)]
+        for target in editor.project.tracks.flatMap(\.clips) where target.id != clip.id {
+            for edge in [target.start, target.end] {
+                matches.append((edge, edge))
+                matches.append((edge - clip.duration, edge))
+            }
+        }
+        var best: (start: Double, guide: Double)?
+        var distance = fragmentSnapTolerance
+        for match in matches where match.start >= 0 {
+            let difference = abs(match.start - start)
+            if difference < distance { best = match; distance = difference }
+        }
+        return best.map { ($0.start, Optional($0.guide)) } ?? (start, nil)
+    }
+    private func updateFragmentMove(at point: NSPoint) {
+        guard let id = dragClip,
+              let i = editor.project.tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == id }) }),
+              let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == id }) else { return }
+        dragDestination = dropTrack(at: point)
+        let position = snappedFragmentPosition(originalStart + (point.x - dragStart.x) / editor.zoom,
+                                               clip: editor.project.tracks[i].clips[j], destination: dragDestination)
+        fragmentSnapTime = position.guide
+        editor.project.tracks[i].clips[j].start = position.start
+        editor.update()
+    }
     func displayedClips(for track: Track) -> [Clip] {
         var clips = track.clips
+        if let resizedFragment, let index = clips.firstIndex(where: { $0.id == resizedFragment.id }) { clips[index] = resizedFragment }
         if let id = dragClip, let source = dragTrack, let target = dragDestination, source != target,
            let clip = editor.project.tracks.first(where: { $0.id == source })?.clips.first(where: { $0.id == id }) {
             if track.id == source { clips.removeAll { $0.id == id } }
@@ -256,6 +282,20 @@ final class Timeline: NSView {
             clips.append(clips.remove(at: index))
         }
         return clips
+    }
+    func fragmentEdgeRects(_ rect: NSRect) -> [NSRect] {
+        let width = min(6, rect.width / 3)
+        return [NSRect(x: rect.minX, y: rect.minY, width: width, height: rect.height),
+                NSRect(x: rect.maxX - width, y: rect.minY, width: width, height: rect.height)]
+    }
+    @discardableResult func cancelFragmentResize() -> Bool {
+        guard fragmentResize != nil else { return false }
+        fragmentResize = nil; resizedFragment = nil; refresh(); return true
+    }
+    private func updateFragmentResize(at point: NSPoint) {
+        guard let resize = fragmentResize else { return }
+        resizedFragment = resize.original.resized(leftEdge: resize.leftEdge, by: (point.x - dragStart.x) / editor.zoom, sourceDuration: resize.sourceDuration)
+        refresh()
     }
     func trackNameRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
@@ -294,6 +334,30 @@ final class Timeline: NSView {
             }
         }
         for (row, item) in rows.enumerated() {
+            if !editor.busy {
+                let clips = displayedClips(for: item.0)
+                let rects = clips.enumerated().map { layer, clip in
+                    clipRect(clip, row: row, layer: clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count)
+                }
+                for index in rects.indices {
+                    for edge in fragmentEdgeRects(rects[index]) {
+                        var exposed = [edge.intersection(visibleTrackRect).intersection(visibleFragmentRect)]
+                        // Hidden edges underneath newer fragments must not advertise resizing.
+                        for cover in rects.dropFirst(index + 1) {
+                            exposed = exposed.flatMap { rect -> [NSRect] in
+                                let overlap = rect.intersection(cover)
+                                guard !overlap.isEmpty else { return [rect] }
+                                return [NSRect(x: rect.minX, y: rect.minY, width: overlap.minX - rect.minX, height: rect.height),
+                                        NSRect(x: overlap.maxX, y: rect.minY, width: rect.maxX - overlap.maxX, height: rect.height),
+                                        NSRect(x: overlap.minX, y: rect.minY, width: overlap.width, height: overlap.minY - rect.minY),
+                                        NSRect(x: overlap.minX, y: overlap.maxY, width: overlap.width, height: rect.maxY - overlap.maxY)]
+                                    .filter { !$0.isEmpty }
+                            }
+                        }
+                        for rect in exposed where !rect.isEmpty { addCursorRect(rect, cursor: .resizeLeftRight) }
+                    }
+                }
+            }
             let depth = item.1
             for (rect, cursor) in [(trackNameHitRect(row: row, depth: depth), NSCursor.iBeam),
                                    (trackMuteRect(row: row, depth: depth), NSCursor.pointingHand),
@@ -412,6 +476,16 @@ final class Timeline: NSView {
         }
         let playX = header + editor.cursor * editor.zoom
         line(NSPoint(x: playX, y: ruler), NSPoint(x: playX, y: bounds.height), editor.isRecording ? .systemRed : accent, width: 1.5)
+        if let fragmentSnapTime {
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: visibleFragmentRect.intersection(visibleTrackRect)).addClip()
+            let x = header + fragmentSnapTime * editor.zoom
+            let guide = NSBezierPath(); guide.move(to: NSPoint(x: x, y: pinnedRulerRect.maxY))
+            guide.line(to: NSPoint(x: x, y: visibleRect.maxY))
+            guide.lineWidth = 1.5; guide.setLineDash([4, 4], count: 2, phase: 0)
+            NSColor.white.withAlphaComponent(0.9).setStroke(); guide.stroke()
+            NSGraphicsContext.restoreGraphicsState()
+        }
         if let rect = marqueeRect {
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(rect: visibleFragmentRect.intersection(visibleTrackRect)).addClip()
@@ -544,12 +618,21 @@ final class Timeline: NSView {
         for (layer, clip) in clips.enumerated().reversed() {
             let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
             if clipRect(clip, row: row, layer: overlaps).contains(p) {
+                if !editor.busy, let edge = fragmentEdgeRects(clipRect(clip, row: row, layer: overlaps)).firstIndex(where: { $0.contains(p) }) {
+                    do {
+                        let duration = try editor.audio.sourceDuration(clip.source)
+                        fragmentResize = (clip, edge == 0, duration); resizedFragment = clip
+                        if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
+                        editor.hint(.selectFragments, "Shift click to multi select"); editor.update()
+                    } catch { editor.error(error) }
+                    return
+                }
                 if event.clickCount == 2 { editor.range = nil }
                 editor.seek(to: (p.x - header) / editor.zoom)
                 if event.modifierFlags.contains(.shift) { if editor.selection.contains(clip.id) { editor.selection.remove(clip.id) } else { editor.selection.insert(clip.id) } }
                 else if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
                 if editor.selection.contains(clip.id) { editor.hint(.selectFragments, "Shift click to multi select") }
-                if !editor.busy { dragClip = clip.id; originalStart = clip.start; dragTrack = track.id; dragDestination = nil }
+                if !editor.busy { dragClip = clip.id; originalStart = clip.start; dragTrack = track.id; dragDestination = nil; fragmentSnapTime = nil }
                 editor.update(); return
             }
         }
@@ -597,6 +680,11 @@ final class Timeline: NSView {
     }
     override func mouseDragged(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if fragmentResize != nil {
+            guard !editor.busy else { cancelFragmentResize(); return }
+            autoscrollRange(with: event)
+            updateFragmentResize(at: convert(event.locationInWindow, from: nil)); return
+        }
         if marqueeAnchor != nil {
             guard canSelectRange else { cancelMarqueeSelection(); return }
             autoscroll(with: event)
@@ -619,11 +707,9 @@ final class Timeline: NSView {
             editor.hint(.nestTracks, "Drag tracks to nest")
             previewTrackMove(at: p)
         }
-        if let id = dragClip, hypot(p.x - dragStart.x, p.y - dragStart.y) > 2 || didCheckpoint {
-            dragDestination = dropTrack(at: p)
+        if dragClip != nil, hypot(p.x - dragStart.x, p.y - dragStart.y) > 2 || didCheckpoint {
             if !didCheckpoint { editor.checkpoint(); didCheckpoint = true }
-            for i in editor.project.tracks.indices { if let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == id }) { editor.project.tracks[i].clips[j].start = max(0, originalStart + (p.x - dragStart.x) / editor.zoom) } }
-            editor.update()
+            updateFragmentMove(at: p)
         }
         if trackDrag != nil {
             let point = NSPoint(x: visibleRect.midX, y: p.y)
@@ -632,6 +718,18 @@ final class Timeline: NSView {
     }
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
+        if let resize = fragmentResize {
+            if !editor.busy {
+                updateFragmentResize(at: p)
+                if let clip = resizedFragment,
+                   clip.start != resize.original.start || clip.duration != resize.original.duration,
+                   let i = editor.project.tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == clip.id }) }),
+                   let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == clip.id }) {
+                    editor.checkpoint(); editor.project.tracks[i].clips[j] = clip
+                }
+            }
+            fragmentResize = nil; resizedFragment = nil; editor.update(); return
+        }
         if marqueeAnchor != nil {
             guard canSelectRange else { cancelMarqueeSelection(); return }
             if marqueeRect == nil {
@@ -668,6 +766,7 @@ final class Timeline: NSView {
             }
             refresh()
         }
+        if dragClip != nil, didCheckpoint, !editor.busy { updateFragmentMove(at: p) }
         if let id = dragClip, let source = dragTrack, let destination = dropTrack(at: p), destination != source {
             if let i = editor.project.tracks.firstIndex(where: { $0.id == source }), let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == id }), let target = editor.project.tracks.firstIndex(where: { $0.id == destination }) {
                 if !didCheckpoint { editor.checkpoint() }
@@ -675,7 +774,7 @@ final class Timeline: NSView {
                 let clip = editor.project.tracks[i].clips.remove(at: j); editor.project.tracks[target].clips.append(clip); editor.selectedTrack = destination; editor.update()
             }
         }
-        dragClip = nil; dragTrack = nil; dragDestination = nil; trackDrag = nil; pendingTrackRename = nil; selectingRange = false
+        dragClip = nil; dragTrack = nil; dragDestination = nil; fragmentSnapTime = nil; trackDrag = nil; pendingTrackRename = nil; selectingRange = false
         needsDisplay = true
         if let renameID { renameTrack(renameID) }
     }
