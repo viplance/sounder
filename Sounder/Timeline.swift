@@ -476,14 +476,14 @@ final class Timeline: NSView {
                 let rect = clipRect(clip, row: index, layer: overlaps)
                 guard rect.intersects(dirtyRect) else { continue }
                 fill(rect.offsetBy(dx: 0, dy: 3), .black.withAlphaComponent(0.4), radius: 6)
-                fill(rect, color.blended(withFraction: 0.78, of: background)!, radius: 6)
+                fill(rect, color.blended(withFraction: clip.muted ? 0.92 : 0.78, of: background)!, radius: 6)
                 let outline = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6); outline.lineWidth = editor.selection.contains(clip.id) ? 2 : 1
                 (editor.selection.contains(clip.id) ? color : color.withAlphaComponent(0.45)).setStroke(); outline.stroke()
                 NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
                 if let data = try? editor.audio.load(clip.source) {
-                    drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, gain: clip.gain, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(track.muted ? 0.3 : 0.9))
+                    drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, gain: clip.gain, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(track.muted || clip.muted ? 0.25 : 0.9))
                 }
-                drawFragmentTitle(clip.name, in: rect, color: color)
+                drawFragmentTitle(clip.name, in: rect, color: clip.muted ? .secondaryLabelColor : color)
                 NSGraphicsContext.restoreGraphicsState()
             }
             if editor.isRecording && editor.recordingTrack == track.id {
@@ -900,6 +900,7 @@ final class Timeline: NSView {
                     ("Move up", #selector(moveFragmentUp(_:)), editor.canMoveFragmentLayers(editor.selection, up: true)),
                     ("Move down", #selector(moveFragmentDown(_:)), editor.canMoveFragmentLayers(editor.selection, up: false)),
                     ("Normalize…", #selector(normalizeFragments(_:)), true),
+                    (editor.fragmentsAreMuted(editor.selection) ? "Unmute" : "Mute", #selector(muteFragments(_:)), true),
                     ("Delete", #selector(deleteFragment(_:)), true)] {
                     let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
                     item.target = self; item.representedObject = editor.selection; item.isEnabled = enabled; menu.addItem(item)
@@ -918,6 +919,9 @@ final class Timeline: NSView {
     @objc func normalizeFragments(_ sender: NSMenuItem) {
         guard !editor.busy, let ids = sender.representedObject as? Set<UUID> else { return }
         editor.selection = ids; NSApp.sendAction(#selector(AppDelegate.normalize), to: NSApp.delegate, from: sender)
+    }
+    @objc func muteFragments(_ sender: NSMenuItem) {
+        if let ids = sender.representedObject as? Set<UUID> { editor.toggleFragmentMute(ids) }
     }
     @objc func deleteFragment(_ sender: NSMenuItem) {
         guard !editor.busy, let ids = sender.representedObject as? Set<UUID> else { return }

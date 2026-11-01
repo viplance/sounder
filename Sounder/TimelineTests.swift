@@ -402,7 +402,7 @@ extension AppDelegate {
         func perform(_ item: NSMenuItem) { _ = NSApp.sendAction(item.action!, to: item.target, from: item) }
         func order() -> [UUID] { editor.project.tracks[0].clips.sorted { $0.order < $1.order }.map(\.id) }
         let bottom = menu(time: 2, y: timeline.ruler + 9)!
-        try check(bottom.items.map(\.title) == ["Move up", "Move down", "Normalize…", "Delete"] && bottom.items[0].isEnabled && !bottom.items[1].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
+        try check(bottom.items.map(\.title) == ["Move up", "Move down", "Normalize…", "Mute", "Delete"] && bottom.items[0].isEnabled && !bottom.items[1].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
         let history = editor.undoStack.count
         perform(bottom.items[0])
         try check(order() == [middle.id, lower.id, upper.id, isolated.id] && editor.undoStack.count == history + 1, "Move up raises the context fragment exactly one overlapping level and leaves other relative ordering intact")
@@ -416,7 +416,7 @@ extension AppDelegate {
         let alone = menu(time: 7.5, y: timeline.ruler + 25)!
         try check(!alone.items[0].isEnabled && !alone.items[1].isEnabled, "Both layer actions are disabled for an isolated fragment")
         editor.selection.insert(upper.id)
-        perform(alone.items[3])
+        perform(alone.items[4])
         try check(editor.project.tracks[0].clips.count == 3 && !editor.project.tracks[0].clips.contains(where: { $0.id == isolated.id }) && editor.project.tracks[0].clips.contains(where: { $0.id == upper.id }), "Context Delete removes only its fragment even when another fragment is selected")
         editor.undo(); try check(editor.project.tracks[0].clips.count == 4, "Context fragment deletion can be undone")
         try check(menu(time: 6, y: timeline.ruler + 25) == nil, "Empty fragment space does not open the track menu")
@@ -427,7 +427,7 @@ extension AppDelegate {
         perform(group.items[1])
         try check(order() == [lower.id, upper.id, middle.id, isolated.id] && editor.selection == [lower.id, upper.id] && editor.undoStack.count == groupHistory + 1, "Group Move down moves selected layers together without swapping them and creates one Undo step")
         editor.undo(); editor.redo(); editor.undo()
-        perform(group.items[3])
+        perform(group.items[4])
         try check(Set(editor.project.tracks[0].clips.map(\.id)) == [middle.id, isolated.id], "Context Delete removes every selected fragment and preserves unselected audio")
         editor.undo()
         var secondLower = lower; secondLower.id = UUID(); secondLower.order = 10
@@ -440,7 +440,7 @@ extension AppDelegate {
         perform(across.items[0])
         try check(order() == [middle.id, upper.id, lower.id, isolated.id] && editor.project.tracks[1].clips.sorted(by: { $0.order < $1.order }).last?.id == secondLower.id && editor.undoStack.count == batchHistory + 1, "One menu action changes layers on every selected track with one Undo step")
         editor.undo()
-        perform(across.items[3])
+        perform(across.items[4])
         try check(!editor.project.tracks.flatMap(\.clips).contains(where: { $0.id == lower.id || $0.id == secondLower.id }) && editor.project.tracks[1].clips.first?.id == secondUpper.id, "Group context deletion applies across tracks")
         editor.undo()
         editor.selection = [lower.id, upper.id]
@@ -558,5 +558,32 @@ extension AppDelegate {
         guard dialog.runModal() == nil, editor.project.normalizationLevel == -3 else { throw SounderError.message("Normalize Cancel changed the last chosen level") }
         editor.project = original; editor.selection = []; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
         print("PASS: physical N/т opens Normalize, Process changes gain, the next dialog recalls the target, and Cancel preserves it")
+    }
+}
+
+extension AppDelegate {
+    func verifyFragmentMuteUI() throws {
+        let original = editor.project
+        let a = original.tracks[0].clips[0], b = original.tracks[1].clips[0]
+        editor.selection = [a.id, b.id]; refresh()
+        func menu() throws -> NSMenu {
+            let point = NSPoint(x: timeline.header + (a.start + 1) * editor.zoom, y: timeline.ruler + 30)
+            let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            guard let menu = timeline.menu(for: event) else { throw SounderError.message("No fragment context menu") }; return menu
+        }
+        let history = editor.undoStack.count, messages = editor.notifications.messages.count
+        let first = try menu()
+        guard let mute = first.items.first(where: { $0.title == "Mute" }), editor.selection == [a.id, b.id] else { throw SounderError.message("Mute context action missing or reset the group") }
+        _ = NSApp.sendAction(mute.action!, to: mute.target, from: mute)
+        guard editor.fragmentsAreMuted([a.id, b.id]), editor.undoStack.count == history + 1, editor.notifications.messages.count == messages else { throw SounderError.message("Group mute did not apply silently as one edit") }
+        let next = try menu()
+        guard next.items.contains(where: { $0.title == "Unmute" }), fragmentMuteButton.toolTip == "Unmute selected fragments" else { throw SounderError.message("Mute action did not change to Unmute") }
+        fragmentMuteButton.performClick(nil)
+        guard !editor.fragmentsAreMuted([a.id, b.id]), editor.project.tracks.flatMap(\.clips).allSatisfy({ !$0.muted }) else { throw SounderError.message("Toolbar Unmute did not restore the selected fragments") }
+        editor.undo()
+        guard editor.fragmentsAreMuted([a.id, b.id]) else { throw SounderError.message("Undo did not restore mute") }
+        editor.redo()
+        editor.project = original; editor.selection = []; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+        print("PASS: context Mute applies to the group, becomes Unmute, toolbar toggles it, no toasts appear, and Undo/Redo works")
     }
 }

@@ -169,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var recordButton: NSButton!
     var exportButton: NSButton!
     var editButtons: [NSButton] = []
+    var fragmentMuteButton: NSButton!
     private var titlebarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("quality"), .flexibleSpace, NSToolbarItem.Identifier("open"), NSToolbarItem.Identifier("save"), NSToolbarItem.Identifier("export")]
     var closingConfirmed = false
@@ -193,10 +194,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let split = button("Split at playhead · S", "scissors", #selector(split)); let trim = button("Trim to ruler selection", "crop", #selector(trim)); let delete = button("Delete fragments · Delete", "trash", #selector(deleteClips))
         let join = button("Join selected fragments · ⌘J", "link", #selector(join))
         let normalize = button("Normalize · N", "waveform.path", #selector(normalize))
+        fragmentMuteButton = button("Mute selected fragments", "speaker.slash", #selector(muteFragments))
         let importButton = button("Import audio · ⌘I", "square.and.arrow.down.on.square", #selector(importAudio))
-        toolbar.addArrangedSubview(section("FRAGMENTS", [split, trim, delete, join, normalize, importButton]))
+        toolbar.addArrangedSubview(section("FRAGMENTS", [split, trim, delete, join, normalize, fragmentMuteButton, importButton]))
         let addTrack = button("Add track · ⌘T", "plus", #selector(addTrack)); let nest = button("Add nested track", "arrow.turn.down.right", #selector(nest)); let removeTrack = button("Delete track", "minus", #selector(removeTrack))
-        toolbar.addArrangedSubview(section("TRACKS", [addTrack, nest, removeTrack])); editButtons = [split, trim, delete, join, normalize, addTrack, nest, removeTrack, importButton]
+        toolbar.addArrangedSubview(section("TRACKS", [addTrack, nest, removeTrack])); editButtons = [split, trim, delete, join, normalize, fragmentMuteButton, addTrack, nest, removeTrack, importButton]
         toolbar.addArrangedSubview(section("VIEW", [button("Zoom out", "minus.magnifyingglass", #selector(zoomOut)), button("Zoom in", "plus.magnifyingglass", #selector(zoomIn))]))
         let spacer2 = NSView(); spacer2.setContentHuggingPriority(.defaultLow, for: .horizontal); toolbar.addArrangedSubview(spacer2)
         metronomeButton = PointerButton(image: NSImage(systemSymbolName: "metronome", accessibilityDescription: "Metronome")!, target: self, action: #selector(toggleMetronome))
@@ -305,6 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             refresh()
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
+            if CommandLine.arguments.contains("--fragment-mute-ui-test") { try verifyFragmentMuteUI() }
             if CommandLine.arguments.contains("--normalize-ui-test") { try verifyNormalizationUI() }
             if CommandLine.arguments.contains("--stop-return-ui-test") { try verifyStopReturnUI() }
             if CommandLine.arguments.contains("--physical-shortcuts-ui-test") { try verifyPhysicalShortcutsUI() }
@@ -631,6 +634,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func refresh() {
         timeline.refresh()
+        let muted = editor.fragmentsAreMuted(editor.selection)
+        fragmentMuteButton.toolTip = muted ? "Unmute selected fragments" : "Mute selected fragments"
+        fragmentMuteButton.setAccessibilityLabel(muted ? "Unmute selected fragments" : "Mute selected fragments")
+        fragmentMuteButton.image = NSImage(systemSymbolName: muted ? "speaker.wave.2" : "speaker.slash", accessibilityDescription: muted ? "Unmute" : "Mute")
         let time = editor.cursor; timeLabel.stringValue = String(format: "%02d:%02d.%03d", Int(time) / 60, Int(time) % 60, Int(time * 1000) % 1000)
         timeLabel.isHidden = editor.project.tempoMode; bpmButton.isHidden = !editor.project.tempoMode
         metronomeButton.isHidden = !editor.project.tempoMode
@@ -682,7 +689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         menu("Sounder", [("About Sounder", #selector(about), ""), ("Quit Sounder", #selector(quit), "q")])
         menu("File", [("Rename Project…", #selector(renameProject), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Import Audio…", #selector(importAudio), "i"), ("Export…", #selector(exportAudio), "e")])
-        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"), ("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
+        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"), ("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Mute Fragments", #selector(muteFragments), ""), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
         if let edit = main.items.last?.submenu { edit.items.filter { [#selector(split), #selector(normalize)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
         menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
         menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
@@ -720,6 +727,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if menuItem.action == #selector(copy(_:)) { return !editor.selection.isEmpty }
             return !editor.busy && NSPasteboard.general.data(forType: Editor.fragmentPasteboardType) != nil
         }
+        if menuItem.action == #selector(muteFragments) {
+            menuItem.title = editor.fragmentsAreMuted(editor.selection) ? "Unmute Fragments" : "Mute Fragments"
+            return !editor.busy && !editor.selection.isEmpty && NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
+        }
         if [#selector(split), #selector(normalize)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView) && !editor.busy
         }
@@ -755,6 +766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func stop() { if timeline.cancelFragmentResize() || timeline.cancelMarqueeSelection() { return }; if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stopAndReturnToStart(); timeline.centerOnPlayhead() } }
     @objc func record() { editor.record() }
     @objc func rewind() { if editor.isRecording { editor.stop() }; editor.seek(to: 0) }
+    @objc func muteFragments() { editor.toggleFragmentMute() }
     @objc func normalize() {
         guard !editor.busy else { return }
         guard !editor.selection.isEmpty else { editor.notifications.show("Select fragments to normalize", style: .hint); return }

@@ -197,6 +197,23 @@ final class Editor: NSObject {
             }
         }
     }
+    func fragmentsAreMuted(_ ids: Set<UUID>) -> Bool {
+        let clips = project.tracks.flatMap(\.clips).filter { ids.contains($0.id) }
+        return !clips.isEmpty && clips.allSatisfy(\.muted)
+    }
+    func toggleFragmentMute(_ ids: Set<UUID>? = nil) {
+        guard !busy else { return }
+        let targets = ids ?? selection
+        guard project.tracks.flatMap(\.clips).contains(where: { targets.contains($0.id) }) else {
+            notifications.show("Select fragments to mute or unmute", style: .hint); return
+        }
+        let muted = !fragmentsAreMuted(targets)
+        checkpoint()
+        for i in project.tracks.indices {
+            for j in project.tracks[i].clips.indices where targets.contains(project.tracks[i].clips[j].id) { project.tracks[i].clips[j].muted = muted }
+        }
+        update()
+    }
     func fragmentLayerNeighbor(_ id: UUID, up: Bool) -> UUID? {
         guard let track = project.tracks.first(where: { $0.clips.contains(where: { $0.id == id }) }) else { return nil }
         let clips = track.clips.sorted { $0.order < $1.order }
@@ -499,7 +516,7 @@ final class Editor: NSObject {
             for clip in project.tracks[i].clips {
                 if targets.contains(where: { $0.id == clip.id }) {
                     var left = clip; var right = clip; right.id = UUID()
-                    left.duration = cursor - clip.start; right.start = cursor; right.offset += left.duration; right.duration -= left.duration
+                    left.duration = cursor - clip.start; left.fadeOutBaked = false; right.fadeInBaked = false; right.start = cursor; right.offset += left.duration; right.duration -= left.duration
                     next += [left, right]; selection.insert(right.id)
                 } else { next.append(clip) }
             }; project.tracks[i].clips = next
@@ -514,7 +531,9 @@ final class Editor: NSObject {
                 guard selection.contains(original.id) else { return original }
                 let start = max(original.start, range.lowerBound), end = min(original.end, range.upperBound)
                 guard end > start else { return nil }
-                var clip = original; clip.offset += start - clip.start; clip.start = start; clip.duration = end - start; return clip
+                var clip = original
+                if start != original.start { clip.fadeInBaked = false }; if end != original.end { clip.fadeOutBaked = false }
+                clip.offset += start - clip.start; clip.start = start; clip.duration = end - start; return clip
             }
         }; reconcile(); update("Trimmed to selected range")
     }
@@ -527,7 +546,7 @@ final class Editor: NSObject {
             var subset = project; subset.tracks[index].clips = clips
             let samples = try audio.renderAudio(subset, range: start..<end, onlyTrack: project.tracks[index].id)
             let url = audio.freshURL(); try audio.write(samples, to: url); checkpoint()
-            let clip = Clip(name: "Joined \(clips.count) fragments", source: url.path, start: start, duration: end - start, order: project.nextOrder)
+            let clip = Clip(name: "Joined \(clips.count) fragments", source: url.path, start: start, duration: end - start, order: project.nextOrder, fadeInBaked: true, fadeOutBaked: true)
             project.nextOrder += 1; project.tracks[index].clips.removeAll { selection.contains($0.id) }; project.tracks[index].clips.append(clip); selection = [clip.id]; update("Fragments joined")
         } catch { self.error(error) }
     }

@@ -15,7 +15,7 @@ func runAudioTests() throws {
     var project = Project(tracks: [track])
     let mix = try store.render(project)
     try check(mix.count == 48_000, "Export duration is sample accurate")
-    try check(mix[100] == 0.25 && mix[13_000] == -0.5 && mix[40_000] == 0.25, "New fragments override overlaps; underlying audio returns after overlap")
+    try check(mix[1000] == 0.25 && mix[13_000] == -0.5 && mix[40_000] == 0.25, "New fragments override overlaps; underlying audio returns after overlap")
     try check(mix[20_000] == 0, "New silent fragment replaces old sound")
     let waveform = try store.load(new.path)
     try check(waveform.peaks[0] == 0.5, "Waveform peaks come from decoded PCM")
@@ -73,7 +73,7 @@ func runAudioTests() throws {
     try check(clipboardEditor.project.tracks.flatMap(\.clips).filter { clipboardEditor.selection.contains($0.id) }.map(\.start).sorted() == [20, 22, 24], "Repeated paste uses the immutable clipboard rather than the previous paste positions")
     var child = Track(name: "Child", parent: track.id); child.clips = [Clip(name: "child", source: old.path, start: 0, duration: 1, order: 4)]
     project.tracks.append(child)
-    let nested = try store.render(project); try check(nested[100] == 0.5, "Nested tracks mix with parent")
+    let nested = try store.render(project); try check(nested[1000] == 0.5, "Nested tracks mix with parent")
     project.tracks[0].muted = true
     let muted = try store.render(project); try check(muted.allSatisfy { $0 == 0 }, "Parent mute silences nested tracks")
     let editor = Editor(store: store); editor.project = Project(tracks: [track]); editor.selectedTrack = track.id; editor.selection = [track.clips[0].id]; editor.cursor = 0.6
@@ -122,21 +122,21 @@ func runAudioTests() throws {
     }
     var fxProject = Project(tracks: [fxParent, fxChild])
     var fxMix = try store.render(fxProject)
-    try check(abs(fxMix[100] - 0.1875) < 0.000001, "Child effects run before parent bus effects, exactly once")
+    try check(abs(fxMix[1000] - 0.1875) < 0.000001, "Child effects run before parent bus effects, exactly once")
     fxChild.effects[0].bypassed = true; fxProject.tracks[1] = fxChild
     fxMix = try store.render(fxProject)
-    try check(fxMix[100] == 0.25, "Child bypass retains inherited parent effects")
+    try check(fxMix[1000] == 0.25, "Child bypass retains inherited parent effects")
     let sibling = Track(name: "Independent", clips: [track.clips[0]])
     fxProject.tracks.append(sibling); fxMix = try store.render(fxProject)
-    try check(fxMix[100] == 0.5, "Parent FX do not affect independent tracks")
+    try check(fxMix[1000] == 0.5, "Parent FX do not affect independent tracks")
     fxParent.effects.append(PluginEffect(name: "bias", path: "test", classID: "bias"))
     fxProject = Project(tracks: [fxParent]); let ordered = try store.render(fxProject)
     fxProject.tracks[0].effects.reverse(); let reversed = try store.render(fxProject)
-    try check(abs(ordered[100] - reversed[100] - 0.05) < 0.000001, "FX chain order changes rendered audio")
+    try check(abs(ordered[1000] - reversed[1000] - 0.05) < 0.000001, "FX chain order changes rendered audio")
     fxProject.tracks[0].effects = [PluginEffect(name: "tail", path: "test", classID: "tail")]
     fxMix = try store.render(fxProject); try check(fxMix.count == 48_002, "Effect tails survive bus summing and export")
     let dry = try store.render(fxProject, range: 0..<1, onlyTrack: fxParent.id)
-    try check(dry.count == 48_000 && dry[100] == 0.25, "Fragment joining stays dry to avoid double processing")
+    try check(dry.count == 48_000 && dry[1000] == 0.25, "Fragment joining stays dry to avoid double processing")
     let fxJSON = try JSONEncoder().encode(fxProject)
     let restoredFX = try JSONDecoder().decode(Project.self, from: fxJSON)
     try check(restoredFX.tracks[0].effects[0].classID == "tail", "Project round-trip preserves effect chains")
@@ -208,6 +208,8 @@ func runAudioTests() throws {
     try runStreamingGraphTests()
     try runTransportPositionTests()
     try runTempoTests()
+    try runFragmentFadeTests()
+    try runFragmentMuteTests()
     try runNormalizationTests()
     try runExportTests()
     try runLiveRecordingTests()
@@ -364,8 +366,8 @@ func runNormalizationTests() throws {
     try process(-3)
     let target = pow(10, -3.0 / 20)
     let normalized = try store.renderAudio(editor.project)
-    try check(abs(Double(normalized.channels[1][100]) - target) < 1e-6 && abs(Double(normalized.channels[0][48_100]) - target) < 1e-6, "Each fragment independently reaches its requested peak using only its trimmed source interval")
-    try check(abs(normalized.channels[1][100] / normalized.channels[0][100] - 2) < 1e-6 && editor.project.tracks[0].clips[0].offset == 0.5, "Normalization links stereo gain and preserves source offset and timing")
+    try check(abs(Double(normalized.channels[1][1000]) - target) < 1e-6 && abs(Double(normalized.channels[0][49_000]) - target) < 1e-6, "Each fragment independently reaches its requested peak using only its trimmed source interval")
+    try check(abs(normalized.channels[1][1000] / normalized.channels[0][1000] - 2) < 1e-6 && editor.project.tracks[0].clips[0].offset == 0.5, "Normalization links stereo gain and preserves source offset and timing")
     try check(try Data(contentsOf: source) == originalBytes && editor.undoStack.count == 1 && editor.project.normalizationLevel == -3, "Normalization leaves originals unchanged and stores the level with one Undo action")
     let graph = try StreamingGraph(project: editor.project, store: store) { _ in throw SounderError.message("Unexpected effect") }
     var peak: Float = 0
@@ -394,4 +396,98 @@ func runNormalizationTests() throws {
     var rejected = false
     do { try FragmentNormalization.validate(1) } catch { rejected = true }
     try check(rejected, "Normalization rejects a peak target above 0 dBFS")
+}
+
+func runFragmentMuteTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderFragmentMute-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let oldURL = store.freshURL(), newURL = store.freshURL()
+    try store.write(Array(repeating: Float(0.25), count: 48_000), to: oldURL)
+    try store.write(Array(repeating: Float(-0.5), count: 24_000), to: newURL)
+    let old = Clip(name: "Old", source: oldURL.path, start: 0, duration: 1, order: 1)
+    let newer = Clip(name: "New", source: newURL.path, start: 0.25, duration: 0.5, order: 2)
+    let editor = Editor(store: store); editor.project = Project(tracks: [Track(name: "Mute", clips: [old, newer])], nextOrder: 3)
+    editor.selection = [newer.id]
+    let messages = editor.notifications.messages.count
+    editor.toggleFragmentMute()
+    let audible = try store.render(editor.project)
+    try check(audible[13_000] == 0.25 && editor.project.tracks[0].clips[1].muted, "Muted fragments are skipped so underlying unmuted audio remains audible")
+    let graph = try StreamingGraph(project: editor.project, store: store) { _ in throw SounderError.message("Unexpected effect") }
+    var played: [Float] = []
+    while graph.position < 14_000 { played += try graph.render(frames: 512) }
+    try check(played[26_000] == 0.25, "Streaming playback honors per-fragment mute before track effects")
+    editor.selection = [old.id, newer.id]; editor.toggleFragmentMute()
+    try check(editor.fragmentsAreMuted(editor.selection) && (try store.render(editor.project)).allSatisfy { $0 == 0 }, "A mixed selection is muted together without changing the track's MUTE state")
+    try check(!editor.project.tracks[0].muted && editor.notifications.messages.count == messages, "Fragment mute is independent from track mute and emits no notifications")
+    editor.toggleFragmentMute()
+    try check(editor.project.tracks[0].clips.allSatisfy { !$0.muted } && (try store.render(editor.project))[13_000] == -0.5, "Unmute restores all selected fragments and their original overlap priority")
+    editor.undo(); try check(editor.project.tracks[0].clips.allSatisfy(\.muted), "One Undo restores the whole group's mute state")
+    editor.redo(); editor.undo()
+    editor.projectURL = directory.appendingPathComponent("Muted.sounder")
+    try check(editor.save(), "Project with muted fragments saves successfully")
+    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!.appendingPathComponent("project.json")))
+    try check(saved.tracks[0].clips.allSatisfy(\.muted), "Save/load preserves fragment mute state")
+    let pasteboard = NSPasteboard.withUniqueName(); defer { pasteboard.releaseGlobally() }
+    editor.copyFragments(to: pasteboard); editor.cursor = 2; editor.selectedTrack = editor.project.tracks[0].id
+    editor.pasteFragments(from: pasteboard)
+    try check(editor.project.tracks.flatMap(\.clips).filter { editor.selection.contains($0.id) }.allSatisfy(\.muted), "Clipboard copies retain fragment mute state")
+    var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(old)) as! [String: Any]
+    legacy.removeValue(forKey: "muted")
+    let restored = try JSONDecoder().decode(Clip.self, from: JSONSerialization.data(withJSONObject: legacy))
+    try check(!restored.muted, "Legacy fragments without a mute field remain audible")
+}
+
+func runFragmentFadeTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderFades-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    for rate in [44_100.0, 48_000, 96_000] {
+        let format = ProjectAudioFormat(sampleRate: rate)
+        store.configure(format)
+        let aURL = store.freshURL(), bURL = store.freshURL()
+        let frames = Int(rate * 0.4)
+        try store.write(AudioSignal(channels: [Array(repeating: Float(0.4), count: frames), Array(repeating: Float(0.2), count: frames)]), to: aURL)
+        try store.write(AudioSignal(channels: [Array(repeating: Float(-0.2), count: frames), Array(repeating: Float(-0.1), count: frames)]), to: bURL)
+        let a = Clip(name: "Underlying", source: aURL.path, start: 0, duration: 0.4, order: 1)
+        let b = Clip(name: "Overlay", source: bURL.path, start: 0.1, duration: 0.2, order: 2)
+        let project = Project(tracks: [Track(name: "Fade", clips: [a, b])], nextOrder: 3, audioFormat: format)
+        let mix = try store.renderAudio(project)
+        let ramp = Int((rate * 0.01).rounded()), start = Int(rate * b.start), end = Int(rate * b.end)
+        try check(mix.channels[0].first == 0 && mix.channels[0].last == 0 && abs(mix.channels[0][ramp] - 0.4) < 1e-6, "Fragment boundaries have a 10 ms fade at \(Int(rate)) Hz")
+        try check(abs(mix.channels[0][start] - 0.4) < 1e-6 && abs(mix.channels[0][start + ramp] + 0.2) < 1e-6 && abs(mix.channels[0][end - 1] - 0.4) < 1e-6, "Overlapping starts and ends crossfade smoothly to and from the underlying fragment")
+        let jump = zip(mix.channels[0], mix.channels[0].dropFirst()).map { abs($0 - $1) }.max()!
+        try check(Double(jump) <= 0.6 / Double(ramp) + 1e-6 && zip(mix.channels[0], mix.channels[1]).allSatisfy { abs($0 - $1 * 2) < 1e-6 }, "Crossfades avoid hard discontinuities and preserve stereo balance")
+        let region = 0.105..<0.115
+        let selected = try store.renderAudio(project, range: region)
+        try check(selected.channels == mix.channels.map { Array($0[Int(region.lowerBound * rate)..<Int(region.upperBound * rate)]) }, "Range rendering does not restart the fragment fades")
+        let graph = try StreamingGraph(project: project, store: store) { _ in throw SounderError.message("Unexpected effect") }
+        var streamed: [Float] = []
+        while graph.position < graph.totalFrames { streamed += try graph.render(frames: 512) }
+        var expected: [Float] = []
+        for frame in 0..<mix.frameCount { expected += [mix.channels[0][frame], mix.channels[1][frame]] }
+        try check(Array(streamed.prefix(expected.count)) == expected, "Streaming blocks and offline export share exactly the same fade samples")
+        let editor = Editor(store: store); editor.project = project; editor.selectedTrack = project.tracks[0].id; editor.selection = [a.id, b.id]
+        editor.join()
+        let joined = try store.renderAudio(editor.project)
+        try check(editor.project.tracks[0].clips.count == 1 && joined.channels == mix.channels, "Join bakes crossfades without applying outer fades twice")
+        let joinedClip = editor.project.tracks[0].clips[0]
+        let restored = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(editor.project))
+        try check(try store.renderAudio(restored).channels == joined.channels, "Project serialization retains baked fades without doubling them after reopening")
+        var overlay = joinedClip.resized(leftEdge: false, by: -0.1, sourceDuration: 0.4)
+        overlay.start = 0.05; overlay.order = 10
+        let reused = try store.renderAudio(Project(tracks: [Track(name: "Joined overlay", clips: [a, overlay])], audioFormat: format))
+        try check(abs(reused.channels[0][Int(0.05 * rate)] - 0.4) < 1e-6, "A reused joined fragment still crossfades with audio beneath its already-baked edge")
+        let resized = joinedClip.resized(leftEdge: true, by: 0.02, sourceDuration: 0.4)
+        try check(!resized.fadeInBaked && resized.fadeOutBaked, "Resizing a baked fragment edge restores its automatic fade")
+        var short = a; short.duration = 0.01
+        let shortMix = try store.renderAudio(Project(tracks: [Track(name: "Short", clips: [short])], audioFormat: format))
+        try check(shortMix.frameCount == Int(rate * 0.01) && shortMix.channels[0].first == 0 && shortMix.channels[0].last == 0 && shortMix.channels[0].max()! > 0.39, "A 10 ms fragment uses shorter edge ramps without losing its peak or duration")
+    }
 }

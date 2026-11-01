@@ -153,3 +153,11 @@
 ## Fragment normalization
 
 - Normalize is available from FRAGMENTS, the Edit menu and the fragment context menu, applying to the captured selection. Use unmodified physical N (including Russian т). Show a compact Normalize dialog with Maximum level in dBFS, Process and Cancel; accept -120…0 dBFS, initially -1 dBFS. Remember the last successfully processed level in the project and use it on reopening the dialog. Analyze the actual selected source interval off the UI thread, independently per fragment with linked stereo-channel gain; leave silence unchanged. Apply non-destructive gain before track effects, reflect it in waveforms, preserve originals and source bounds, and support one-step Undo/Redo. Gain and the level must survive save/load; legacy clips use unity gain. Splits, trims, clipboard copies, playback, export and joining must honor gain without applying it twice.
+
+## Fragment muting
+
+- Provide a Mute/Unmute toggle in FRAGMENTS, Edit and the fragment context menu. Apply to the whole selection across tracks with one Undo step: mute a mixed/unmuted selection, unmute when all selected fragments are muted. Dim muted fragments without hiding their waveform or selection. Persist per-fragment mute in the project and clipboard; legacy clips default to unmuted. Exclude muted clips from playback/export/joins, allowing underlying unmuted overlaps to sound. Keep fragment mute edits silent and subject to normal fragment-edit availability. Track MUTE remains independent.
+
+## Automatic fragment fades
+
+- Apply 10 ms linear fade-in/out in the shared dry fragment renderer before track effects. At overlaps, crossfade the incoming/outgoing fragment against the already composed underlying audio, retaining newest-fragment priority outside the ramps and linked stereo weights. Short fragments cap ramps at half their length; use absolute fragment bounds so seeking, range export and streaming block boundaries do not restart fades. Preserve source files and duration. Join bakes the existing fades/crossfades and marks its two edges as baked to avoid applying them twice; split, trim and resize restore automatic fading on newly created/changed edges. Persist baked-edge metadata with legacy defaults false.

@@ -212,7 +212,7 @@ func runStreamingGraphTests() throws {
         StreamingEffect(latency: 0, tail: 0) { $0.map { $0 * gain } }
     }
     let first = try graph.render(frames: 512)
-    try check(abs(first[0] - 0.35) < 0.000001 && abs(first[1] - 0.175) < 0.000001, "Streaming graph applies child and parent effects once, with independent stereo and sibling tracks")
+    try check(abs(first[1000] - 0.35) < 0.000001 && abs(first[1001] - 0.175) < 0.000001, "Streaming graph applies child and parent effects once, with independent stereo and sibling tracks")
     gain = 0.25
     let next = try graph.render(frames: 512)
     try check(abs(next[0] - 0.2625) < 0.000001, "Changing a live parameter changes the very next block without rebuilding the mix")
@@ -226,17 +226,19 @@ func runStreamingGraphTests() throws {
         let delay = SampleDelay(frames: 37, channels: 2)
         return StreamingEffect(latency: 37, tail: 0) { delay.apply($0) }
     }
-    let delayed = try delayedGraph.render(frames: 128)
-    try check(delayedGraph.latency == 74 && delayed.prefix(148).allSatisfy { $0 == 0 } && abs(delayed[148] - 0.6) < 0.000001, "Streaming latency compensation aligns dry, child and root buses")
+    let delayed = try delayedGraph.render(frames: 512)
+    let delayedInterior = try delayedGraph.render(frames: 512)
+    try check(delayedGraph.latency == 74 && delayed.prefix(148).allSatisfy { $0 == 0 } && abs(delayedInterior[84] - 0.6) < 0.000001, "Streaming latency compensation aligns dry, child and root buses")
     var mutedParent = parent; mutedParent.muted = true
     let muted = try StreamingGraph(project: Project(tracks: [mutedParent, child]), store: store) { _ in
         StreamingEffect(latency: 0, tail: 0) { $0 }
     }
-    try check(try muted.render(frames: 32).allSatisfy { $0 == 0 }, "Streaming mute silences the entire subtree")
+    try check(try muted.render(frames: 512).allSatisfy { $0 == 0 }, "Streaming mute silences the entire subtree")
     muted.setMuted(false, trackID: parent.id)
     try check(abs(try muted.render(frames: 32)[0] - 0.4) < 0.000001, "A track muted before Play can be unmuted in the same stream")
     var newerSilence = clip; newerSilence.id = UUID(); newerSilence.order = 2; newerSilence.source = store.freshURL().path
     try store.write(AudioSignal(channels: [[Float](repeating: 0, count: 2048), [Float](repeating: 0, count: 2048)]), to: URL(fileURLWithPath: newerSilence.source))
     let overlap = try StreamingGraph(project: Project(tracks: [Track(name: "Overlap", clips: [clip, newerSilence])]), store: store) { _ in fatalError() }
-    try check(try overlap.render(frames: 128).allSatisfy { $0 == 0 }, "Streaming playback preserves newer silent takes over older fragments")
+    _ = try overlap.render(frames: 512)
+    try check(try overlap.render(frames: 128).allSatisfy { $0 == 0 }, "Streaming playback preserves newer silent takes after their edge crossfade")
 }

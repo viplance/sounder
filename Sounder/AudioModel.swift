@@ -19,6 +19,9 @@ struct Clip: Codable, Identifiable {
     var duration: Double
     var order: Int
     var gain = 1.0
+    var muted = false
+    var fadeInBaked = false
+    var fadeOutBaked = false
     var end: Double { start + duration }
 
     func resized(leftEdge: Bool, by delta: Double, sourceDuration: Double) -> Clip {
@@ -28,20 +31,25 @@ struct Clip: Codable, Identifiable {
         if leftEdge {
             let shift = max(-min(start, offset), min(delta, duration - minimum))
             result.start += shift; result.offset += shift; result.duration -= shift
+            if shift != 0 { result.fadeInBaked = false }
         } else {
             result.duration = max(minimum, min(duration + delta, sourceDuration - offset))
+            if result.duration != duration { result.fadeOutBaked = false }
         }
         return result
     }
 }
 extension Clip {
-    enum CodingKeys: String, CodingKey { case id, name, source, start, offset, duration, order, gain }
+    enum CodingKeys: String, CodingKey { case id, name, source, start, offset, duration, order, gain, muted, fadeInBaked, fadeOutBaked }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id); name = try values.decode(String.self, forKey: .name)
         source = try values.decode(String.self, forKey: .source); start = try values.decode(Double.self, forKey: .start)
         offset = try values.decodeIfPresent(Double.self, forKey: .offset) ?? 0
         duration = try values.decode(Double.self, forKey: .duration); order = try values.decode(Int.self, forKey: .order)
+        fadeInBaked = try values.decodeIfPresent(Bool.self, forKey: .fadeInBaked) ?? false
+        fadeOutBaked = try values.decodeIfPresent(Bool.self, forKey: .fadeOutBaked) ?? false
+        muted = try values.decodeIfPresent(Bool.self, forKey: .muted) ?? false
         gain = try values.decodeIfPresent(Double.self, forKey: .gain) ?? 1
         guard gain.isFinite && gain >= 0 else { throw SounderError.message("Invalid fragment gain") }
     }
@@ -325,21 +333,28 @@ final class AudioStore {
         let length = max(0, Int((region.upperBound - region.lowerBound) * sampleRate))
         func raw(_ track: Track) throws -> AudioSignal {
             var lane = silence(length)
-            // Oldest first: a newer fragment overwrites, even when its sample is silence.
-            for clip in track.clips.sorted(by: { $0.order < $1.order }) {
+            // Composite oldest first. A new fragment wins outside its edge
+            // ramps; within each 10 ms ramp it crossfades with the audio below.
+            for clip in track.clips.sorted(by: { $0.order < $1.order }) where !clip.muted {
                 let audio = try load(clip.source)
-                let first = max(0, Int((clip.start - region.lowerBound) * sampleRate))
-                let last = min(length, Int((clip.end - region.lowerBound) * sampleRate))
+                let clipFirst = Int((clip.start - region.lowerBound) * sampleRate)
+                let clipLast = Int((clip.end - region.lowerBound) * sampleRate)
+                let first = max(0, clipFirst), last = min(length, clipLast)
                 guard last > first else { continue }
+                let fade = max(1, min(Int((0.010 * sampleRate).rounded()), (clipLast - clipFirst - 1) / 2))
                 for frame in first..<last {
                     let sourceFrame = Int((region.lowerBound - clip.start + clip.offset) * sampleRate) + frame
+                    let incoming = min(1, Double(frame - clipFirst) / Double(fade))
+                    let outgoing = min(1, Double(clipLast - 1 - frame) / Double(fade))
+                    let weight = min(incoming, outgoing)
+                    let sourceWeight = min(clip.fadeInBaked ? 1 : incoming, clip.fadeOutBaked ? 1 : outgoing)
                     for channel in 0..<channelCount {
                         var sample: Float = 0
                         if sourceFrame >= 0 && sourceFrame < audio.frameCount {
                             if channelCount == 1 { sample = audio.channels.reduce(Float(0)) { $0 + $1[sourceFrame] } / Float(audio.channels.count) }
                             else { sample = audio.channels[min(channel, audio.channels.count - 1)][sourceFrame] }
                         }
-                        lane.channels[channel][frame] = Float(Double(sample) * clip.gain)
+                        lane.channels[channel][frame] = Float(Double(lane.channels[channel][frame]) * (1 - weight) + Double(sample) * clip.gain * sourceWeight)
                     }
                 }
             }
