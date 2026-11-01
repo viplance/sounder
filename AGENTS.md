@@ -52,7 +52,7 @@
 
 ## Audio import
 
-- After selecting multiple files, show an English placement dialog with Separate tracks first and selected by default, followed by One track, and Import/Cancel. Single-track placement is sequential; separate-track placement starts at the captured active track, follows visible hierarchy order below it, and gives all fragments the same captured cursor time. Create missing root tracks with the corresponding imported fragment names (respecting track name limits). Keep existing tracks/fragments intact; commit successful files and any new tracks together as one Undo action. Single-file import does not show this dialog.
+- After selecting multiple files, show an English placement dialog with Separate tracks first and selected by default, followed by One track, and Import/Cancel. Single-track placement is sequential; separate-track placement starts at the captured active track, follows visible hierarchy order below it, and gives all fragments the same captured cursor time. Create missing root tracks with the corresponding imported fragment names (respecting track name limits). Keep existing tracks/fragments intact; commit successful files and any new tracks together as one Undo action. Single-file import does not show this dialog. Within this modal window, Tab/Shift-Tab and Up/Down cycle the radio selection immediately, regardless of system keyboard-navigation preferences; Enter and Escape retain Import/Cancel behavior. Scope the key handler to this dialog and remove it when closed.
 
 - Show a nonmodal import window immediately after file selection, with each file's own progress and outcome. Keep copy, decoding, resampling and waveform preparation on a worker queue.
 - Publish prepared PCM and waveform data into the main-thread audio cache under the final copied source path before inserting fragments. Timeline drawing must not decode imported files again.
@@ -64,9 +64,9 @@
 
 - Dragging on the ruler selects a time range without seeking or stopping playback. Defer ruler click seeking until mouse-up without a drag. Highlight the range on the ruler and fragment area; its ruler edges are draggable with the horizontal resize cursor, without moving the playhead.
 - Clicking the timeline ruler, a fragment, or empty timeline space places the playhead at that time and discards any previous paused/playing stream. If playback is active, immediately continue playing from the selected time; if stopped, only reposition the cursor. Play starts from the selected playhead, independent of scrolling or the previous playback position.
-- Stopping (including the Play/Pause button) captures the current render position, clears the stream and freezes the cursor. The next Play always builds a new stream from that one cursor position. Never retain a separate paused position or resume old queued audio. While playing, the cursor follows the render clock monotonically; missing timestamps must not reset it. Do not silently reset a selected position beyond the project end to zero.
+- Pause via Play/Pause or Space captures the current render position, clears the stream and freezes the cursor. The explicit Stop icon/menu/Escape stops and returns to the last playback start notch (zero before the first start), bringing it into view; when recording, return to the recording start. Keep gesture cancellation ahead of Stop. The next Play always builds a new stream from that one cursor position. Never retain a separate paused position or resume old queued audio. While playing, the cursor follows the render clock monotonically; missing timestamps must not reset it. Do not silently reset a selected position beyond the project end to zero.
 
-- Natural playback completion (including effect tails) stops audio and returns the cursor to the last-start notch. Manual Stop/Pause and playback errors retain their current position; stale completion callbacks must not move the cursor.
+- Natural playback completion (including effect tails) stops audio and returns the cursor to the last-start notch. Pause and playback errors retain their current position; stale completion callbacks must not move the cursor.
 
 - Enter (Return or keypad Enter) always starts playback from the last successful user playback start, whether stopped or playing. Show that position as an orange vertical notch on the ruler. Play/Space and live timeline seeks update the marker; Stop, stopped seeking, range selection, and internal effect-chain restarts do not. Before the first start, Enter starts at zero; opening a project clears the marker.
 
@@ -94,11 +94,15 @@
 
 ## Export
 
+- Show an initially unchecked Selected range checkbox at the bottom of Export audio only for a nonempty timeline selection. When checked, export exactly that captured interval for WAV/MP3/OGG, preserving pre-range effect history and padding selected empty timeline space with silence. Crop at the project rate before final resampling. Keep the range choice transient; normal format settings retain their existing persistence.
+
 - Give the Export button comfortable horizontal padding. Disable both the titlebar button and File menu export action when the project has no audio fragments or editing is busy.
 - Label the titlebar button and File menu action Export. Open export options before choosing a destination; offer MP3 (default), WAV and OGG. First use inherits project rate and depth; remember export choices only after a file is successfully written, and save those last successful choices inside the project, independently from project audio settings. Cancel must not export a file.
 - PCM bit depth is editable for WAV only. MP3 offers supported rates up to 48 kHz and bitrate selection; explain codec constraints in the dialog. Use built-in encoders, preserve channels, process effects at the project rate and resample the finished mix only once using Mastering quality. Failed exports must not damage an existing destination.
 
 ## Tempo and metronome
+
+- Tempo settings include a Tap button beside the BPM field. Compute BPM from monotonic tap intervals using a rolling recent window, update the field on every tap after the first, reset after a long pause and ignore accidental double taps. Keep values within 20–300 BPM and retain Save/Cancel semantics.
 
 - Place Tempo, Metronome and the timer/BPM display in the pinned top-left timeline corner in place of the TRACKS caption. Use one vertically centered row: timer/BPM, metronome icon, flexible space, then Tempo pinned to the right edge beside the timeline. Use matching 18 pt light monospaced timer/BPM fonts and pin the controls on both scroll axes. The metronome uses an outline icon when off and a filled accent-colored icon when on.
 
@@ -141,3 +145,7 @@
 ## Fragment clipboard and duplication
 
 - Command-A selects all fragments. Command-C writes an immutable group snapshot to the system pasteboard; Command-V creates fresh fragment IDs at the cursor, anchoring the earliest selected fragment there and preserving time spacing, relative visible track rows, source offsets, durations and overlap ordering. Use the active track as the first destination row and create missing root tracks as needed. Keep native text Select All/Copy/Paste in inline editors and other text fields. Paste is a single Undo action. Command held when a fragment drag begins creates live preview copies and leaves originals untouched; retain group spacing and snapping, select the copies after drop and undo duplication in one step.
+
+## Keyboard layout independence
+
+- Split uses the unmodified physical S key (including Russian ы), shown as S in the menu and toolbar tooltip. Resolve app-owned letter shortcuts by physical key codes in the main editor window while respecting their exact modifier masks, validation, dialogs and plugin windows. Keep normal typing and native text shortcuts in text editors; Command-S remains Save. Arrow and transport key codes remain layout-independent.

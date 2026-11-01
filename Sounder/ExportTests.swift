@@ -21,6 +21,35 @@ func runExportTests() throws {
         let file = try AVAudioFile(forReading: path)
         try check(file.fileFormat.sampleRate == 96_000 && file.fileFormat.channelCount == 2 && file.fileFormat.settings[AVLinearPCMBitDepthKey] as? Int == depth && abs(file.length - 96_000) < 2, "WAV export writes the selected \(depth)-bit format and 96 kHz with the correct stereo duration")
     }
+    var rangeSettings = ExportSettings(projectFormat: project.audioFormat)
+    rangeSettings.format = .wav; rangeSettings.bitDepth = 32
+    let selectedWAV = directory.appendingPathComponent("selected.wav")
+    store.processEffects = { samples, _ in Array(repeating: Float(0), count: 4) + Array(samples.dropLast(4)) }
+    let fullWithEffects = try store.renderAudio(project)
+    try AudioExporter.write(project: project, store: store, settings: rangeSettings, to: selectedWAV, range: 0.2..<0.45)
+    let selectedAudio = try AudioStore.decode(selectedWAV, sampleRate: 48_000)
+    try check(selectedAudio.frameCount == 12_000 && selectedAudio.channels == fullWithEffects.channels.map { Array($0[9600..<21600]) }, "Selected-range WAV contains exactly the requested stereo frames with pre-range effect history")
+    store.processEffects = nil
+    try AudioExporter.write(project: project, store: store, settings: rangeSettings, to: selectedWAV, range: 0.8..<1.2)
+    let padded = try AudioStore.decode(selectedWAV, sampleRate: 48_000)
+    try check(padded.frameCount == 19_200 && padded.channels.allSatisfy { $0.suffix(9600).allSatisfy { $0 == 0 } }, "Selected empty timeline space is padded to the exact export range length")
+    rangeSettings.sampleRate = 96_000
+    try AudioExporter.write(project: project, store: store, settings: rangeSettings, to: selectedWAV, range: 0.2..<0.45)
+    try check(abs((try AVAudioFile(forReading: selectedWAV)).length - 24_000) < 2, "Selected-range duration survives high-quality export resampling")
+    rangeSettings.sampleRate = 44_100
+    for format in [ExportFormat.mp3, .ogg] {
+        rangeSettings.format = format
+        let path = directory.appendingPathComponent("selected." + format.rawValue)
+        try AudioExporter.write(project: project, store: store, settings: rangeSettings, to: path, range: 0.2..<0.7)
+        if format == .mp3 {
+            let result = try AudioStore.decode(path, sampleRate: 44_100)
+            try check(abs(result.frameCount - 22_050) < 2304, "Selected-range MP3 exports only the chosen half-second within codec padding")
+        } else {
+            let result = try AudioExporter.runEncoder(["--inspect-ogg", path.path])
+            let info = try JSONSerialization.jsonObject(with: result) as! [String: Any]
+            try check(abs((info["frames"] as! Int) - 22_050) < 2, "Selected-range OGG exports the chosen half-second")
+        }
+    }
     settings.format = .mp3; settings.sampleRate = 44_100
     let mp3 = directory.appendingPathComponent("out.mp3")
     try AudioExporter.write(project: project, store: store, settings: settings, to: mp3)
@@ -69,8 +98,19 @@ func runExportTests() throws {
 
 extension AppDelegate {
     func verifyExportUI() throws {
+        let ranged = ExportOptionsController(settings: editor.project.defaultExportSettings, range: 1...3)
+        guard !ranged.selectedRangeCheckbox.isHidden, ranged.selectedRange == nil else { throw SounderError.message("Selected range must be visible and initially unchecked for a timeline range") }
+        ranged.selectedRangeCheckbox.performClick(nil)
+        guard ranged.selectedRange == 1..<3 else { throw SounderError.message("Selected range checkbox did not enable interval export") }
+        ranged.rates.selectItem(at: 3); ranged.changed()
+        guard !ranged.note.isHidden, ranged.selectedRangeCheckbox.frame.maxY <= ranged.note.frame.minY, ranged.selectedRange == 1..<3 else { throw SounderError.message("Export validation overlaps or resets the range checkbox") }
+        ranged.formats.selectItem(at: 1); ranged.changed()
+        guard ranged.note.isHidden, ranged.selectedRangeCheckbox.frame.maxY < ranged.bitrates.frame.minY else { throw SounderError.message("Selected range must remain the last export form row") }
+        let empty = ExportOptionsController(settings: editor.project.defaultExportSettings, range: 2...2)
+        guard empty.selectedRangeCheckbox.isHidden else { throw SounderError.message("An empty time range must not show the checkbox") }
         let options = ExportOptionsController(settings: editor.project.defaultExportSettings)
         guard options.settings.sampleRate == editor.project.audioFormat.sampleRate && options.settings.bitDepth == editor.project.audioFormat.bitDepth && options.settings.format == .mp3 else { throw SounderError.message("Export dialog defaults do not match the project") }
+        guard options.selectedRangeCheckbox.isHidden && options.selectedRange == nil else { throw SounderError.message("No selected timeline range must hide the export checkbox") }
         guard !options.depths.isEnabled && options.bitrates.isEnabled else { throw SounderError.message("Compressed export presents misleading PCM bit depth") }
         options.formats.selectItem(at: 1); options.changed()
         guard options.depths.isEnabled && !options.bitrates.isEnabled else { throw SounderError.message("WAV depth is not editable") }
@@ -86,6 +126,6 @@ extension AppDelegate {
         }
         RunLoop.main.add(timer, forMode: .modalPanel)
         guard options.runModal() == nil else { throw SounderError.message("Export Cancel was ignored") }
-        print("PASS: export options show project defaults, format-specific controls, and Cancel without altering settings")
+        print("PASS: export range checkbox is conditional, initially off, survives format validation and stays at the form bottom; defaults and Cancel work")
     }
 }

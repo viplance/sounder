@@ -18,12 +18,27 @@ final class ImportPlacementDialog: NSObject {
         }
         separate.state = .on
         alert.accessoryView = form; alert.addButton(withTitle: "Import"); alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = separate
     }
     @objc private func selectPlacement(_ sender: NSButton) {
         single.state = sender === single ? .on : .off
         separate.state = sender === separate ? .on : .off
     }
-    func runModal() -> AudioImportPlacement? { alert.runModal() == .alertFirstButtonReturn ? placement : nil }
+    @discardableResult func handleSelectionKey(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.window === alert.window, NSApp.modalWindow === alert.window,
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+              [UInt16(48), 125, 126].contains(event.keyCode) else { return false }
+        let next = placement == .separateTracks ? single : separate
+        selectPlacement(next); alert.window.makeFirstResponder(next)
+        return true
+    }
+    func runModal() -> AudioImportPlacement? {
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleSelectionKey(event) == true ? nil : event
+        }
+        defer { if let monitor { NSEvent.removeMonitor(monitor) } }
+        return alert.runModal() == .alertFirstButtonReturn ? placement : nil
+    }
 }
 
 struct ImportedAudio {

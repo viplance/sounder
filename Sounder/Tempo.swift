@@ -1,4 +1,53 @@
+import AppKit
 import AVFoundation
+
+struct TapTempo {
+    private var taps: [Double] = []
+    mutating func tap(at time: Double) -> Double? {
+        guard time.isFinite else { return nil }
+        if let last = taps.last {
+            guard time > last, time - last >= 0.1 else { return nil }
+            if time - last > 3.5 { taps = [] }
+        }
+        taps.append(time)
+        if taps.count > 9 { taps.removeFirst(taps.count - 9) }
+        guard taps.count >= 2, let first = taps.first else { return nil }
+        return min(300, max(20, 60 * Double(taps.count - 1) / (time - first)))
+    }
+}
+
+final class TempoDialog: NSObject {
+    let alert = CompactSettingsAlert()
+    let field: NSTextField
+    let tapButton = PointerButton(title: "Tap", target: nil, action: nil)
+    private var estimator = TapTempo()
+    private let now: () -> Double
+    init(bpm: Double, now: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
+        self.now = now; field = NSTextField(string: String(format: "%g", bpm))
+        super.init()
+        alert.messageText = "Tempo"
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
+        field.frame = NSRect(x: 0, y: 1, width: 140, height: 26); field.setAccessibilityLabel("BPM"); form.addSubview(field)
+        tapButton.bezelStyle = .rounded; tapButton.target = self; tapButton.action = #selector(tap)
+        tapButton.frame = NSRect(x: 152, y: 0, width: 68, height: 28); form.addSubview(tapButton)
+        alert.accessoryView = form; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+    }
+    @objc private func tap() {
+        guard let bpm = estimator.tap(at: now()) else { return }
+        let text = String(format: "%g", (bpm * 10).rounded() / 10)
+        field.stringValue = text
+        if let input = field.currentEditor() as? NSTextView { input.string = text; input.setSelectedRange(NSRange(location: (text as NSString).length, length: 0)) }
+    }
+    func runModal() -> Double? {
+        while alert.runModal() == .alertFirstButtonReturn {
+            let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+            if let value = Double(text), value.isFinite, (20...300).contains(value) { return value }
+            alert.informativeText = "Enter a tempo between 20 and 300 BPM."
+        }
+        return nil
+    }
+}
 
 /// A click derived from absolute timeline frames, independent of timer jitter.
 enum MetronomeClick {

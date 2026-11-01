@@ -408,3 +408,35 @@ extension AppDelegate {
         editor.stop(); editor.seek(to: 5.8); editor.dirty = false; refresh()
     }
 }
+
+extension AppDelegate {
+    func verifyStopReturnUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        func buttons(_ view: NSView) -> [NSButton] {
+            (view as? NSButton).map { [$0] } ?? view.subviews.flatMap { buttons($0) }
+        }
+        guard let stopButton = buttons(window.contentView!).first(where: { $0.action == #selector(stop) }) else { throw SounderError.message("No Stop icon") }
+        let history = editor.undoStack.count
+        editor.seek(to: 4); stopButton.performClick(nil)
+        try check(editor.cursor == 0 && editor.player == nil, "Stop returns to zero before the first playback start")
+        editor.seek(to: 1.25); editor.playPause()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.12))
+        editor.playPause(); let paused = editor.cursor
+        try check(paused > 1.25 && editor.player == nil, "Play/Pause still pauses at the actual audio position")
+        stopButton.performClick(nil)
+        try check(editor.cursor == 1.25 && editor.lastPlaybackStart == 1.25, "Stop icon returns a paused cursor to its last playback start")
+        editor.playPause()
+        try check(editor.player?.start == 1.25 && editor.isPlaying, "Play after Stop starts from the returned cursor")
+        editor.seek(to: 2.5)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+        stopButton.performClick(nil)
+        try check(editor.cursor == 2.5 && editor.player == nil && !editor.isPlaying && editor.lastPlaybackStart == 2.5, "Stop ends active playback and returns to the latest successful live-seek start")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.12))
+        try check(editor.cursor == 2.5, "Stopped callbacks do not move the returned cursor")
+        editor.seek(to: 5); stopButton.performClick(nil)
+        try check(editor.cursor == 2.5 && editor.undoStack.count == history, "Stop also returns a manually repositioned cursor without changing project history")
+        editor.seek(to: 5.8); editor.dirty = false; refresh()
+    }
+}

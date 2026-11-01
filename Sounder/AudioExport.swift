@@ -25,16 +25,20 @@ final class ExportOptionsController: NSObject {
     let alert = CompactSettingsAlert()
     let formats = NSPopUpButton(), rates = NSPopUpButton(), depths = NSPopUpButton(), bitrates = NSPopUpButton()
     let note = NSTextField(wrappingLabelWithString: "")
+    let selectedRangeCheckbox = PointerButton(title: "Selected range", target: nil, action: nil)
+    private let availableRange: ClosedRange<Double>?
     private var showsRateError = false
-    init(settings: ExportSettings) {
+    init(settings: ExportSettings, range: ClosedRange<Double>? = nil) {
+        availableRange = range.flatMap { $0.lowerBound.isFinite && $0.upperBound.isFinite && $0.lowerBound >= 0 && $0.upperBound > $0.lowerBound ? $0 : nil }
         super.init()
         alert.messageText = "Export audio"
         alert.icon = NSImage(size: .zero)
         alert.addButton(withTitle: "Export…"); alert.addButton(withTitle: "Cancel")
-        let form = NSView(frame: NSRect(x: 0, y: 0, width: 390, height: 154))
+        let rangeHeight: CGFloat = availableRange == nil ? 0 : 32
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 390, height: 154 + rangeHeight))
         let rows: [(String, NSPopUpButton)] = [("Format", formats), ("Sample rate", rates), ("Bit depth", depths), ("MP3 bitrate", bitrates)]
         for (index, row) in rows.enumerated() {
-            let y = CGFloat(120 - index * 36)
+            let y = CGFloat(120 - index * 36) + rangeHeight
             let label = NSTextField(labelWithString: row.0); label.frame = NSRect(x: 0, y: y + 3, width: 115, height: 22); form.addSubview(label)
             row.1.frame = NSRect(x: 124, y: y, width: 260, height: 28)
             row.1.setAccessibilityLabel(row.0); row.1.target = self; row.1.action = #selector(changed)
@@ -45,8 +49,15 @@ final class ExportOptionsController: NSObject {
         rates.selectItem(at: ProjectAudioFormat.supportedRates.firstIndex(of: settings.sampleRate) ?? 1)
         depths.addItems(withTitles: ["16 bit", "24 bit", "32 bit (Float)"]); depths.selectItem(at: [16,24,32].firstIndex(of: settings.bitDepth) ?? 1)
         bitrates.addItems(withTitles: ["128 kbps", "192 kbps", "256 kbps", "320 kbps"]); bitrates.selectItem(at: [128,192,256,320].firstIndex(of: settings.mp3Bitrate) ?? 3)
-        note.frame = NSRect(x: 0, y: 0, width: 390, height: 54); note.font = .systemFont(ofSize: 11); note.textColor = .secondaryLabelColor; form.addSubview(note)
+        note.frame = NSRect(x: 0, y: rangeHeight, width: 390, height: 54); note.font = .systemFont(ofSize: 11); note.textColor = .secondaryLabelColor; form.addSubview(note)
+        selectedRangeCheckbox.setButtonType(.switch); selectedRangeCheckbox.state = .off
+        selectedRangeCheckbox.frame = NSRect(x: 0, y: 0, width: 390, height: 24)
+        selectedRangeCheckbox.isHidden = availableRange == nil; form.addSubview(selectedRangeCheckbox)
         alert.accessoryView = form; changed()
+    }
+    var selectedRange: Range<Double>? {
+        guard selectedRangeCheckbox.state == .on, let availableRange else { return nil }
+        return availableRange.lowerBound..<availableRange.upperBound
     }
     var settings: ExportSettings {
         var value = ExportSettings(projectFormat: ProjectAudioFormat(sampleRate: ProjectAudioFormat.supportedRates[rates.indexOfSelectedItem], bitDepth: [16,24,32][depths.indexOfSelectedItem]))
@@ -61,7 +72,7 @@ final class ExportOptionsController: NSObject {
         note.isHidden = !invalidMP3Rate
         if invalidMP3Rate != showsRateError, let form = alert.accessoryView {
             let shift: CGFloat = invalidMP3Rate ? 54 : -54
-            for view in form.subviews where view !== note { view.frame.origin.y += shift }
+            for view in form.subviews where view !== note && view !== selectedRangeCheckbox { view.frame.origin.y += shift }
             form.frame.size.height += shift
             showsRateError = invalidMP3Rate
             alert.layout()
@@ -82,14 +93,29 @@ enum AudioExporter {
         guard process.terminationStatus == 0 else { throw SounderError.message(String(data: failure, encoding: .utf8) ?? "Audio export failed") }
         return result
     }
-    static func write(project: Project, store: AudioStore, settings: ExportSettings, to destination: URL) throws {
+    static func write(project: Project, store: AudioStore, settings: ExportSettings, to destination: URL, range: Range<Double>? = nil) throws {
         try settings.validate()
+        if let range {
+            guard range.lowerBound.isFinite, range.upperBound.isFinite, range.lowerBound >= 0, range.upperBound > range.lowerBound else { throw SounderError.message("Select a nonempty time range to export") }
+        }
         let fm = FileManager.default
         let work = fm.temporaryDirectory.appendingPathComponent("SounderExport-" + UUID().uuidString)
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
         // Mix and process effects at the project rate, then resample the final mix once.
         var signal = try store.renderAudio(project)
+        if let range {
+            // Crop after effects so delay/reverb history before the selected start
+            // remains correct. Pad empty timeline space to the exact range length.
+            let first = Int((range.lowerBound * project.audioFormat.sampleRate).rounded())
+            let last = Int((range.upperBound * project.audioFormat.sampleRate).rounded())
+            signal = AudioSignal(channels: signal.channels.map { channel in
+                let start = min(first, channel.count), end = min(last, channel.count)
+                var selected = Array(channel[start..<end])
+                selected.append(contentsOf: repeatElement(0, count: max(0, last - first - selected.count)))
+                return selected
+            })
+        }
         if settings.sampleRate != project.audioFormat.sampleRate {
             let source = work.appendingPathComponent("mix.wav")
             try store.write(signal, to: source)

@@ -865,7 +865,8 @@ final class Timeline: NSView {
         centerOnPlayhead()
     }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 123 { if event.modifierFlags.contains(.command) { seekBoundary(end: false) } else { movePlayhead(direction: -1) } }
+        if event.keyCode == 1 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { editor.split() }
+        else if event.keyCode == 123 { if event.modifierFlags.contains(.command) { seekBoundary(end: false) } else { movePlayhead(direction: -1) } }
         else if event.keyCode == 124 { if event.modifierFlags.contains(.command) { seekBoundary(end: true) } else { movePlayhead(direction: 1) } }
         else if event.keyCode == 126 { NSApp.sendAction(#selector(AppDelegate.zoomIn), to: NSApp.delegate, from: self) }
         else if event.keyCode == 125 { NSApp.sendAction(#selector(AppDelegate.zoomOut), to: NSApp.delegate, from: self) }

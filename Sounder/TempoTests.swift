@@ -5,6 +5,15 @@ func runTempoTests() throws {
     func check(_ condition: Bool, _ message: String) throws {
         guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
     }
+    var tap = TapTempo()
+    try check(tap.tap(at: 0) == nil && tap.tap(at: 0.5) == 120 && tap.tap(at: 1) == 120, "Tap tempo derives BPM from successive monotonic click intervals")
+    try check(tap.tap(at: 1.03) == nil && tap.tap(at: 1.5) == 120, "Tap tempo ignores accidental double clicks without disturbing the beat")
+    try check(tap.tap(at: 10) == nil && tap.tap(at: 10.75) == 80, "A long pause resets tapping so a new tempo is measured immediately")
+    for index in 2...12 { _ = tap.tap(at: 10 + Double(index) * 0.5) }
+    try check(tap.tap(at: 16.5) == 120, "A rolling tap window adapts to a new tempo instead of averaging the whole session")
+    var fast = TapTempo(); _ = fast.tap(at: 0)
+    var slow = TapTempo(); _ = slow.tap(at: 0)
+    try check(fast.tap(at: 0.15) == 300 && slow.tap(at: 3) == 20, "Tap tempo respects the project's 20–300 BPM limits")
     let fm = FileManager.default
     let directory = fm.temporaryDirectory.appendingPathComponent("SounderTempo-" + UUID().uuidString)
     defer { try? fm.removeItem(at: directory) }
@@ -119,5 +128,35 @@ extension AppDelegate {
         editor.dirty = false
         RunLoop.current.run(until: Date().addingTimeInterval(5.1))
         print("PASS: Tempo switches to editable BPM and a 4/4 ruler, Metronome toggles, and controls fit a 1000-point window")
+    }
+}
+
+extension AppDelegate {
+    func verifyTapTempoUI() throws {
+        var clock = 0.0
+        let dialog = TempoDialog(bpm: 93, now: { clock })
+        var failure: String?
+        let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
+            dialog.tapButton.performClick(nil)
+            if dialog.field.stringValue != "93" { failure = "First tap should leave BPM unchanged" }
+            clock = 0.5; dialog.tapButton.performClick(nil)
+            if dialog.field.stringValue != "120" { failure = "Second tap should immediately show 120 BPM" }
+            clock = 1.25; dialog.tapButton.performClick(nil)
+            if dialog.field.stringValue != "96" { failure = "Every following tap should update the BPM field" }
+            dialog.alert.buttons[0].performClick(nil)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        let result = dialog.runModal()
+        if let failure { throw SounderError.message(failure) }
+        guard result == 96 else { throw SounderError.message("Save did not return the tapped BPM") }
+        let cancelled = TempoDialog(bpm: editor.project.tempo, now: { clock })
+        let original = editor.project.tempo
+        let cancel = Timer(timeInterval: 0.1, repeats: false) { _ in
+            cancelled.tapButton.performClick(nil); clock += 0.5; cancelled.tapButton.performClick(nil)
+            cancelled.alert.buttons[1].performClick(nil)
+        }
+        RunLoop.main.add(cancel, forMode: .common)
+        guard cancelled.runModal() == nil, editor.project.tempo == original else { throw SounderError.message("Cancel changed the project tempo") }
+        print("PASS: Tap updates the BPM field in real time, Save accepts it, and Cancel retains the project tempo")
     }
 }

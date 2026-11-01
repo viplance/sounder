@@ -116,14 +116,23 @@ extension AppDelegate {
         for choice in [0, 1, 2] {
             let dialog = ImportPlacementDialog()
             guard dialog.single.title == "One track", dialog.separate.title == "Separate tracks", dialog.placement == .separateTracks, dialog.separate.frame.minY > dialog.single.frame.minY else { throw SounderError.message("Separate tracks must be first and selected by default") }
+            var keyFailure: String?
             let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
-                if choice == 1 { dialog.single.performClick(nil) }
+                if choice == 1 {
+                    for (code, flags, expected) in [(UInt16(125), NSEvent.ModifierFlags(), AudioImportPlacement.singleTrack), (126, [], .separateTracks), (48, [], .singleTrack), (48, [.shift], .separateTracks), (126, [], .singleTrack), (125, [], .separateTracks), (48, [], .singleTrack)] {
+                        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: dialog.alert.window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+                        if !dialog.handleSelectionKey(event) || dialog.placement != expected { keyFailure = "Tab/Shift-Tab/Up/Down failed to switch the import radio choice" }
+                    }
+                    let otherWindow = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: self.window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 48)!
+                    if dialog.handleSelectionKey(otherWindow) { keyFailure = "Import radio navigation intercepted another window" }
+                }
                 dialog.alert.buttons[choice == 2 ? 1 : 0].performClick(nil)
             }
             RunLoop.main.add(timer, forMode: .common)
             let result = dialog.runModal()
+            if let keyFailure { throw SounderError.message(keyFailure) }
             guard choice == 0 ? result == .separateTracks : choice == 1 ? result == .singleTrack : result == nil else { throw SounderError.message("Import placement choice or cancellation failed") }
         }
-        print("PASS: import placement dialog defaults to Separate tracks first, confirms either choice, and cancels without importing")
+        print("PASS: import radio choices cycle with Tab, Shift-Tab, Up and Down; default, confirmation and cancellation work")
     }
 }

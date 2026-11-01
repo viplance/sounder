@@ -149,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("quality"), .flexibleSpace, NSToolbarItem.Identifier("open"), NSToolbarItem.Identifier("save"), NSToolbarItem.Identifier("export")]
     var closingConfirmed = false
     var dialogAutomation: ((NSAlert) -> Void)?
+    private var shortcutMonitor: Any?
     func applicationDidFinishLaunching(_ notification: Notification) {
         for app in NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "enotix.Sounder") where app.processIdentifier != ProcessInfo.processInfo.processIdentifier { app.terminate() }
         do { editor = Editor(store: try AudioStore()) }
@@ -164,8 +165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let toolbar = NSStackView(); toolbar.orientation = .horizontal; toolbar.spacing = 14; toolbar.edgeInsets = NSEdgeInsets(top: toolbarTopInset, left: 22, bottom: 12, right: 22)
         playButton = button("Play / pause · Space", "play.fill", #selector(play))
         recordButton = button("Record · R", "record.circle", #selector(record)); recordButton.contentTintColor = .systemRed
-        toolbar.addArrangedSubview(section("PLAYER", [button("Return to start", "backward.end.fill", #selector(rewind)), playButton, button("Stop · Escape", "stop.fill", #selector(stop)), recordButton]))
-        let split = button("Split at playhead · ⌘B", "scissors", #selector(split)); let trim = button("Trim to ruler selection", "crop", #selector(trim)); let delete = button("Delete fragments · Delete", "trash", #selector(deleteClips))
+        toolbar.addArrangedSubview(section("PLAYER", [button("Return to start", "backward.end.fill", #selector(rewind)), playButton, button("Stop and return to playback start · Escape", "stop.fill", #selector(stop)), recordButton]))
+        let split = button("Split at playhead · S", "scissors", #selector(split)); let trim = button("Trim to ruler selection", "crop", #selector(trim)); let delete = button("Delete fragments · Delete", "trash", #selector(deleteClips))
         let join = button("Join selected fragments · ⌘J", "link", #selector(join))
         let importButton = button("Import audio · ⌘I", "square.and.arrow.down.on.square", #selector(importAudio))
         toolbar.addArrangedSubview(section("FRAGMENTS", [split, trim, delete, join, importButton]))
@@ -203,7 +204,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         timeline = Timeline(editor); scroll.documentView = timeline; timeline.installHeaderControls(timelineControls); add(scroll, to: stack)
         notificationOverlay = ToastOverlay.install(in: content, center: editor.notifications)
         editor.changed = { [weak self] in self?.refresh() }
-        buildMenu(); window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refresh()
+        buildMenu()
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handlePhysicalShortcut(event) == true ? nil : event
+        }
+        window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refresh()
         if let index = CommandLine.arguments.firstIndex(of: "--import-ui-test"), index + 1 < CommandLine.arguments.count { importUITest(URL(fileURLWithPath: CommandLine.arguments[index + 1])); return }
         if CommandLine.arguments.contains("--ui-test") { uiTest() }
     }
@@ -275,6 +280,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             refresh()
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
+            if CommandLine.arguments.contains("--stop-return-ui-test") { try verifyStopReturnUI() }
+            if CommandLine.arguments.contains("--physical-shortcuts-ui-test") { try verifyPhysicalShortcutsUI() }
+            if CommandLine.arguments.contains("--tap-tempo-ui-test") { try verifyTapTempoUI() }
             if CommandLine.arguments.contains("--tempo-ui-test") { try verifyTempoUI() }
             if CommandLine.arguments.contains("--export-ui-test") { try verifyExportUI() }
             if CommandLine.arguments.contains("--restart-ui-test") { try verifyRestartUI() }
@@ -558,15 +566,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func toggleTempo() { editor.toggleTempoMode() }
     @objc func toggleMetronome() { editor.toggleMetronome() }
     @objc func editTempo() {
-        let alert = CompactSettingsAlert(); alert.messageText = "Tempo"
-        let field = NSTextField(string: String(format: "%g", editor.project.tempo))
-        field.frame = NSRect(x: 0, y: 0, width: 220, height: 26); field.setAccessibilityLabel("BPM")
-        alert.accessoryView = field; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field
-        while alert.runModal() == .alertFirstButtonReturn {
-            let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
-            if let value = Double(text), value.isFinite, (20...300).contains(value) { editor.setTempo(value); return }
-            alert.informativeText = "Enter a tempo between 20 and 300 BPM."
-        }
+        if let bpm = TempoDialog(bpm: editor.project.tempo).runModal() { editor.setTempo(bpm) }
     }
     @objc func audioSettings() {
         guard !editor.busy else { return }
@@ -656,12 +656,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         menu("Sounder", [("About Sounder", #selector(about), ""), ("Quit Sounder", #selector(quit), "q")])
         menu("File", [("Rename Project…", #selector(renameProject), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Import Audio…", #selector(importAudio), "i"), ("Export…", #selector(exportAudio), "e")])
-        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"), ("Split at Playhead", #selector(split), "b"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
+        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"), ("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
+        if let edit = main.items.last?.submenu { edit.items.first(where: { $0.action == #selector(split) })?.keyEquivalentModifierMask = [] }
         menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
         menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
         if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
         menu("View", [("Zoom In", #selector(zoomIn), "\u{f700}"), ("Zoom Out", #selector(zoomOut), "\u{f701}")])
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
+    }
+    @discardableResult func handlePhysicalShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, NSApp.modalWindow == nil,
+              event.window === window, !(window.firstResponder is NSTextView) else { return false }
+        let flags = event.modifierFlags.intersection([.command, .shift, .control, .option])
+        let letters: [UInt16: String] = [0: "a", 1: "s", 3: "f", 6: "z", 8: "c", 9: "v", 12: "q", 14: "e", 15: "r", 17: "t", 31: "o", 34: "i", 38: "j"]
+        guard let letter = letters[event.keyCode] else { return false }
+        for root in NSApp.mainMenu?.items ?? [] {
+            for item in root.submenu?.items ?? [] where item.keyEquivalent.lowercased() == letter {
+                var modifiers = item.keyEquivalentModifierMask.intersection([.command, .shift, .control, .option])
+                if item.keyEquivalent != item.keyEquivalent.lowercased() { modifiers.insert(.shift) }
+                guard flags == modifiers, let action = item.action, validateMenuItem(item) else { continue }
+                return NSApp.sendAction(action, to: item.target, from: item)
+            }
+        }
+        return false
     }
     @objc func openProject() { editor.open() }
     private func finishNameEditing() { projectNameField.finish(commit: true); timeline.nameField.finish(commit: true) }
@@ -676,6 +693,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if menuItem.action == #selector(selectAll(_:)) { return timeline.canSelectRange }
             if menuItem.action == #selector(copy(_:)) { return !editor.selection.isEmpty }
             return !editor.busy && NSPasteboard.general.data(forType: Editor.fragmentPasteboardType) != nil
+        }
+        if menuItem.action == #selector(split) {
+            return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView) && !editor.busy
         }
         if menuItem.action == #selector(exportAudio) { return editor.canExport }
         if [#selector(zoomIn), #selector(zoomOut)].contains(menuItem.action) {
@@ -706,7 +726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func seekForward() { timeline.movePlayhead(direction: 1) }
     @objc func restartPlayback() { editor.restartFromLastStart() }
     @objc func play() { editor.playPause() }
-    @objc func stop() { if timeline.cancelFragmentResize() || timeline.cancelMarqueeSelection() { return }; if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stop() } }
+    @objc func stop() { if timeline.cancelFragmentResize() || timeline.cancelMarqueeSelection() { return }; if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stopAndReturnToStart(); timeline.centerOnPlayhead() } }
     @objc func record() { editor.record() }
     @objc func rewind() { if editor.isRecording { editor.stop() }; editor.seek(to: 0) }
     @objc func split() { editor.split() }

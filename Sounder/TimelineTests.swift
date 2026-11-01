@@ -496,3 +496,35 @@ extension AppDelegate {
         editor.project = original; editor.selectedTrack = original.tracks[0].id; editor.selection = []; editor.dirty = false; refresh()
     }
 }
+
+extension AppDelegate {
+    func verifyPhysicalShortcutsUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
+        func event(_ text: String, code: UInt16, flags: NSEvent.ModifierFlags = []) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: text, charactersIgnoringModifiers: text, isARepeat: false, keyCode: code)!
+        }
+        let clip = original.tracks[0].clips[0]
+        let count = original.tracks[0].clips.count
+        editor.selection = [clip.id]; editor.cursor = clip.start + 0.5
+        try check(handlePhysicalShortcut(event("s", code: 1)) && editor.project.tracks[0].clips.count == count + 1, "Physical S splits a selected fragment without modifiers")
+        editor.undo(); editor.selection = [clip.id]
+        try check(handlePhysicalShortcut(event("ы", code: 1)) && editor.project.tracks[0].clips.count == count + 1, "Russian ы on the same physical key performs Split")
+        editor.undo()
+        try check(!handlePhysicalShortcut(event("ы", code: 1, flags: [.option])) && !handlePhysicalShortcut(event("ы", code: 1, flags: [.control])), "Split does not consume modified S combinations")
+        try check(handlePhysicalShortcut(event("ф", code: 0, flags: [.command])) && editor.selection == Set(editor.project.tracks.flatMap(\.clips).map(\.id)), "Command-A works on the Russian physical ф key")
+        let splitItem = NSApp.mainMenu!.items.flatMap { $0.submenu?.items ?? [] }.first { $0.action == #selector(split) }!
+        try check(splitItem.keyEquivalent == "s" && splitItem.keyEquivalentModifierMask.isEmpty, "The Edit menu shows S instead of Command-B for Split")
+        timeline.renameTrack(original.tracks[0].id)
+        guard let input = timeline.nameField.currentEditor() as? NSTextView else { throw SounderError.message("No inline field editor") }
+        let before = editor.project.tracks[0].clips.count
+        try check(!handlePhysicalShortcut(event("ы", code: 1)), "Physical letter shortcuts are inactive while editing a name")
+        input.insertText("ы", replacementRange: input.selectedRange())
+        try check(input.string.contains("ы") && editor.project.tracks[0].clips.count == before, "Russian ы remains ordinary text while editing")
+        timeline.nameField.finish(commit: false); window.makeFirstResponder(timeline)
+        editor.project = original; editor.selection = []; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+    }
+}

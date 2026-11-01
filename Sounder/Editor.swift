@@ -428,6 +428,10 @@ final class Editor: NSObject {
             startTimer(); update()
         } catch { player?.stop(); player = nil; self.error(error) }
     }
+    func stopAndReturnToStart() {
+        let start = isRecording ? recordingStart : (lastPlaybackStart ?? 0)
+        stop(); cursor = start; update()
+    }
     func stop() {
         stopPlayback()
         if let recorder {
@@ -548,17 +552,17 @@ final class Editor: NSObject {
     }
     func export() {
         guard canExport else { return }
-        let options = ExportOptionsController(settings: project.defaultExportSettings)
+        let options = ExportOptionsController(settings: project.defaultExportSettings, range: range)
         guard let settings = options.runModal() else { return }
         let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(filenameExtension: settings.format.rawValue) ?? .audio]
         panel.allowsOtherFileTypes = false
         panel.nameFieldStringValue = projectName.replacingOccurrences(of: "/", with: "-") + "." + settings.format.rawValue
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try export(to: url, settings: settings) } catch { self.error(error) }
+        do { try export(to: url, settings: settings, range: options.selectedRange) } catch { self.error(error) }
     }
-    func export(to url: URL, settings: ExportSettings) throws {
+    func export(to url: URL, settings: ExportSettings, range: Range<Double>? = nil) throws {
         flushPluginEdits()
-        try AudioExporter.write(project: project, store: audio, settings: settings, to: url)
+        try AudioExporter.write(project: project, store: audio, settings: settings, to: url, range: range)
         if settings != project.exportSettings || !project.exportSettingsConfirmed {
             checkpoint(); project.exportSettings = settings; project.exportSettingsConfirmed = true
         }
