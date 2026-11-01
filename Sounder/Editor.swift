@@ -18,6 +18,16 @@ final class Editor: NSObject {
     var dirty = false
     var projectURL: URL?
     var player: LivePlayback?
+    private(set) var shuttle: ShuttlePlayback?
+    private var shuttleGesture: (direction: Double, resume: Bool)?
+    private var shuttleReleasing = false
+    private var mixCache: (key: Data, graph: StreamingGraph)?
+    func invalidateMixCache() { mixCache = nil }
+    private func mixCacheKey() throws -> Data {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(project)
+    }
+    var isShuttling: Bool { shuttleGesture != nil }
     private(set) var trackMeters: [UUID: TrackLevelMeter] = [:]
     private let makeRecorder: (URL, ProjectAudioFormat) throws -> LiveRecorder
     private let makePlayback: (StreamingGraph, ProjectAudioFormat, Double) throws -> LivePlayback
@@ -40,8 +50,8 @@ final class Editor: NSObject {
     var isImporting: Bool { importer?.isRunning == true }
     var requestingMic = false
     var isRecording: Bool { recorder != nil }
-    var isPlaying: Bool { player?.isPlaying == true }
-    var busy: Bool { isRecording || isPlaying || requestingMic || isImporting || isNormalizing }
+    var isPlaying: Bool { player?.isPlaying == true || shuttle?.isPlaying == true }
+    var busy: Bool { isRecording || isPlaying || isShuttling || requestingMic || isImporting || isNormalizing }
     var canExport: Bool { !busy && duration > 0 }
     var duration: Double { project.tracks.flatMap(\.clips).map(\.end).max() ?? 0 }
     var projectName: String { project.name ?? projectURL?.deletingPathExtension().lastPathComponent ?? "MY PROJECT" }
@@ -61,10 +71,11 @@ final class Editor: NSObject {
     }
     func hint(_ key: UXHint, _ text: String) { notifications.hint(key, text) }
     func error(_ error: Error) { notifications.show(error.localizedDescription, style: .error); changed?() }
-    func checkpoint() { undoStack.append(project); if undoStack.count > 50 { undoStack.removeFirst() }; redoStack = []; dirty = true }
+    func checkpoint() { invalidateMixCache(); undoStack.append(project); if undoStack.count > 50 { undoStack.removeFirst() }; redoStack = []; dirty = true }
     func undo() { guard !busy else { return }; flushPluginEdits(); guard let previous = undoStack.popLast() else { return }; redoStack.append(project); project = previous; dirty = true; reconcile(); update("Undo") }
     func redo() { guard !busy else { return }; flushPluginEdits(); guard let next = redoStack.popLast() else { return }; undoStack.append(project); project = next; dirty = true; reconcile(); update("Redo") }
     func reconcile() {
+        invalidateMixCache()
         closePluginWindows(capture: false)
         pluginHosts = [:]
         for window in Array(effectsWindows.values) { window.done() }
@@ -409,7 +420,10 @@ final class Editor: NSObject {
         else if let player {
             cursor = player.currentTime
             updateTrackMeters(player.consumeTrackPeaks(at: cursor))
-        }
+            if shuttleReleasing, player.returnReady, abs(player.currentSpeed - 1) < 1e-8 {
+                player.completeReturn(); shuttleReleasing = false; shuttleGesture = nil
+            }
+        } else if let shuttle { cursor = shuttle.currentTime }
         changed?()
     }
     func startTimer() {
@@ -440,7 +454,7 @@ final class Editor: NSObject {
         recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled)
     }
     func toggleMute(_ trackID: UUID) {
-        guard !isRecording, !requestingMic, !isImporting,
+        guard !isRecording, !isShuttling, !requestingMic, !isImporting,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
         checkpoint()
         project.tracks[index].muted.toggle()
@@ -448,7 +462,7 @@ final class Editor: NSObject {
         update()
     }
     func toggleSolo(_ trackID: UUID) {
-        guard !isRecording, !requestingMic, !isImporting,
+        guard !isRecording, !isShuttling, !requestingMic, !isImporting,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
         checkpoint()
         project.tracks[index].solo.toggle()
@@ -456,6 +470,7 @@ final class Editor: NSObject {
         update()
     }
     func effectsChanged() {
+        invalidateMixCache()
         let playing = isPlaying
         if player != nil { stop() }
         let ids = Set(project.tracks.flatMap(\.effects).map(\.id))
@@ -474,12 +489,14 @@ final class Editor: NSObject {
     }
     func seek(to position: Double) {
         guard !isRecording, !requestingMic, !isImporting, position.isFinite else { return }
-        let continuePlaying = isPlaying
+        let continuePlaying = shuttleGesture?.resume ?? isPlaying
+        endShuttle(resume: false)
         stopPlayback()
         cursor = max(0, position)
         if continuePlaying { startPlayback() } else { update() }
     }
     func playPause() {
+        if isShuttling { endShuttle(resume: false); return }
         if isRecording {
             let start = recordingStart
             stop(); cursor = start; update(); return
@@ -492,36 +509,130 @@ final class Editor: NSObject {
         if isRecording { restartRecording(); return }
         guard !requestingMic, !isImporting else { return }
         let start = lastPlaybackStart ?? 0
+        endShuttle(resume: false)
         stopPlayback()
         cursor = start
         startPlayback()
+    }
+    private func playbackHosts() throws -> [UUID: SNPluginHost] {
+        var hosts: [UUID: SNPluginHost] = [:]
+        for effect in project.tracks.flatMap(\.effects) where !effect.bypassed { hosts[effect.id] = try pluginHost(effect) }
+        return hosts
+    }
+    private static func makeGraph(project: Project, store: AudioStore, hosts: [UUID: SNPluginHost], dryGraph: StreamingGraph? = nil, cancelled: () -> Bool = { false }) throws -> StreamingGraph {
+        try StreamingGraph(project: project, store: store, dryGraph: dryGraph) { effect in
+            guard !cancelled() else { throw CancellationError() }
+            guard let host = hosts[effect.id] else { throw SounderError.message("Effect processor is unavailable") }
+            try host.beginStreaming(project.audioFormat.channels)
+            guard host.latency <= Int(store.sampleRate * 30) else { throw SounderError.message("Plug-in latency exceeds the supported 30-second maximum") }
+            let channels = project.audioFormat.channels
+            return StreamingEffect(latency: host.latency, tail: host.tail) { samples in
+                let data = try host.processBlock(samples.withUnsafeBytes { Data($0) }, channels: channels)
+                return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            }
+        }
+    }
+    private func playbackGraph() throws -> StreamingGraph {
+        try Self.makeGraph(project: project, store: audio, hosts: playbackHosts())
+    }
+    func beginShuttle(direction: Double) {
+        guard !isRecording, !requestingMic, !isImporting, !isNormalizing, duration > 0 else { return }
+        let direction = direction < 0 ? -1.0 : 1.0
+        if shuttleGesture?.direction == direction && !shuttleReleasing { return }
+        shuttleReleasing = false
+        let resume = shuttleGesture?.resume ?? isPlaying
+        shuttleGesture = (direction, resume)
+        if let shuttle { shuttle.changeDirection(direction); update(); return }
+        do {
+            let store = try AudioStore(directory: audio.directory)
+            store.configure(project.audioFormat); store.cache = audio.cache
+            let cached = mixCache?.key == (try mixCacheKey()) ? mixCache?.graph : nil
+            let source = DryShuttleSource(project: project, store: store, processed: cached?.outputCache, latency: cached?.latency ?? 0, frameCount: max(cached?.totalFrames ?? 0, Int(cursor * project.audioFormat.sampleRate) + 1))
+            if let player {
+                // The same engine, node and queued output continue running.
+                // The next buffer changes speed from +1, without a new start.
+                player.beginShuttle(source: source, direction: direction)
+                cursor = player.currentTime
+            } else {
+                let playback = ShuttlePlayback(source: source, start: cursor, direction: direction)
+                shuttle = playback
+                playback.finished = { [weak self, weak playback] failure in
+                    guard let self, let playback, self.shuttle === playback else { return }
+                    self.cursor = failure == nil && !self.shuttleReleasing ? ((self.shuttleGesture?.direction ?? direction) < 0 ? 0 : playback.motion.end) : playback.currentTime
+                    self.shuttle = nil; playback.stop(); self.timer?.invalidate(); self.timer = nil
+                    if self.shuttleReleasing { self.shuttleReleasing = false; self.shuttleGesture = nil }
+                    if let failure { self.endShuttle(resume: false); self.error(failure) } else { self.update() }
+                }
+                playback.start()
+            }
+            startTimer(); update()
+        } catch { endShuttle(resume: false); self.error(error) }
+    }
+    func releaseShuttle() {
+        guard let gesture = shuttleGesture, !shuttleReleasing else { return }
+        shuttleReleasing = true
+        if let shuttle { shuttle.release(); update(); return }
+        guard let player else {
+            shuttleReleasing = false; shuttleGesture = nil
+            if gesture.resume { startPlayback(rememberStart: false) } else { update() }
+            return
+        }
+        guard gesture.resume else { endShuttle(resume: false); return }
+        do {
+            let snapshot = project, hosts = try playbackHosts(), key = try mixCacheKey()
+            let store = try AudioStore(directory: audio.directory)
+            store.configure(snapshot.audioFormat); store.cache = audio.cache
+            let previous = player.snapshotGraph
+            player.restored = { [weak self, weak player] graph in
+                guard let self, let player, self.player === player else { return }
+                if (try? self.mixCacheKey()) == key { self.mixCache = (key, graph) }
+                self.updateTransportPosition()
+            }
+            player.releaseShuttle { cancelled in
+                try Self.makeGraph(project: snapshot, store: store, hosts: hosts, dryGraph: previous, cancelled: cancelled)
+            }
+            update()
+        } catch { endShuttle(resume: false); self.error(error) }
+    }
+    func endShuttle(resume: Bool = true) {
+        guard let gesture = shuttleGesture else { return }
+        if player?.isShuttling == true { stopPlayback() }
+        if let shuttle {
+            cursor = shuttle.currentTime
+            self.shuttle = nil; shuttle.stop()
+        }
+        timer?.invalidate(); timer = nil; shuttleGesture = nil; shuttleReleasing = false
+        if resume && gesture.resume { startPlayback() } else { update() }
     }
     private func startPlayback(rememberStart: Bool = true) {
         do {
             guard duration > 0 else { return }
             flushPluginEdits()
-            let graph = try StreamingGraph(project: project, store: audio) { effect in
-                let host = try self.pluginHost(effect)
-                try host.beginStreaming(self.project.audioFormat.channels)
-                guard host.latency <= Int(self.audio.sampleRate * 30) else { throw SounderError.message("Plug-in latency exceeds the supported 30-second maximum") }
-                let channels = self.project.audioFormat.channels
-                return StreamingEffect(latency: host.latency, tail: host.tail) { samples in
-                    let data = try host.processBlock(samples.withUnsafeBytes { Data($0) }, channels: channels)
-                    return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-                }
-            }
+            let graph = try playbackGraph()
             let start = max(0, cursor)
             guard start < Double(graph.totalFrames) / audio.sampleRate else { update(); return }
             cursor = start
             let playback = try makePlayback(graph, project.audioFormat, start)
             playback.finished = { [weak self, weak playback] failure in
                 guard let self, let playback, self.player === playback else { return }
+                if self.shuttleReleasing {
+                    self.stopPlayback(at: failure == nil ? (self.lastPlaybackStart ?? playback.start) : playback.currentTime)
+                    self.shuttleGesture = nil; self.shuttleReleasing = false; self.update()
+                    if let failure { self.error(failure) }
+                    return
+                }
+                if let gesture = self.shuttleGesture {
+                    self.stopPlayback(at: failure == nil ? (gesture.direction < 0 ? 0 : Double(playback.graph.totalFrames) / self.audio.sampleRate) : playback.currentTime)
+                    if let failure { self.endShuttle(resume: false); self.error(failure) } else { self.update() }
+                    return
+                }
                 let returnPosition = self.lastPlaybackStart ?? playback.start
                 self.stopPlayback(at: failure == nil ? returnPosition : playback.currentTime)
                 self.update()
                 if let failure { self.error(failure) }
             }
             player = playback
+            mixCache = (try mixCacheKey(), graph)
             playback.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
             try playback.startPlayback()
             cursor = playback.start
@@ -534,6 +645,7 @@ final class Editor: NSObject {
         stop(); cursor = start; update()
     }
     func stop() {
+        endShuttle(resume: false)
         stopPlayback()
         if let recorder {
             let failure = recorder.stop(); self.recorder = nil

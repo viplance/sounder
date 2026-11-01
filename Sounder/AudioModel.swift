@@ -471,7 +471,7 @@ final class AudioStore {
     func render(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil) throws -> [Float] {
         try renderAudio(project, range: range, onlyTrack: onlyTrack).mono
     }
-    func renderAudio(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil) throws -> AudioSignal {
+    func renderAudio(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil, sourceFrames: Range<Int>? = nil) throws -> AudioSignal {
         try project.audioFormat.validate()
         configure(project.audioFormat)
         let channelCount = project.audioFormat.channels
@@ -479,22 +479,22 @@ final class AudioStore {
         let end = project.tracks.flatMap(\.clips).map(\.end).max() ?? 0
         // Render from project zero so delay/reverb history is correct when seeking.
         // Fragment joining is deliberately dry and excludes child buses and effects.
-        let region = onlyTrack == nil ? 0..<max(0, end) : (range ?? 0..<max(0, end))
-        let length = max(0, Int((region.upperBound - region.lowerBound) * sampleRate))
+        let region = onlyTrack == nil ? 0..<max(0, end) : (sourceFrames.map { (Double($0.lowerBound) / sampleRate)..<(Double($0.upperBound) / sampleRate) } ?? range ?? 0..<max(0, end))
+        let length = max(0, sourceFrames?.count ?? Int((region.upperBound - region.lowerBound) * sampleRate))
         func raw(_ track: Track) throws -> AudioSignal {
             var lane = silence(length)
             // Composite oldest first. A new fragment wins outside its edge
             // ramps; within each 10 ms ramp it crossfades with the audio below.
             for clip in track.clips.sorted(by: { $0.order < $1.order }) where !clip.muted {
-                let audio = try load(clip.source)
-                let clipFirst = Int((clip.start - region.lowerBound) * sampleRate)
-                let clipLast = Int((clip.end - region.lowerBound) * sampleRate)
+                let clipFirst = sourceFrames.map { Int(clip.start * sampleRate) - $0.lowerBound } ?? Int((clip.start - region.lowerBound) * sampleRate)
+                let clipLast = sourceFrames.map { Int(clip.end * sampleRate) - $0.lowerBound } ?? Int((clip.end - region.lowerBound) * sampleRate)
                 let first = max(0, clipFirst), last = min(length, clipLast)
                 guard last > first else { continue }
+                let audio = try load(clip.source)
                 let (fadeIn, fadeOut) = clip.fadeLengths(frames: clipLast - clipFirst, sampleRate: sampleRate)
                 let gains = (0..<channelCount).map { clip.volumeGain * clip.panGain(channel: $0, channels: channelCount) }
                 for frame in first..<last {
-                    let sourceFrame = Int((region.lowerBound - clip.start + clip.offset) * sampleRate) + frame
+                    let sourceFrame = sourceFrames.map { Int((clip.offset - clip.start) * sampleRate) + $0.lowerBound + frame } ?? (Int((region.lowerBound - clip.start + clip.offset) * sampleRate) + frame)
                     let incoming = fadeIn == 0 ? 1 : clip.fadeInCurve.value(Double(frame - clipFirst) / fadeIn)
                     let outgoing = fadeOut == 0 ? 1 : clip.fadeOutCurve.value(Double(clipLast - 1 - frame) / fadeOut)
                     let weight = min(incoming, outgoing)

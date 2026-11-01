@@ -92,6 +92,7 @@ final class PluginEditorWindow: NSObject, NSWindowDelegate {
         let parameters = parameterValues(), revision = host.editRevision
         if host.latency != lastLatency { lastLatency = host.latency; editor.effectsChanged() }
         guard parameters != lastParameters || revision != lastRevision else { return }
+        editor.invalidateMixCache()
         guard let track = editor.project.tracks.firstIndex(where: { $0.effects.contains(where: { $0.id == effectID }) }),
               let effect = editor.project.tracks[track].effects.firstIndex(where: { $0.id == effectID }) else { return }
         do {

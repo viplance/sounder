@@ -370,9 +370,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         notificationOverlay = ToastOverlay.install(in: content, center: editor.notifications)
         editor.changed = { [weak self] in self?.refresh() }
         buildMenu()
-        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handlePhysicalShortcut(event) == true ? nil : event
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            guard let self else { return event }
+            if self.handleShuttleShortcut(event) { return nil }
+            return self.handlePhysicalShortcut(event) ? nil : event
         }
+        NotificationCenter.default.addObserver(self, selector: #selector(cancelShuttle), name: NSApplication.didResignActiveNotification, object: NSApp)
+        NotificationCenter.default.addObserver(self, selector: #selector(cancelShuttle), name: NSWindow.didResignKeyNotification, object: window)
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refresh()
         if let index = CommandLine.arguments.firstIndex(of: "--import-ui-test"), index + 1 < CommandLine.arguments.count { importUITest(URL(fileURLWithPath: CommandLine.arguments[index + 1])); return }
         if CommandLine.arguments.contains("--ui-test") { uiTest() }
@@ -465,6 +469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--mute-ui-test") { try verifyMuteUI() }
             if CommandLine.arguments.contains("--zoom-ui-test") { try verifyZoomUI() }
             if CommandLine.arguments.contains("--range-ui-test") { try verifyRangeUI() }
+            if CommandLine.arguments.contains("--shuttle-ui-test") { try verifyShuttleUI() }
             if CommandLine.arguments.contains("--boundary-seek-ui-test") { try verifyBoundarySeekUI() }
             if CommandLine.arguments.contains("--playhead-ui-test") { try verifyPlayheadUI() }
             if CommandLine.arguments.contains("--track-name-ui-test") { try verifyTrackNameUI() }
@@ -854,6 +859,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
         menu("View", [("Zoom In", #selector(zoomIn), "\u{f700}"), ("Zoom Out", #selector(zoomOut), "\u{f701}")])
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
+    }
+    private var shuttleKey: UInt16?
+    @objc private func cancelShuttle() { shuttleKey = nil; editor.endShuttle(resume: false) }
+    @discardableResult func handleShuttleShortcut(_ event: NSEvent) -> Bool {
+        guard event.keyCode == 123 || event.keyCode == 124 else { return false }
+        if event.type == .keyUp {
+            guard shuttleKey == event.keyCode else { return false }
+            shuttleKey = nil; editor.releaseShuttle(); timeline.centerOnPlayhead(); return true
+        }
+        guard event.type == .keyDown, event.window === window, NSApp.modalWindow == nil,
+              !(window.firstResponder is NSTextView), timeline.canSelectRange,
+              event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty else { return false }
+        if !event.isARepeat || shuttleKey != event.keyCode {
+            shuttleKey = event.keyCode
+            timeline.beginShuttle(direction: event.keyCode == 123 ? -1 : 1)
+        }
+        return true
     }
     @discardableResult func handlePhysicalShortcut(_ event: NSEvent) -> Bool {
         guard event.type == .keyDown, NSApp.modalWindow == nil,

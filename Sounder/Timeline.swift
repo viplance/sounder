@@ -151,6 +151,7 @@ final class Timeline: NSView {
     private(set) var headerControls: NSView?
     private var scrollObserver: NSObjectProtocol?
     private var controlsTracking: NSTrackingArea?
+    private var followedPlayback = false
     private var hoveredTrackControl: (id: UUID, kind: Int)?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -181,7 +182,7 @@ final class Timeline: NSView {
     private func updateTrackControlHover(at point: NSPoint?) {
         var next: (id: UUID, kind: Int)?
         if let point, visibleTrackRect.contains(point), point.x < fragmentLeft,
-           !editor.isRecording, !editor.requestingMic, !editor.isImporting {
+           !editor.isRecording, !editor.isShuttling, !editor.requestingMic, !editor.isImporting {
             let row = Int((point.y - ruler) / rowHeight)
             if rows.indices.contains(row) {
                 let (track, depth) = rows[row]
@@ -196,7 +197,7 @@ final class Timeline: NSView {
     override func mouseExited(with event: NSEvent) { updateTrackControlHover(at: nil) }
     private func drawTrackControlHover(_ id: UUID, kind: Int, rect: NSRect) {
         guard window?.isKeyWindow == true, hoveredTrackControl?.id == id, hoveredTrackControl?.kind == kind,
-              !editor.isRecording, !editor.requestingMic, !editor.isImporting else { return }
+              !editor.isRecording, !editor.isShuttling, !editor.requestingMic, !editor.isImporting else { return }
         fill(rect, NSColor.white.withAlphaComponent(0.10), radius: 5)
         NSColor.white.withAlphaComponent(0.16).setStroke()
         let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.4, dy: 0.4), xRadius: 5, yRadius: 5); path.lineWidth = 0.7; path.stroke()
@@ -293,6 +294,9 @@ final class Timeline: NSView {
         if let window, window.isKeyWindow { updateTrackControlHover(at: convert(window.mouseLocationOutsideOfEventStream, from: nil)) }
         else { updateTrackControlHover(at: nil) }
         needsDisplay = true
+        let followsPlayback = editor.isPlaying || editor.isShuttling
+        if followsPlayback || followedPlayback { centerOnPlayhead() }
+        followedPlayback = followsPlayback
         if editor.isRecording, let scroll = enclosingScrollView {
             let visible = scroll.documentVisibleRect, x = header + editor.cursor * editor.zoom
             if x > visible.maxX - 40 {
@@ -573,7 +577,7 @@ final class Timeline: NSView {
                                    (trackSoloRect(row: row, depth: depth), NSCursor.arrow),
                                    (trackFXRect(row: row, depth: depth), NSCursor.arrow)] {
                 let visible = rect.intersection(visibleTrackRect)
-                if !visible.isEmpty && (!editor.busy || ((rect == trackFXRect(row: row, depth: depth) || rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
+                if !visible.isEmpty && (!editor.busy || ((rect == trackFXRect(row: row, depth: depth) || rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
             }
         }
     }
@@ -751,8 +755,7 @@ final class Timeline: NSView {
             let recording = editor.isRecording && editor.recordingTrack == track.id
             let headerRect = NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight)
             if (recording || editor.isPlaying) && meter.fraction > 0 {
-                let meterTint: NSColor = recording ? .systemRed : meterColor(meter.level)
-                fill(NSRect(x: headerRect.minX, y: y, width: header * meter.fraction, height: rowHeight), meterTint.withAlphaComponent(recording ? 0.3 : 0.25))
+                fill(NSRect(x: headerRect.minX, y: y, width: header * meter.fraction, height: rowHeight), accent.withAlphaComponent(0.25))
             }
             if editor.showsTrackMeter(track.id) {
                 label(meter.peakText, NSRect(x: fragmentLeft - 74, y: y + 12, width: 62, height: 16), size: 9, color: recording ? .systemRed : meterColor(meter.peak), weight: .medium, alignment: .right)
@@ -840,7 +843,7 @@ final class Timeline: NSView {
             }
             return
         }
-        if !editor.isRecording && !editor.requestingMic && !editor.isImporting && isTrackPoint(point) && point.x < fragmentLeft {
+        if !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isImporting && isTrackPoint(point) && point.x < fragmentLeft {
             let row = Int((point.y - ruler) / rowHeight)
             if rows.indices.contains(row), trackMuteRect(row: row, depth: rows[row].1).contains(point) {
                 editor.selectedTrack = rows[row].0.id
@@ -1107,8 +1110,7 @@ final class Timeline: NSView {
     func centerOnPlayhead() {
         guard let scroll = enclosingScrollView else { return }
         let width = scroll.contentSize.width
-        let position = editor.player?.currentTime ?? editor.cursor
-        let x = header + position * editor.zoom
+        let x = header + editor.cursor * editor.zoom
         var origin = x - header - (width - header) / 2
         origin = min(max(0, frame.width - width), max(0, origin))
         scroll.contentView.scroll(to: NSPoint(x: origin, y: scroll.contentView.bounds.minY))
@@ -1122,6 +1124,12 @@ final class Timeline: NSView {
         let step = Double(fragmentWidth) / editor.zoom * 0.01
         let position = editor.player?.currentTime ?? editor.cursor
         editor.seek(to: position + direction * step)
+        centerOnPlayhead()
+    }
+    func beginShuttle(direction: Double) {
+        guard canSelectRange else { return }
+        editor.beginShuttle(direction: direction)
+        centerOnPlayhead()
     }
     func seekBoundary(end: Bool) {
         guard canSelectRange else { return }
@@ -1131,14 +1139,18 @@ final class Timeline: NSView {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 1 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { editor.split() }
         else if event.keyCode == 45 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { NSApp.sendAction(#selector(AppDelegate.normalize), to: NSApp.delegate, from: self) }
-        else if event.keyCode == 123 { if event.modifierFlags.contains(.command) { seekBoundary(end: false) } else { movePlayhead(direction: -1) } }
-        else if event.keyCode == 124 { if event.modifierFlags.contains(.command) { seekBoundary(end: true) } else { movePlayhead(direction: 1) } }
+        else if event.keyCode == 123 { if event.modifierFlags.contains(.command) { seekBoundary(end: false) } else { beginShuttle(direction: -1) } }
+        else if event.keyCode == 124 { if event.modifierFlags.contains(.command) { seekBoundary(end: true) } else { beginShuttle(direction: 1) } }
         else if event.keyCode == 126 { NSApp.sendAction(#selector(AppDelegate.zoomIn), to: NSApp.delegate, from: self) }
         else if event.keyCode == 125 { NSApp.sendAction(#selector(AppDelegate.zoomOut), to: NSApp.delegate, from: self) }
         else if event.keyCode == 36 || event.keyCode == 76 { editor.restartFromLastStart() }
         else if event.keyCode == 49 { editor.playPause() }
         else if event.keyCode == 51 || event.keyCode == 117 { editor.deleteClips() }
         else { super.keyDown(with: event) }
+    }
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == 123 || event.keyCode == 124 { editor.releaseShuttle(); centerOnPlayhead() }
+        else { super.keyUp(with: event) }
     }
     override func menu(for event: NSEvent) -> NSMenu? {
         guard !editor.busy else { return nil }

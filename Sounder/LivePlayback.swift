@@ -28,6 +28,7 @@ final class PlaybackMeterBuffer {
         pending.append((frame, peaks))
         if pending.count > 512 { pending.removeFirst(pending.count - 512) }
     }
+    func clear() { lock.lock(); pending.removeAll(); lock.unlock() }
     func consume(through frame: Int) -> [UUID: Float] {
         lock.lock(); defer { lock.unlock() }
         var result: [UUID: Float] = [:], count = 0
@@ -60,6 +61,50 @@ private final class SampleDelay {
         }
         return output
     }
+}
+
+// Retaining processed PCM lets shuttle reuse effects without running processors
+// in reverse. A short I/O lock also covers overlapping cancelled/new shuttles.
+final class ProcessedMixCache {
+    let url: URL
+    private let file: FileHandle
+    private let lock = NSLock()
+    let channels: Int
+    private(set) var frames = 0
+    init(channels: Int) throws {
+        self.channels = channels
+        url = FileManager.default.temporaryDirectory.appendingPathComponent("Sounder-mix-" + UUID().uuidString + ".pcm")
+        guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw SounderError.message("Cannot create playback cache") }
+        do {
+            file = try FileHandle(forUpdating: url)
+            // The open handle retains the data, but a crash or forced quit can
+            // never leave a full-length temporary recording on disk.
+            try FileManager.default.removeItem(at: url)
+        }
+        catch { try? FileManager.default.removeItem(at: url); throw error }
+    }
+    func append(_ samples: [Float]) throws {
+        lock.lock(); defer { lock.unlock() }
+        try file.seekToEnd()
+        try samples.withUnsafeBytes { try file.write(contentsOf: $0) }
+        frames += samples.count / channels
+    }
+    func read(_ range: Range<Int>) throws -> [Float] {
+        lock.lock(); defer { lock.unlock() }
+        guard !range.isEmpty else { return [] }
+        precondition(range.lowerBound >= 0 && range.upperBound <= frames)
+        try file.seek(toOffset: UInt64(range.lowerBound * channels * MemoryLayout<Float>.size))
+        let count = range.count * channels * MemoryLayout<Float>.size
+        var data = Data()
+        while data.count < count {
+            guard let next = try file.read(upToCount: count - data.count), !next.isEmpty else { throw SounderError.message("Incomplete playback cache") }
+            data.append(next)
+        }
+        return data.withUnsafeBytes { bytes in
+            (0..<(range.count * channels)).map { bytes.loadUnaligned(fromByteOffset: $0 * MemoryLayout<Float>.size, as: Float.self) }
+        }
+    }
+    deinit { try? file.close(); try? FileManager.default.removeItem(at: url) }
 }
 
 /// Runs on the playback worker. Each parent processes its children exactly once.
@@ -115,19 +160,27 @@ final class StreamingGraph {
     let channels: Int
     let latency: Int
     let totalFrames: Int
+    let outputCache: ProcessedMixCache
     private(set) var position = 0
-    init(project: Project, store: AudioStore, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
+    init(project: Project, store: AudioStore, dryGraph: StreamingGraph? = nil, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
         tracks = project.tracks
         parents = Dictionary(uniqueKeysWithValues: project.tracks.compactMap { track in track.parent.map { (track.id, $0) } })
         channels = project.audioFormat.channels
+        outputCache = try ProcessedMixCache(channels: channels)
         let channelCount = channels
         var visited = Set<UUID>()
         var trackBuses: [UUID: Bus] = [:]
         func bus(_ track: Track) throws -> Bus {
             guard visited.insert(track.id).inserted else { throw SounderError.message("Invalid track hierarchy") }
-            let raw = try store.renderAudio(project, onlyTrack: track.id)
-            var dry = [Float](repeating: 0, count: raw.frameCount * channelCount)
-            for frame in 0..<raw.frameCount { for ch in 0..<channelCount { dry[frame * channelCount + ch] = raw.channels[ch][frame] } }
+            let dry: [Float]
+            if let previous = dryGraph?.buses[track.id], previous.channels == channelCount {
+                dry = previous.dry // Immutable PCM is shared; no full-project remix on release.
+            } else {
+                let raw = try store.renderAudio(project, onlyTrack: track.id)
+                var samples = [Float](repeating: 0, count: raw.frameCount * channelCount)
+                for frame in 0..<raw.frameCount { for ch in 0..<channelCount { samples[frame * channelCount + ch] = raw.channels[ch][frame] } }
+                dry = samples
+            }
             let children = try project.tracks.filter { $0.parent == track.id }.map { try bus($0) }
             let effects = try track.effects.filter { !$0.bypassed }.map(makeEffect)
             let result = Bus(dry: dry, children: children, effects: effects, channels: channelCount, muted: track.muted)
@@ -166,7 +219,9 @@ final class StreamingGraph {
             trackPeaks[id] = audible ? bus.peak : 0
         }
         position += frames
-        return mix.map { $0.isFinite ? min(1, max(-1, $0)) : 0 }
+        let output = mix.map { $0.isFinite ? min(1, max(-1, $0)) : 0 }
+        try outputCache.append(output)
+        return output
     }
 }
 
@@ -176,7 +231,7 @@ final class StreamingGraph {
 final class LivePlayback {
     let engine = AVAudioEngine()
     let node = AVAudioPlayerNode()
-    let graph: StreamingGraph
+    private(set) var graph: StreamingGraph
     let format: ProjectAudioFormat
     let queue = DispatchQueue(label: "Sounder.playback", qos: .userInteractive)
     private let meterBuffer = PlaybackMeterBuffer()
@@ -185,6 +240,23 @@ final class LivePlayback {
     private var tempo = 120.0
     private var metronomeEnabled = false
     private var nextFrame: Int
+    private var outputFrames = 0
+    private var shuttleRenderer: ShuttlePlayback?
+    private var renderingNormal = true
+    private var metronomeFadeStart = 0
+    private let returnQueue = DispatchQueue(label: "Sounder.return-to-play", qos: .userInitiated)
+    private let returnLock = NSLock()
+    private var returnToken: UUID?
+    private(set) var returnReady = false
+    var restored: ((StreamingGraph) -> Void)?
+    var snapshotGraph: StreamingGraph { queue.sync { graph } }
+    private func cancelReturn() { returnLock.lock(); returnToken = nil; returnLock.unlock() }
+    private func isCurrentReturn(_ token: UUID) -> Bool { returnLock.lock(); defer { returnLock.unlock() }; return returnToken == token }
+    func completeReturn() { isShuttling = false; returnReady = false; cancelReturn() }
+    private let transportLock = NSLock()
+    private var transportMotions: [(frame: Int, motion: ShuttleMotion)] = []
+    private(set) var isShuttling = false
+    private(set) var shuttleUsesProcessedCache = false
     let start: Double
     var finished: ((Error?) -> Void)?
     private let firstFrame: Int
@@ -198,8 +270,18 @@ final class LivePlayback {
             let frames = Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded())
             lastKnownFrame = max(lastKnownFrame, frames)
         }
-        // A temporarily unavailable render timestamp must not move the UI backwards.
+        // Output time stays monotonic; source time may reverse smoothly.
+        transportLock.lock(); defer { transportLock.unlock() }
+        if let segment = transportMotions.last(where: { $0.frame <= lastKnownFrame }) {
+            return segment.motion.position(at: Double(lastKnownFrame - segment.frame) / format.sampleRate)
+        }
         return Double(min(graph.totalFrames, firstFrame + lastKnownFrame)) / format.sampleRate
+    }
+    var currentSpeed: Double {
+        _ = currentTime
+        transportLock.lock(); defer { transportLock.unlock() }
+        guard let segment = transportMotions.last(where: { $0.frame <= lastKnownFrame }) else { return 1 }
+        return segment.motion.speed(at: Double(lastKnownFrame - segment.frame) / format.sampleRate)
     }
     init(graph: StreamingGraph, format: ProjectAudioFormat, start: Double) {
         self.graph = graph; self.format = format
@@ -219,8 +301,100 @@ final class LivePlayback {
         }
         engine.prepare(); try engine.start(); node.play()
     }
+    func beginShuttle(source: DryShuttleSource, direction: Double) {
+        cancelReturn(); returnReady = false
+        isShuttling = true; shuttleUsesProcessedCache = source.processed != nil
+        queue.async {
+            guard self.running else { return }
+            do {
+                let position = self.shuttleRenderer?.renderedPosition ?? Double(self.nextFrame) / self.format.sampleRate
+                let speed = self.shuttleRenderer?.renderedSpeed ?? 1
+                // Keep a short wet continuation beyond the queued normal audio,
+                // then fade to dry if the remaining mix has not been processed.
+                if self.renderingNormal {
+                    let needed = Int(position * self.format.sampleRate) + self.graph.latency + 512
+                    while self.graph.position < needed { _ = try self.graph.render(frames: min(512, needed - self.graph.position)) }
+                }
+                self.renderingNormal = false; self.meterBuffer.clear()
+                let entry = DryShuttleSource(project: source.project, store: source.store, processed: source.processed ?? self.graph.outputCache, latency: source.processed == nil ? self.graph.latency : source.latency, cachedStart: source.processed == nil ? max(0, Int(position * self.format.sampleRate) - 64) : source.cachedStart, frameCount: max(source.frameCount, self.graph.totalFrames))
+                let renderer = ShuttlePlayback(source: entry, start: position, direction: direction, initialSpeed: speed)
+                self.shuttleRenderer = renderer
+                self.transportLock.lock(); self.transportMotions.append((self.outputFrames, renderer.motion)); self.transportLock.unlock()
+            } catch { self.running = false; DispatchQueue.main.async { self.finished?(error) } }
+        }
+    }
+    func releaseShuttle(makeGraph: @escaping (@escaping () -> Bool) throws -> StreamingGraph) {
+        cancelReturn(); returnReady = false
+        let token = UUID()
+        returnLock.lock(); returnToken = token; returnLock.unlock()
+        queue.async {
+            guard self.running, let renderer = self.shuttleRenderer else { return }
+            renderer.retarget(1)
+            self.transportLock.lock(); self.transportMotions.append((self.outputFrames, renderer.motion)); self.transportLock.unlock()
+            self.returnQueue.async {
+                do {
+                    let cancelled = { !self.isCurrentReturn(token) }
+                    guard !cancelled() else { return }
+                    let graph = try makeGraph(cancelled)
+                    while !cancelled() {
+                        let target: Int? = self.queue.sync {
+                            guard self.running, self.isCurrentReturn(token), self.shuttleRenderer === renderer else { return nil }
+                            return renderer.hasSettled ? Int(renderer.renderedPosition * self.format.sampleRate) + graph.latency : -1
+                        }
+                        guard let target else { return }
+                        if target < 0 { Thread.sleep(forTimeInterval: 0.005); continue }
+                        while graph.position < max(0, target - 512) {
+                            if cancelled() { return }
+                            _ = try graph.render(frames: min(512, max(0, target - 512) - graph.position))
+                        }
+                        let installed: Bool = try self.queue.sync {
+                            guard self.running, self.isCurrentReturn(token), self.shuttleRenderer === renderer else { return true }
+                            let frame = Int(renderer.renderedPosition * self.format.sampleRate)
+                            let needed = frame + graph.latency
+                            guard needed - graph.position <= 1024 else { return false }
+                            while graph.position < needed { _ = try graph.render(frames: min(512, needed - graph.position)) }
+                            let source = DryShuttleSource(project: renderer.source.project, store: renderer.source.store, processed: graph.outputCache, latency: graph.latency, frameCount: graph.totalFrames, liveGraph: graph)
+                            self.graph = graph; renderer.replaceSource(source)
+                            self.renderingNormal = true; self.metronomeFadeStart = self.outputFrames; self.meterBuffer.clear()
+                            DispatchQueue.main.async {
+                                guard self.isCurrentReturn(token) else { return }
+                                self.returnReady = true; self.restored?(graph)
+                            }
+                            return true
+                        }
+                        if installed { return }
+                    }
+                } catch {
+                    guard self.isCurrentReturn(token) else { return }
+                    DispatchQueue.main.async { if self.isCurrentReturn(token) { self.finished?(error) } }
+                }
+            }
+        }
+    }
     private func enqueue(format pcmFormat: AVAudioFormat) throws {
         guard running else { return }
+        if let renderer = shuttleRenderer {
+            guard let buffer = try renderer.render(frames: 512) else {
+                if scheduled == 0 { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(nil) } }
+                return
+            }
+            if renderingNormal {
+                let first = renderer.renderedPosition - Double(buffer.frameLength) / format.sampleRate
+                let scale: Float = format.bitDepth == 16 ? 32768 : 8388608
+                for i in 0..<Int(buffer.frameLength) {
+                    let fade = min(1, Double(outputFrames + i - metronomeFadeStart) / (0.010 * format.sampleRate))
+                    let click = metronomeEnabled ? MetronomeClick.sample(frame: Int64(first * format.sampleRate) + Int64(i), sampleRate: format.sampleRate, bpm: tempo) * Float(fade) : 0
+                    for ch in 0..<format.channels {
+                        let value = min(1, max(-1, buffer.floatChannelData![ch][i] + click))
+                        buffer.floatChannelData![ch][i] = format.bitDepth == 32 ? value : min(scale - 1, (value * scale).rounded()) / scale
+                    }
+                }
+                meterBuffer.append(frame: Int(renderer.renderedPosition * format.sampleRate), peaks: graph.trackPeaks)
+            }
+            outputFrames += Int(buffer.frameLength); scheduled += 1
+            schedule(buffer, last: renderer.reachedEnd, format: pcmFormat)
+            return
+        }
         let frames = min(512, graph.totalFrames - nextFrame)
         guard frames > 0 else {
             if scheduled == 0 { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(nil) } }
@@ -236,9 +410,11 @@ final class LivePlayback {
             buffer.floatChannelData![channel][frame] = format.bitDepth == 32 ? value : min(scale - 1, (value * scale).rounded()) / scale
         } }
         meterBuffer.append(frame: nextFrame + frames, peaks: graph.trackPeaks)
-        nextFrame += frames; scheduled += 1
-        let isLast = nextFrame == graph.totalFrames
-        let completionType: AVAudioPlayerNodeCompletionCallbackType = isLast
+        nextFrame += frames; outputFrames += frames; scheduled += 1
+        schedule(buffer, last: nextFrame == graph.totalFrames, format: pcmFormat)
+    }
+    private func schedule(_ buffer: AVAudioPCMBuffer, last: Bool, format pcmFormat: AVAudioFormat) {
+        let completionType: AVAudioPlayerNodeCompletionCallbackType = last
             ? (engine.isInManualRenderingMode ? .dataRendered : .dataPlayedBack)
             : .dataConsumed
         node.scheduleBuffer(buffer, completionCallbackType: completionType) { [weak self] _ in
@@ -261,7 +437,13 @@ final class LivePlayback {
         queue.async { self.graph.setMuted(muted, trackID: trackID) }
     }
     func setSolo(_ ids: Set<UUID>) { queue.async { self.graph.setSolo(ids) } }
-    func stop() { queue.sync { running = false }; node.stop(); engine.stop() }
+    func stop() {
+        cancelReturn(); queue.sync { running = false }
+        node.stop(); engine.stop()
+        // Releasing hands processors to this worker. Drain a cancelled block
+        // before another Play can begin using those same plug-in instances.
+        returnQueue.sync {}
+    }
     deinit { engine.stop() }
 }
 
@@ -316,4 +498,299 @@ func runStreamingGraphTests() throws {
     let overlap = try StreamingGraph(project: Project(tracks: [Track(name: "Overlap", clips: [clip, newerSilence])]), store: store) { _ in fatalError() }
     _ = try overlap.render(frames: 512)
     try check(try overlap.render(frames: 128).allSatisfy { $0 == 0 }, "Streaming playback preserves newer silent takes after their edge crossfade")
+}
+
+/// Audio-clock-based shuttle: both audible sampling and the cursor use this
+/// same integral, independent of keyboard repeat settings and UI timer jitter.
+struct ShuttleMotion {
+    static let maximumRate = 8.0
+    static let releaseDuration = 0.5
+    let start: Double
+    let direction: Double
+    let end: Double
+    var initialSpeed = 0.0
+    var target: Double? = nil
+    var targetSpeed: Double { target ?? direction * Self.maximumRate }
+    var settlingDuration: Double { rampTime }
+    func settled(at time: Double) -> Bool { time >= rampTime }
+    private var isRelease: Bool { target == 0 || target == 1 }
+    private var acceleration: Double {
+        isRelease ? abs(targetSpeed - initialSpeed) / (Self.releaseDuration * Self.releaseDuration) : 4
+    }
+    private var rampTime: Double {
+        guard targetSpeed != initialSpeed else { return 0 }
+        return isRelease ? Self.releaseDuration : sqrt(abs(targetSpeed - initialSpeed) / acceleration)
+    }
+    func speed(at time: Double) -> Double {
+        let sign = targetSpeed >= initialSpeed ? 1.0 : -1.0
+        if time >= rampTime { return targetSpeed }
+        let t = max(0, time)
+        return initialSpeed + sign * acceleration * t * t
+    }
+    func distance(at time: Double) -> Double {
+        let t = max(0, time), a = min(t, rampTime)
+        let sign = targetSpeed >= initialSpeed ? 1.0 : -1.0
+        return initialSpeed * a + sign * acceleration * a * a * a / 3 + targetSpeed * max(0, t - rampTime)
+    }
+    func position(at time: Double) -> Double {
+        if initialSpeed * targetSpeed < 0 {
+            let turn = sqrt(abs(initialSpeed) / acceleration)
+            if time >= turn {
+                let pivot = min(end, max(0, start + distance(at: turn)))
+                return min(end, max(0, pivot + distance(at: time) - distance(at: turn)))
+            }
+        }
+        return min(end, max(0, start + distance(at: time)))
+    }
+    func reachedBoundary(at time: Double) -> Bool {
+        if targetSpeed == 0 && settled(at: time) { return true }
+        return direction < 0 ? position(at: time) <= 0 : position(at: time) >= end
+    }
+}
+
+// A private source/cache snapshot avoids decoding on the UI thread. Read only
+// the small window needed by the next output block; never instantiate plug-ins
+// or prepare a full-project mix just to move the cursor.
+final class DryShuttleSource {
+    let project: Project
+    let store: AudioStore
+    let frameCount: Int
+    private let tracks: [Track]
+    let processed: ProcessedMixCache?
+    let latency: Int
+    let cachedStart: Int
+    let liveGraph: StreamingGraph?
+    init(project: Project, store: AudioStore, processed: ProcessedMixCache? = nil, latency: Int = 0, cachedStart: Int = 0, frameCount: Int? = nil, liveGraph: StreamingGraph? = nil) {
+        self.project = project; self.store = store; self.processed = processed; self.latency = latency; self.cachedStart = cachedStart; self.liveGraph = liveGraph
+        self.frameCount = max(frameCount ?? 0, Int((project.tracks.flatMap(\.clips).map(\.end).max() ?? 0) * project.audioFormat.sampleRate))
+        let routing = TrackSoloRouting(tracks: project.tracks)
+        let parents = Dictionary(uniqueKeysWithValues: project.tracks.map { ($0.id, $0) })
+        tracks = project.tracks.filter { track in
+            guard routing.dry.contains(track.id) else { return false }
+            var ancestor: Track? = track
+            var visited = Set<UUID>()
+            while let current = ancestor {
+                if current.muted || !visited.insert(current.id).inserted { return false }
+                ancestor = current.parent.flatMap { parents[$0] }
+            }
+            return true
+        }
+    }
+    func read(_ range: Range<Int>) throws -> [Float] {
+        let channels = project.audioFormat.channels, rate = project.audioFormat.sampleRate
+        if let graph = liveGraph {
+            let upper = range.upperBound + graph.latency
+            while graph.position < upper { _ = try graph.render(frames: min(512, upper - graph.position)) }
+            return try graph.outputCache.read((range.lowerBound + graph.latency)..<upper)
+        }
+        let cachedEnd = min(frameCount, max(0, (processed?.frames ?? latency) - latency))
+        let fade = cachedEnd == frameCount ? 0 : Int(rate * 0.010)
+        if range.lowerBound >= cachedStart + (cachedStart > 0 ? 64 : 0), range.upperBound <= cachedEnd - fade, let processed { return try processed.read((range.lowerBound + latency)..<(range.upperBound + latency)) }
+        var output = [Float](repeating: 0, count: range.count * channels)
+        for track in tracks {
+            let signal = try store.renderAudio(project, onlyTrack: track.id, sourceFrames: range)
+            for frame in 0..<min(signal.frameCount, range.count) {
+                for ch in 0..<channels { output[frame * channels + ch] += signal.channels[ch][frame] }
+            }
+        }
+        if let processed, max(range.lowerBound, cachedStart) < min(range.upperBound, cachedEnd) {
+            let first = max(range.lowerBound, cachedStart), last = min(range.upperBound, cachedEnd)
+            let wet = try processed.read((first + latency)..<(last + latency))
+            for frame in first..<last {
+                let incoming = cachedStart == 0 ? 1 : min(1, Double(frame - cachedStart) / 64)
+                let blend = min(incoming, fade == 0 ? 1 : min(1, Double(cachedEnd - frame) / Double(fade)))
+                for ch in 0..<channels {
+                    let i = (frame - range.lowerBound) * channels + ch
+                    output[i] = Float(Double(wet[(frame - first) * channels + ch]) * blend + Double(output[i]) * (1 - blend))
+                }
+            }
+        }
+        return output.map { $0.isFinite ? min(1, max(-1, $0)) : 0 }
+    }
+}
+
+final class ShuttlePlayback {
+    let engine = AVAudioEngine()
+    let node = AVAudioPlayerNode()
+    let queue = DispatchQueue(label: "Sounder.shuttle", qos: .userInteractive)
+    private(set) var source: DryShuttleSource
+    private var previousSource: DryShuttleSource?
+    private var sourceChangeFrame = 0
+    let format: ProjectAudioFormat
+    private(set) var motion: ShuttleMotion
+    private var motionStartFrame = 0
+    private let motionLock = NSLock()
+    private var motions: [(frame: Int, motion: ShuttleMotion)] = []
+    private var requestedRevision = 0
+    private var activeRevision = 0
+    private var started = false
+    var renderedPosition: Double { motion.position(at: Double(outputFrame - motionStartFrame) / format.sampleRate) }
+    var renderedSpeed: Double { motion.speed(at: Double(outputFrame - motionStartFrame) / format.sampleRate) }
+    var hasSettled: Bool { motion.settled(at: Double(outputFrame - motionStartFrame) / format.sampleRate) }
+    var reachedEnd: Bool { terminal || motion.reachedBoundary(at: Double(outputFrame - motionStartFrame) / format.sampleRate) }
+    var finished: ((Error?) -> Void)?
+    private let cancellation = NSLock()
+    private var cancelled = false
+    private var outputFrame = 0
+    private var playedFrames = 0
+    private var scheduled = 0
+    private var terminal = false
+    var isPlaying: Bool { node.isPlaying && engine.isRunning }
+    private var isCancelled: Bool { cancellation.lock(); defer { cancellation.unlock() }; return cancelled }
+    var currentTime: Double {
+        if let time = node.lastRenderTime, let played = node.playerTime(forNodeTime: time), played.isSampleTimeValid, played.sampleRate > 0 {
+            playedFrames = max(playedFrames, Int(Double(played.sampleTime) * format.sampleRate / played.sampleRate))
+        }
+        motionLock.lock(); defer { motionLock.unlock() }
+        let segment = motions.last(where: { $0.frame <= playedFrames }) ?? motions[0]
+        return segment.motion.position(at: Double(playedFrames - segment.frame) / format.sampleRate)
+    }
+    init(source: DryShuttleSource, start: Double, direction: Double, initialSpeed: Double = 0) {
+        self.source = source; self.format = source.project.audioFormat
+        let format = source.project.audioFormat
+        motion = ShuttleMotion(start: start, direction: direction < 0 ? -1 : 1, end: Double(source.frameCount) / format.sampleRate, initialSpeed: initialSpeed)
+        motions = [(0, motion)]
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!)
+    }
+    // Called only on the worker. Used by the audio device and offline tests.
+    func render(frames requested: Int) throws -> AVAudioPCMBuffer? {
+        guard !isCancelled, !terminal else { return nil }
+        let rate = format.sampleRate
+        var positions: [Double] = []
+        let timeAtStart = Double(outputFrame - motionStartFrame) / rate
+        let steady = motion.settled(at: timeAtStart) && motion.targetSpeed == 1
+        let firstPosition = motion.position(at: timeAtStart) * rate
+        for i in 0..<requested {
+            let time = Double(outputFrame + i - motionStartFrame) / rate
+            if motion.reachedBoundary(at: time) { terminal = true; break }
+            positions.append(steady ? firstPosition + Double(i) : motion.position(at: time) * rate)
+        }
+        guard let minimum = positions.min(), let maximum = positions.max() else { return nil }
+        // Windowed-sinc interpolation also low-pass filters accelerated audio.
+        let radius = 32
+        let phase = firstPosition - floor(firstPosition)
+        let kernel: [Double]? = steady ? ((-radius + 1)...radius).map { offset in
+            let delta = phase - Double(offset), x = Double.pi * delta
+            return (abs(x) < 1e-10 ? 1 : sin(x) / x) * (0.5 + 0.5 * cos(Double.pi * delta / Double(radius)))
+        } : nil
+        let lower = max(0, Int(minimum.rounded(.down)) - radius)
+        let upper = min(source.frameCount, Int(maximum.rounded(.down)) + radius + 2)
+        let samples = try source.read(lower..<upper)
+        let fadeFrames = max(1, Int(rate * 0.010))
+        if outputFrame - sourceChangeFrame >= fadeFrames { previousSource = nil }
+        let previous = try previousSource?.read(lower..<upper)
+        guard !isCancelled else { return nil }
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: rate, channels: AVAudioChannelCount(format.channels))!
+        let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: AVAudioFrameCount(positions.count))!
+        buffer.frameLength = AVAudioFrameCount(positions.count)
+        for (index, position) in positions.enumerated() {
+            let center = Int(position.rounded(.down))
+            let time = Double(outputFrame + index - motionStartFrame) / rate
+            let velocity = motion.speed(at: time)
+            let cutoff = 1 / max(1, abs(velocity))
+            var sums = [Double](repeating: 0, count: format.channels), weightSum = 0.0
+            for frame in max(lower, center - radius + 1)..<min(upper, center + radius + 1) {
+                let delta = position - Double(frame)
+                let weight: Double
+                if let kernel { weight = kernel[frame - center + radius - 1] }
+                else {
+                    let x = Double.pi * delta * cutoff
+                    let sinc = abs(x) < 1e-10 ? 1 : sin(x) / x
+                    weight = cutoff * sinc * (0.5 + 0.5 * cos(Double.pi * delta / Double(radius)))
+                }
+                weightSum += weight
+                let blend = previous == nil ? 1 : min(1, Double(outputFrame + index - sourceChangeFrame) / Double(fadeFrames))
+                for ch in 0..<format.channels {
+                    let i = (frame - lower) * format.channels + ch
+                    let value = Double(samples[i]) * blend + Double(previous?[i] ?? 0) * (1 - blend)
+                    sums[ch] += value * weight
+                }
+            }
+            let edgeDistance = velocity < 0 ? motion.position(at: time) : motion.end - motion.position(at: time)
+            let onset = abs(motion.initialSpeed) < 0.01 ? min(1, time / 0.005) : 1
+            let stopFade = motion.targetSpeed == 0 ? min(1, max(0, (motion.settlingDuration - time) / 0.005)) : 1
+            let envelope = min(onset, abs(velocity) / 0.02, edgeDistance / (0.005 * max(0.02, abs(velocity)))) * stopFade
+            let scale = format.bitDepth == 16 ? 32768.0 : 8388608.0
+            for ch in 0..<format.channels {
+                let value = min(1, max(-1, sums[ch] / max(1e-9, weightSum))) * envelope
+                buffer.floatChannelData![ch][index] = Float(format.bitDepth == 32 || source.liveGraph != nil ? value : min(scale - 1, (value * scale).rounded()) / scale)
+            }
+        }
+        outputFrame += positions.count
+        return buffer
+    }
+    // Worker-only: re-anchor at the next unscheduled sample, preserving phase
+    // and signed velocity across key release or a change of direction.
+    func retarget(_ target: Double, revision: Int? = nil) {
+        let direction = target == 0 ? (renderedSpeed < 0 ? -1.0 : 1.0) : (target < 0 ? -1.0 : 1.0)
+        let next = ShuttleMotion(start: renderedPosition, direction: direction, end: motion.end, initialSpeed: renderedSpeed, target: target)
+        motion = next; motionStartFrame = outputFrame; terminal = false
+        motionLock.lock()
+        if let revision { activeRevision = revision } else { requestedRevision += 1; activeRevision = requestedRevision }
+        motions.append((outputFrame, next)); motionLock.unlock()
+    }
+    func replaceSource(_ source: DryShuttleSource) {
+        previousSource = self.source; self.source = source; sourceChangeFrame = outputFrame
+    }
+    private func requestTarget(_ target: Double) {
+        motionLock.lock(); requestedRevision += 1; let revision = requestedRevision; motionLock.unlock()
+        queue.async {
+            guard !self.isCancelled else { return }
+            self.retarget(target, revision: revision)
+            if self.started && self.scheduled == 0 {
+                do { try self.enqueue() } catch { self.report(error) }
+            }
+        }
+    }
+    func changeDirection(_ direction: Double) { requestTarget(direction < 0 ? -8 : 8) }
+    func release() { requestTarget(0) }
+    func start() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            do {
+                self.started = true
+                for _ in 0..<8 { try self.enqueue() }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !self.isCancelled else { return }
+                    do { self.engine.prepare(); try self.engine.start(); self.node.play() }
+                    catch { self.finished?(error) }
+                }
+            } catch { self.report(error) }
+        }
+    }
+    private func enqueue() throws {
+        guard !isCancelled else { return }
+        guard let buffer = try render(frames: 512) else {
+            if scheduled == 0 { report(nil) }
+            return
+        }
+        scheduled += 1
+        let last = reachedEnd
+        let completion: AVAudioPlayerNodeCompletionCallbackType = last ? (engine.isInManualRenderingMode ? .dataRendered : .dataPlayedBack) : .dataConsumed
+        node.scheduleBuffer(buffer, completionCallbackType: completion) { [weak self] _ in
+            guard let self else { return }
+            self.queue.async {
+                guard !self.isCancelled else { return }
+                self.scheduled -= 1
+                do { try self.enqueue() } catch { self.report(error) }
+            }
+        }
+    }
+    private func report(_ error: Error?) {
+        let revision = activeRevision
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.isCancelled else { return }
+            self.motionLock.lock(); let current = self.requestedRevision; self.motionLock.unlock()
+            guard error != nil || current == revision else { return }
+            self.finished?(error)
+        }
+    }
+    func stop() {
+        cancellation.lock(); cancelled = true; cancellation.unlock()
+        node.stop(); engine.stop()
+        // Each gesture owns its source snapshot and no plug-ins. Cancellation
+        // must not wait on a decoder or disk I/O on the main thread.
+    }
+    deinit { engine.stop() }
 }

@@ -394,7 +394,7 @@ extension AppDelegate {
         key(123)
         try check(editor.cursor == 0 && !editor.isPlaying, "Command-Left seeks to zero while stopped")
         key(124, command: false)
-        try check(editor.cursor > 0 && editor.cursor < editor.duration, "Unmodified Right retains its one-percent seek step")
+        try check(editor.cursor == 0 && editor.isShuttling, "Unmodified Right starts continuous shuttle at the current position without a seek step")
         editor.seek(to: 3); editor.playPause(); key(123)
         try check(editor.isPlaying && editor.player?.start == 0, "Command-Left restarts active playback at the beginning without pausing")
         key(124)
@@ -531,5 +531,275 @@ extension AppDelegate {
         openProject(); saveProject(); saveAs()
         try check(editor.isRecording && NSApp.modalWindow == nil && !editor.save(), "Open/Save stay disabled while recording without stopping capture")
         editor.stop(); try verifyEnabled(true)
+    }
+}
+
+func runShuttleAudioTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderShuttle-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let format = ProjectAudioFormat(sampleRate: 48_000, channels: 2, bitDepth: 32)
+    store.configure(format)
+    let url = store.freshURL()
+    let left = (0..<192_000).map { Float(0.1 + Double($0) / 480_000) }
+    try store.write(AudioSignal(channels: [left, left.map { -$0 * 0.5 }]), to: url)
+    var clip = Clip(name: "Shuttle", source: url.path, start: 0, duration: 4, order: 1)
+    clip.fadeInMS = 0; clip.fadeOutMS = 0
+    let effect = PluginEffect(name: "Never instantiate during shuttle", path: "/missing-shuttle-plugin.vst3", classID: "test")
+    let track = Track(name: "Source", clips: [clip], effects: [effect])
+    let project = Project(tracks: [track], audioFormat: format)
+    let dry = DryShuttleSource(project: project, store: store)
+    for direction in [-1.0, 1.0] {
+        let playback = ShuttlePlayback(source: dry, start: 1, direction: direction, initialSpeed: direction)
+        let buffer = try playback.render(frames: 512)!
+        var error = 0.0
+        for i in 250..<512 {
+            let t = Double(i) / format.sampleRate
+            let expected = 0.1 + playback.motion.position(at: t) / 10
+            error = max(error, abs(Double(buffer.floatChannelData![0][i]) - expected), abs(Double(buffer.floatChannelData![1][i]) + expected * 0.5))
+        }
+        try check(error < 0.00001, "Shuttle renders real stereo PCM in the correct direction without loading plug-ins (\(direction))")
+        playback.stop()
+    }
+    // Exercise the actual queued AVAudioEngine output across multiple refills.
+    let queued = ShuttlePlayback(source: dry, start: 1, direction: -1)
+    let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+    try queued.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+    queued.start()
+    let deadline = Date().addingTimeInterval(2)
+    while !queued.isPlaying && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+    try check(queued.isPlaying, "Shuttle starts its audio engine asynchronously")
+    let captured = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+    var previous: Float?, discontinuity: Float = 0, silent = 0
+    for block in 0..<32 {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.001))
+        queued.queue.sync {}
+        guard try queued.engine.renderOffline(512, to: captured) == .success else { throw SounderError.message("Cannot render queued shuttle audio") }
+        if block >= 8 {
+            for i in 0..<512 {
+                let value = captured.floatChannelData![0][i]
+                if value < 0.05 { silent += 1 }
+                if let previous { discontinuity = max(discontinuity, abs(value - previous)) }
+                previous = value
+            }
+        }
+    }
+    queued.stop()
+    try check(silent == 0 && discontinuity < 0.001, "Actual reverse audio stays continuous across scheduled buffer refills (silent: \(silent), discontinuity: \(discontinuity))")
+    // Capture the join itself through the existing live engine. An engine
+    // restart, position jump or silent buffer cannot hide behind UI state.
+    for direction in [-1.0, 1.0] {
+        let liveGraph = try StreamingGraph(project: project, store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }
+        let live = LivePlayback(graph: liveGraph, format: format, start: 0.5)
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        try live.startPlayback()
+        var output: [Float] = []
+        func capture(_ blocks: Int) throws {
+            for _ in 0..<blocks {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.001)); live.queue.sync {}
+                guard try live.engine.renderOffline(512, to: captured) == .success else { throw SounderError.message("Cannot render live-to-shuttle transition") }
+                output.append(contentsOf: UnsafeBufferPointer(start: captured.floatChannelData![0], count: 512))
+            }
+        }
+        try capture(16)
+        let source = DryShuttleSource(project: project, store: store, processed: liveGraph.outputCache)
+        live.beginShuttle(source: source, direction: direction); live.queue.sync {}
+        let anchor = liveGraph.position - 512
+        let boundary = anchor - 24_000
+        let plan = ShuttleMotion(start: Double(anchor) / format.sampleRate, direction: direction, end: 4, initialSpeed: 1)
+        try capture(40)
+        var maximum = 0.0
+        for i in max(512, boundary - 128)..<min(output.count, boundary + 1024) {
+            let position = i < boundary ? 0.5 + Double(i) / format.sampleRate : plan.position(at: Double(i - boundary) / format.sampleRate)
+            maximum = max(maximum, abs(Double(output[i]) - (0.1 + position / 10)))
+        }
+        try check(live.isPlaying && maximum < 0.00001, "Live-to-shuttle join preserves every output sample without silence or a position jump (\(direction), error: \(maximum))")
+        live.stop()
+    }
+    for direction in [-1.0, 1.0] {
+        let stopping = ShuttlePlayback(source: dry, start: 2, direction: direction, initialSpeed: direction)
+        let before = try stopping.render(frames: 512)!
+        let position = stopping.renderedPosition, speed = stopping.renderedSpeed
+        stopping.retarget(0)
+        try check(stopping.motion.position(at: 0) == position && stopping.motion.speed(at: 0) == speed && stopping.motion.settlingDuration == 0.5, "Release-to-pause takes 0.5 seconds and preserves position and signed speed (\(direction))")
+        let first = try stopping.render(frames: 512)!
+        try check(abs(first.floatChannelData![0][0] - before.floatChannelData![0][511]) < 0.0001, "Release-to-pause has no sample discontinuity (\(direction))")
+        var last = first, blocks = 0
+        while let buffer = try stopping.render(frames: 512), blocks < 200 { last = buffer; blocks += 1 }
+        try check(stopping.reachedEnd && stopping.hasSettled && abs(last.floatChannelData![0][Int(last.frameLength) - 1]) < 0.001, "Paused shuttle drains a smooth stop ending at silence (\(direction))")
+        stopping.stop()
+    }
+    for initial in [-8.0, -4.0, 0.0, 4.0, 8.0] {
+        let returning = ShuttleMotion(start: 10, direction: 1, end: 100, initialSpeed: initial, target: 1)
+        let duration = returning.settlingDuration
+        try check(duration == 0.5 && returning.speed(at: 0) == initial && returning.speed(at: duration) == 1 && returning.speed(at: duration + 2) == 1, "Release-to-Play continuously reaches and maintains exactly 1x (\(initial))")
+        if initial < 0 { try check(returning.speed(at: 0.25) < 0 && returning.speed(at: duration) > 0, "Releasing reverse playback brakes through zero before going forward") }
+    }
+    for direction in [-1.0, 1.0] {
+        let old = try StreamingGraph(project: project, store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }
+        let live = LivePlayback(graph: old, format: format, start: 1.5)
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        try live.startPlayback()
+        func block() throws -> [Float] {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.001)); live.queue.sync {}
+            guard try live.engine.renderOffline(512, to: captured) == .success else { throw SounderError.message("Cannot render shuttle release") }
+            return Array(UnsafeBufferPointer(start: captured.floatChannelData![0], count: 512))
+        }
+        for _ in 0..<8 { _ = try block() }
+        live.beginShuttle(source: DryShuttleSource(project: project, store: store, processed: old.outputCache), direction: direction)
+        for _ in 0..<(direction < 0 ? 80 : 40) { _ = try block() }
+        var previous = try block().last!, maximum: Float = 0
+        let engine = live.engine, node = live.node
+        live.releaseShuttle { cancelled in
+            guard !cancelled() else { throw CancellationError() }
+            return try StreamingGraph(project: project, store: store, dryGraph: old) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }
+        }
+        var blocks = 0
+        while (!live.returnReady || abs(live.currentSpeed - 1) > 1e-8) && blocks < 180 {
+            for value in try block() { maximum = max(maximum, abs(value - previous)); previous = value }
+            blocks += 1
+        }
+        try check(live.returnReady && live.engine === engine && live.node === node && abs(live.currentSpeed - 1) < 1e-8, "Audible shuttle release returns to 1x without restarting the engine/node (\(direction))")
+        try check(maximum < 0.005, "Actual release audio has no gap or hard join across braking, reversal and effect restoration (\(direction), jump: \(maximum))")
+        live.completeReturn()
+        let restored = live.snapshotGraph
+        live.setMuted(true, trackID: track.id)
+        for _ in 0..<12 { _ = try block() }
+        let silence = try block()
+        try check(live.snapshotGraph === restored && silence.allSatisfy { abs($0) < 1e-6 }, "Mute remains live on the restored DSP graph after shuttle release (\(direction))")
+        live.stop()
+    }
+    let fullDry = try store.renderAudio(project, onlyTrack: track.id)
+    for first in [1, 511, 1023, 47_999, 80_013] {
+        let window = try dry.read(first..<(first + 513))
+        try check(window.count == 1026 && (0..<513).allSatisfy { window[$0 * 2] == fullDry.channels[0][first + $0] }, "Integer source windows preserve every sample across arbitrary boundaries (\(first))")
+    }
+    let motion = ShuttleMotion(start: 100, direction: -1, end: 200)
+    try check(motion.speed(at: 0) == 0 && motion.speed(at: 0.5) == -1 && motion.speed(at: 1) == -4 && motion.speed(at: 20) == -8, "Paused shuttle starts at zero speed and accelerates continuously to a bounded 8x")
+    try check(abs((motion.position(at: 1.001) - motion.position(at: 0.999)) / 0.002 - motion.speed(at: 1)) < 0.00001 && motion.position(at: 100) == 0, "Cursor motion integrates audible speed and clamps exactly at timeline boundaries")
+    let brake = ShuttleMotion(start: 100, direction: -1, end: 200, initialSpeed: 1)
+    try check(brake.speed(at: 0) == 1 && brake.speed(at: 0.5) == 0 && brake.speed(at: 0.6) < 0 && brake.position(at: 0.5) > 100, "Rewind from Play brakes through zero before reversing, without changing the initial position or velocity")
+    let accelerate = ShuttleMotion(start: 100, direction: 1, end: 200, initialSpeed: 1)
+    try check(accelerate.position(at: 0) == 100 && accelerate.speed(at: 0) == 1 && accelerate.speed(at: 0.1) > 1, "Forward shuttle starts at the existing speed immediately and smoothly accelerates")
+    var calls = 0
+    let graph = try StreamingGraph(project: project, store: store) { _ in
+        StreamingEffect(latency: 0, tail: 0) { samples in calls += 1; return samples.map { $0 * 0.25 } }
+    }
+    for _ in 0..<8 { _ = try graph.render(frames: 512) }
+    let count = calls
+    let cached = DryShuttleSource(project: project, store: store, processed: graph.outputCache)
+    let wet = try cached.read(512..<1024), uncached = try cached.read(5000..<5512)
+    try check(abs(wet[0] - left[512] * 0.25) < 1e-6 && abs(uncached[0] - left[5000]) < 1e-6 && calls == count, "Rendered regions reuse cached effects; unrendered regions use dry audio with zero plug-in calls")
+    let transition = try cached.read(3500..<4500)
+    let jump = zip(transition.dropFirst(2), transition).enumerated().filter { $0.offset % 2 == 0 }.map { abs($0.element.0 - $0.element.1) }.max() ?? 0
+    try check(jump < 0.001, "A 10 ms transition avoids a hard discontinuity between cached effects and dry shuttle audio")
+    var muted = track; muted.muted = true
+    let mutedSource = DryShuttleSource(project: Project(tracks: [muted], audioFormat: format), store: store)
+    try check(try mutedSource.read(1000..<1512).allSatisfy { $0 == 0 }, "Dry shuttle respects track mute")
+    let cacheURL: URL = try {
+        let cache = try ProcessedMixCache(channels: 2)
+        try cache.append([0.25, -0.5]); try check(try cache.read(0..<1) == [0.25, -0.5], "Disk mix cache preserves exact channel samples")
+        return cache.url
+    }()
+    try check(!FileManager.default.fileExists(atPath: cacheURL.path), "Temporary processed mix files are deleted when the cache is released")
+}
+
+extension AppDelegate {
+    func verifyShuttleUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        func key(_ type: NSEvent.EventType, _ code: UInt16, repeatKey: Bool = false, flags: NSEvent.ModifierFlags = []) -> NSEvent {
+            NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: repeatKey, keyCode: code)!
+        }
+        func waitFor(_ condition: () -> Bool) {
+            let deadline = Date().addingTimeInterval(4)
+            while !condition() && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        }
+        func centered() -> Bool {
+            let expected = min(max(0, timeline.frame.width - timeline.viewportSize.width), max(0, editor.cursor * editor.zoom - (timeline.viewportSize.width - timeline.header) / 2))
+            return abs(timeline.visibleRect.minX - expected) < 2
+        }
+        window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
+        editor.stop(); editor.zoom = 500; editor.seek(to: 5); refresh()
+        let before = editor.cursor
+        try check(handleShuttleShortcut(key(.keyDown, 123)), "Unmodified Left is captured before native menu key equivalents")
+        try check(editor.player == nil && editor.shuttle != nil && editor.isShuttling && editor.cursor == before && centered(), "Arrow-down immediately creates shuttle at the exact paused cursor, without a step or hold timer")
+        _ = handleShuttleShortcut(key(.keyUp, 123))
+        waitFor { !editor.isShuttling }
+        try check(!editor.isPlaying && !editor.isShuttling, "Releasing an arrow while initially paused glides to a stopped cursor")
+        editor.playPause(); RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+        try check(editor.isPlaying && centered(), "Ordinary playback keeps the cursor centered horizontally")
+        let originalPlayer = editor.player!
+        let positionAtPress = originalPlayer.currentTime
+        _ = handleShuttleShortcut(key(.keyDown, 123))
+        try check(editor.player === originalPlayer && originalPlayer.isPlaying && originalPlayer.isShuttling && abs(editor.cursor - positionAtPress) < 0.03, "Rewind keeps the current engine/node playing and does not jump the cursor")
+        try check(originalPlayer.shuttleUsesProcessedCache, "Rewind reuses processed audio from the preceding playback")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25)); editor.updateTransportPosition()
+        try check(editor.cursor > positionAtPress && centered(), "Rewind initially continues forward while braking, like an analog tape")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.55)); editor.updateTransportPosition()
+        let first = editor.cursor
+        _ = handleShuttleShortcut(key(.keyDown, 123, repeatKey: true))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15)); editor.updateTransportPosition()
+        try check(editor.player === originalPlayer && editor.isPlaying && editor.cursor < first && centered(), "The same live stream reverses after braking; key repeat never restarts it")
+        _ = handleShuttleShortcut(key(.keyUp, 123))
+        try check(editor.player === originalPlayer && editor.isPlaying && editor.isShuttling, "Releasing rewind keeps the same stream running while braking and turning forward")
+        waitFor { !editor.isShuttling }
+        try check(editor.isPlaying && editor.player === originalPlayer && abs(originalPlayer.currentSpeed - 1) < 1e-8, "Reverse release smoothly returns to ordinary playback without replacing the player")
+        let restoredGraph = originalPlayer.snapshotGraph
+        editor.toggleMute(editor.project.tracks[0].id)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+        try check(editor.player === originalPlayer && originalPlayer.snapshotGraph === restoredGraph && editor.isPlaying, "Live Mute still works on the restored graph without interrupting playback")
+        editor.toggleMute(editor.project.tracks[0].id)
+        _ = handleShuttleShortcut(key(.keyDown, 124)); RunLoop.current.run(until: Date().addingTimeInterval(0.45)); editor.updateTransportPosition()
+        let forward = editor.cursor
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2)); editor.updateTransportPosition()
+        try check(editor.player?.isShuttling == true && editor.cursor > forward && centered(), "Holding Right auditions forward audio with the same acceleration and centered scrolling")
+        let speedAtRelease = editor.player!.currentSpeed
+        _ = handleShuttleShortcut(key(.keyUp, 124))
+        try check(editor.player === originalPlayer && editor.isShuttling && speedAtRelease > 1, "Forward release keeps accelerated playback alive while it slows down")
+        waitFor { !editor.isShuttling }
+        try check(editor.player === originalPlayer && abs(originalPlayer.currentSpeed - 1) < 1e-8, "Forward release settles at exactly 1x in the same stream")
+        editor.stop()
+        editor.seek(to: 5); _ = handleShuttleShortcut(key(.keyDown, 123))
+        _ = handleShuttleShortcut(key(.keyDown, 124))
+        try check(!handleShuttleShortcut(key(.keyUp, 123)) && editor.isShuttling, "Releasing the older opposite arrow does not cancel the current direction")
+        _ = handleShuttleShortcut(key(.keyUp, 124)); editor.stop()
+        try check(!handleShuttleShortcut(key(.keyDown, 123, flags: [.command])), "Command-arrows retain the separate start/end shortcuts")
+        window.makeFirstResponder(projectNameField)
+        try check(!handleShuttleShortcut(key(.keyDown, 123)), "Arrow text editing never starts audio shuttle")
+        window.makeFirstResponder(timeline)
+        editor.stop(); editor.checkpoint(); editor.project.tracks[0].clips[0].volumeDB = -6
+        editor.seek(to: 5); _ = handleShuttleShortcut(key(.keyDown, 123))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        try check(editor.shuttle?.source.processed == nil, "An audio edit invalidates previously processed mix regions")
+        let positionAtRelease = editor.cursor
+        _ = handleShuttleShortcut(key(.keyUp, 123))
+        try check(editor.isShuttling && editor.shuttle != nil, "Paused audition retains its audio node for the release glide")
+        waitFor { !editor.isShuttling }
+        try check(!editor.isPlaying && !editor.isShuttling && editor.cursor < positionAtRelease, "Paused reverse audition smoothly stops farther along its motion")
+        let stopped = editor.cursor
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        try check(editor.cursor == stopped, "After the glide, the paused cursor stays exactly at the final audible position")
+        editor.undo()
+        editor.seek(to: 5); _ = handleShuttleShortcut(key(.keyDown, 123)); editor.stop()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        try check(!editor.isShuttling && editor.shuttle == nil && !editor.isPlaying, "Stop cancels pending shuttle preparation and prevents delayed audio restart")
+        _ = handleShuttleShortcut(key(.keyUp, 123))
+        editor.seek(to: 5); editor.playPause()
+        let interrupted = editor.player!
+        _ = handleShuttleShortcut(key(.keyDown, 123))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.65))
+        _ = handleShuttleShortcut(key(.keyUp, 123))
+        _ = handleShuttleShortcut(key(.keyDown, 124))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+        try check(editor.player === interrupted && editor.isPlaying && editor.isShuttling, "A new direction retargets an unfinished release in the same audio stream")
+        _ = handleShuttleShortcut(key(.keyUp, 124)); editor.stop()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        try check(editor.player == nil && editor.shuttle == nil && !editor.isShuttling && !editor.isPlaying, "Stop cancels background effect restoration without a delayed playback restart")
+        editor.seek(to: 5.8); editor.zoom = 70; refresh()
     }
 }
