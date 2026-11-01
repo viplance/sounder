@@ -32,6 +32,8 @@ final class Editor: NSObject {
     var recordingURL: URL?
     var recordingTrack: UUID?
     var recordingStart = 0.0
+    private var pendingRecordedSources = Set<String>()
+    private var recordedSourceCleanup: [String: String] = [:]
     var timer: Timer?
     var importer: AudioImportController?
     private(set) var isNormalizing = false
@@ -542,6 +544,7 @@ final class Editor: NSObject {
                         if let failure { throw failure }
                         throw SounderError.message("No audio was captured. Check the selected input device.")
                     }
+                    pendingRecordedSources.insert(url.path)
                     checkpoint()
                     let clip = Clip(name: "\(project.tracks[index].name) \(project.tracks[index].nextTakeNumber)", source: url.path, start: recordingStart, duration: Double(data.frameCount) / audio.sampleRate, order: project.nextOrder)
                     project.tracks[index].nextTakeNumber += 1
@@ -599,28 +602,52 @@ final class Editor: NSObject {
         } catch { self.error(error) }
     }
     func save(as: Bool = false) -> Bool {
-        guard !isRecording, !isImporting, !isNormalizing else { return false }
+        guard !busy else { return false }
         var destination = projectURL
         if destination == nil || `as` {
             let panel = NSSavePanel(); panel.nameFieldStringValue = suggestedFilename; panel.canCreateDirectories = true
             guard panel.runModal() == .OK else { return false }; destination = panel.url
         }
-        do {
-            let url = destination!; let fm = FileManager.default
-            let media = url.appendingPathComponent("Media"); try fm.createDirectory(at: media, withIntermediateDirectories: true)
-            flushPluginEdits()
-            var saved = project
-            saved.name = projectName
-            for i in saved.tracks.indices { for j in saved.tracks[i].clips.indices {
-                let original = URL(fileURLWithPath: saved.tracks[i].clips[j].source)
-                let target = media.appendingPathComponent(original.lastPathComponent)
-                if original.standardizedFileURL != target.standardizedFileURL && !fm.fileExists(atPath: target.path) { try fm.copyItem(at: original, to: target) }
-                saved.tracks[i].clips[j].source = "Media/" + target.lastPathComponent
+        do { try save(to: destination!); return true }
+        catch { self.error(error); return false }
+    }
+    func save(to url: URL) throws {
+        guard !busy else { throw SounderError.message("Wait for the current operation before saving") }
+        flushPluginEdits()
+        var snapshot = project; snapshot.name = projectName
+        let saved = try ProjectStorage.save(snapshot, to: url, additionalSources: pendingRecordedSources)
+        func remapped(_ original: Project) -> Project {
+            var result = original
+            for i in result.tracks.indices { for j in result.tracks[i].clips.indices {
+                if let path = saved.sources[result.tracks[i].clips[j].source] { result.tracks[i].clips[j].source = path }
             } }
-            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(saved).write(to: url.appendingPathComponent("project.json"), options: .atomic)
-            project.name = saved.name; projectURL = url; dirty = false; update("Saved \(url.lastPathComponent)"); return true
-        } catch { self.error(error); return false }
+            return result
+        }
+        for (source, target) in saved.sources { if let data = audio.cache[source] { audio.cache[target] = data } }
+        project = remapped(project); project.name = saved.project.name
+        undoStack = undoStack.map(remapped); redoStack = redoStack.map(remapped)
+        let pasteboard = NSPasteboard.general
+        if let bytes = pasteboard.data(forType: Self.fragmentPasteboardType),
+           var payload = try? JSONDecoder().decode(FragmentClipboard.self, from: bytes) {
+            var changed = false
+            for i in payload.items.indices {
+                if let target = saved.sources[payload.items[i].clip.source] { payload.items[i].clip.source = target; changed = true }
+            }
+            if changed, let updated = try? JSONEncoder().encode(payload) { pasteboard.setData(updated, forType: Self.fragmentPasteboardType) }
+        }
+        for source in pendingRecordedSources {
+            if let target = saved.sources[source], source != target { recordedSourceCleanup[source] = target }
+        }
+        pendingRecordedSources.subtract(saved.sources.keys)
+        projectURL = url; dirty = false; update("Saved \(url.lastPathComponent)")
+        // Commit paths before removing temporary takes: saved media always survives a failure.
+        for (source, target) in recordedSourceCleanup {
+            guard FileManager.default.fileExists(atPath: target) else { continue }
+            do {
+                if FileManager.default.fileExists(atPath: source) { try FileManager.default.removeItem(atPath: source) }
+                recordedSourceCleanup.removeValue(forKey: source); audio.cache.removeValue(forKey: source)
+            } catch { self.error(SounderError.message("Project saved, but the temporary take could not be removed: " + error.localizedDescription)) }
+        }
     }
     func confirmDiscard() -> Bool {
         flushPluginEdits()
@@ -630,26 +657,23 @@ final class Editor: NSObject {
     }
     func open() {
         guard !busy, confirmDiscard() else { return }
-        let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = true; panel.treatsFilePackagesAsDirectories = false
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.canChooseFiles = true; panel.treatsFilePackagesAsDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try open(from: url) }
+        catch { self.error(error) }
+    }
+    func open(from url: URL) throws {
+        guard !busy else { throw SounderError.message("Stop the current operation before opening a project") }
         do {
-            var loaded = try JSONDecoder().decode(Project.self, from: Data(contentsOf: url.appendingPathComponent("project.json")))
-            try TrackHierarchy.validate(loaded.tracks)
+            let loaded = try ProjectStorage.load(from: url)
             audio.configure(loaded.audioFormat)
-            for i in loaded.tracks.indices {
-                for j in loaded.tracks[i].clips.indices {
-                    let c = loaded.tracks[i].clips[j]
-                    guard c.start.isFinite, c.offset.isFinite, c.duration.isFinite, c.start >= 0, c.offset >= 0, c.duration > 0 else { throw SounderError.message("Invalid fragment timing") }
-                    let source = url.appendingPathComponent(c.source).standardizedFileURL
-                    guard source.path.hasPrefix(url.standardizedFileURL.path + "/") else { throw SounderError.message("Audio must be inside the project") }
-                    let data = try audio.load(source.path)
-                    guard c.offset + c.duration <= Double(data.frameCount) / audio.sampleRate + 0.001 else { throw SounderError.message("Fragment exceeds its audio file") }
-                    loaded.tracks[i].clips[j].source = source.path
-                }
+            for clip in loaded.tracks.flatMap(\.clips) {
+                let data = try audio.load(clip.source)
+                guard clip.offset + clip.duration <= Double(data.frameCount) / audio.sampleRate + 0.001 else { throw SounderError.message("Fragment exceeds its audio file") }
             }
-            loaded.nextOrder = max(loaded.nextOrder, (loaded.tracks.flatMap(\.clips).map(\.order).max() ?? 0) + 1)
+            pendingRecordedSources = []; recordedSourceCleanup = [:]
             project = loaded; projectURL = url; undoStack = []; redoStack = []; selection = []; cursor = 0; lastPlaybackStart = nil; range = nil; dirty = false; reconcile(); update("Project opened")
-        } catch { audio.configure(project.audioFormat); self.error(error) }
+        } catch { audio.configure(project.audioFormat); throw error }
     }
     func export() {
         guard canExport else { return }

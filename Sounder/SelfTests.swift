@@ -205,6 +205,8 @@ func runAudioTests() throws {
         let error = zip(decoded.channels[0], stereoAgain.channels[0]).map { abs($0 - $1) }.max() ?? 0
         try check(error <= (depth == 16 ? 0.00004 : 0.000001), "\(depth)-bit export round-trip stays within quantization error")
     }
+    try runRecordedMediaMoveTests()
+    try runProjectStorageTests()
     try runTrackMeterTests()
     try runStreamingGraphTests()
     try runTransportPositionTests()
@@ -303,13 +305,15 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
         let projectURL = directory.appendingPathComponent("Test.sounder")
         guard !FileManager.default.fileExists(atPath: projectURL.path) else { throw SounderError.message("Plug-in edit unexpectedly wrote a project") }
         editor.projectURL = projectURL
+        editor.stop()
         guard editor.save() else { throw SounderError.message("Could not save live plug-in state") }
-        let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: projectURL.appendingPathComponent("project.json")))
+        let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: projectURL))
         let savedHost = try SNPluginHost(path: path, classID: host.classID, state: saved.tracks[0].effects[0].state)
         guard abs(savedHost.parameterValue(id) - 0.62) < 0.001 else { throw SounderError.message("Save did not persist the open editor's current state") }
+        editor.playPause()
         liveHost.setParameter(id, value: 0.47); panel.captureChanges()
         guard editor.dirty else { throw SounderError.message("Editing after Save did not mark the project dirty") }
-        let unchanged = try Data(contentsOf: projectURL.appendingPathComponent("project.json"))
+        let unchanged = try Data(contentsOf: projectURL)
         guard try JSONDecoder().decode(Project.self, from: unchanged).tracks[0].effects[0].state == saved.tracks[0].effects[0].state else { throw SounderError.message("Editing a plug-in wrote to disk without project Save") }
         editor.playPause()
         let stoppedAt = editor.cursor
@@ -325,7 +329,7 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
         editor.playPause()
         RunLoop.current.run(until: Date().addingTimeInterval(0.4 + Double(liveHost.tail) / sampleRate))
         guard editor.player == nil, editor.cursor == 0, editor.lastPlaybackStart == 0 else { throw SounderError.message("Live playback did not return to its last start after the project and effect tail finished") }
-        print("PASS: audio engine streams with the native editor open; parameter edits, Save and editor close do not restart playback; pause/resume/stop work")
+        print("PASS: audio engine streams with the native editor open; parameter edits and editor close do not restart playback; Save persists state while stopped; pause/resume/stop work")
         guard abs((try editor.pluginHost(editor.project.tracks[0].effects[0])).parameterValue(id) - 0.47) < 0.001 else { throw SounderError.message("Closing the editor discarded live changes") }
         print("PASS: nonmodal plug-in editor applies changes immediately, retains edits on close, and writes state only on project Save")
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
@@ -384,7 +388,7 @@ func runNormalizationTests() throws {
     editor.redo()
     editor.projectURL = directory.appendingPathComponent("Normalized.sounder")
     try check(editor.save(), "Normalized project saves successfully")
-    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!.appendingPathComponent("project.json")))
+    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!))
     try check(saved.normalizationLevel == -3 && saved.tracks[0].clips[0].gain == gain, "Save/load preserves normalized gains and the last chosen level")
     var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(saved)) as! [String: Any]
     legacy.removeValue(forKey: "normalizationLevel")
@@ -432,7 +436,7 @@ func runFragmentMuteTests() throws {
     editor.redo(); editor.undo()
     editor.projectURL = directory.appendingPathComponent("Muted.sounder")
     try check(editor.save(), "Project with muted fragments saves successfully")
-    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!.appendingPathComponent("project.json")))
+    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!))
     try check(saved.tracks[0].clips.allSatisfy(\.muted), "Save/load preserves fragment mute state")
     let pasteboard = NSPasteboard.withUniqueName(); defer { pasteboard.releaseGlobally() }
     editor.copyFragments(to: pasteboard); editor.cursor = 2; editor.selectedTrack = editor.project.tracks[0].id
@@ -643,4 +647,122 @@ func runTrackMeterTests() throws {
     try check(buffer.consume(through: 512)[id] == 0.9 && buffer.consume(through: 512).isEmpty && buffer.consume(through: 1024)[id] == 0.2, "Meter publication follows played frames and drains each peak once")
     buffer.append(frame: 1536, peaks: [id: 0.3]); buffer.append(frame: 2048, peaks: [id: 0.8])
     try check(buffer.consume(through: 2048)[id] == 0.8, "UI polling preserves brief peaks across all audio blocks since the previous update")
+}
+
+func runProjectStorageTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let fm = FileManager.default, root = fm.temporaryDirectory.appendingPathComponent("SounderMedia-" + UUID().uuidString)
+    defer { try? fm.removeItem(at: root) }
+    let store = try AudioStore(directory: root.appendingPathComponent("working")), editor = Editor(store: store)
+    var inputs: [URL] = []
+    for (index, value) in [Float(0.1), Float(0.4)].enumerated() {
+        let folder = root.appendingPathComponent("input\(index)"); try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent("source.wav")
+        try store.write(AudioSignal(channels: [Array(repeating: value, count: 4096), Array(repeating: value * 0.5, count: 4096)]), to: url)
+        inputs.append(url)
+    }
+    let bytes = try inputs.map { try Data(contentsOf: $0) }
+    let a = Clip(name: "Take", source: inputs[0].path, start: 0, duration: 0.05, order: 1)
+    var split = a; split.id = UUID(); split.start = 0.06; split.offset = 0.01; split.duration = 0.02
+    let b = Clip(name: "Imported", source: inputs[1].path, start: 0, duration: 0.05, order: 2)
+    editor.project = Project(tracks: [Track(name: "Media", clips: [a, b, split])])
+    let originalAudio = try store.renderAudio(editor.project)
+    editor.checkpoint(); editor.project.tracks[0].clips[0].name = "Renamed"
+    let url = root.appendingPathComponent("Session/Project.sounder"), media = url.deletingLastPathComponent().appendingPathComponent("media")
+    try editor.save(to: url)
+    var directory: ObjCBool = false
+    try check(fm.fileExists(atPath: url.path, isDirectory: &directory) && !directory.boolValue && fm.fileExists(atPath: media.path), "New projects save as a file beside a media folder")
+    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: url))
+    let paths = saved.tracks.flatMap(\.clips).map(\.source)
+    try check(paths.allSatisfy { $0.hasPrefix("media/") } && Set(paths).count == 2 && paths[0] != paths[1] && paths[0] == paths[2], "Relative media paths deduplicate split sources and keep same-named input files distinct")
+    try check(try inputs.enumerated().allSatisfy { try Data(contentsOf: $0.element) == bytes[$0.offset] }, "Saving copies media without modifying or deleting original inputs")
+    try check(try store.renderAudio(editor.project).channels == originalAudio.channels && editor.project.tracks.flatMap(\.clips).allSatisfy { $0.source.hasPrefix(media.path + "/") }, "The live project switches to saved media paths without changing audio")
+    try editor.save(to: url)
+    try check(try fm.contentsOfDirectory(atPath: media.path).count == 2, "Repeated Save reuses existing media without extra copies")
+    for file in inputs { try fm.removeItem(at: file) }
+    editor.undo(); _ = try store.renderAudio(editor.project)
+    try check(editor.project.tracks[0].clips[0].name == "Take" && editor.project.tracks[0].clips[0].source.hasPrefix(media.path + "/"), "Undo references saved media even after transient source files disappear")
+    editor.redo(); _ = try store.renderAudio(editor.project)
+    let newTake = store.freshURL(); try store.write(AudioSignal(channels: [Array(repeating: Float(0.05), count: 4096)]), to: newTake)
+    editor.project.tracks[0].clips.append(Clip(name: "New take", source: newTake.path, start: 0.1, duration: 0.05, order: 4))
+    try editor.save(to: url)
+    try check(try fm.contentsOfDirectory(atPath: media.path).count == 3 && editor.project.tracks[0].clips.last!.source.hasPrefix(media.path + "/"), "Saving again adds newly recorded or imported sources to the same media folder")
+    let originalJSON = try Data(contentsOf: url)
+    let copy = root.appendingPathComponent("Copy/Clone.sounder")
+    try editor.save(to: copy)
+    try check(try Data(contentsOf: url) == originalJSON && fm.contentsOfDirectory(atPath: copy.deletingLastPathComponent().appendingPathComponent("media").path).count == 3, "Save As copies all referenced media beside the new project and preserves the original project")
+    let moved = root.appendingPathComponent("Moved")
+    try fm.moveItem(at: copy.deletingLastPathComponent(), to: moved)
+    let movedProject = moved.appendingPathComponent("Clone.sounder"), reader = Editor(store: try AudioStore(directory: root.appendingPathComponent("reader")))
+    try reader.open(from: movedProject)
+    try check(reader.project.tracks.flatMap(\.clips).allSatisfy { $0.source.hasPrefix(moved.appendingPathComponent("media").path + "/") } && (try reader.audio.renderAudio(reader.project)).frameCount > 0, "Moving the project and media folder together preserves reopening and playback")
+    let previous = try Data(contentsOf: movedProject)
+    var broken = reader.project
+    broken.tracks[0].clips.append(Clip(name: "Missing", source: root.appendingPathComponent("missing.wav").path, start: 0, duration: 1, order: 10))
+    var rejected = false
+    do { _ = try ProjectStorage.save(broken, to: movedProject) } catch { rejected = true }
+    try check(rejected && (try Data(contentsOf: movedProject)) == previous, "A missing source cannot overwrite an already saved project")
+    let folder = root.appendingPathComponent("Directory.sounder", isDirectory: true)
+    try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+    rejected = false; do { _ = try ProjectStorage.load(from: folder) } catch { rejected = true }
+    try check(rejected, "Opening a project accepts files only")
+    rejected = false; do { _ = try ProjectStorage.save(reader.project, to: folder) } catch { rejected = true }
+    try check(rejected, "Saving cannot turn a directory into a project package")
+    var escape = saved; escape.tracks[0].clips[0].source = "../outside.wav"
+    let escapeURL = moved.appendingPathComponent("Escape.sounder")
+    try JSONEncoder().encode(escape).write(to: escapeURL)
+    rejected = false; do { _ = try ProjectStorage.load(from: escapeURL) } catch { rejected = true }
+    try check(rejected, "Project media references cannot escape the containing project folder")
+}
+
+func runRecordedMediaMoveTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let fm = FileManager.default, root = fm.temporaryDirectory.appendingPathComponent("SounderTakeMove-" + UUID().uuidString)
+    defer { try? fm.removeItem(at: root) }
+    let store = try AudioStore(directory: root.appendingPathComponent("temporary")), editor = Editor(store: store)
+    let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+    func record() throws -> URL {
+        let recorder = try LiveRecorder(url: store.freshURL(), format: editor.project.audioFormat, inputFormat: input)
+        try recorder.start(); editor.activateRecording(recorder)
+        recorder.writer.append(captureTestBuffer(format: input, start: 0, frames: 24_000)); recorder.writer.waitForPendingWrites()
+        editor.stop(); return recorder.url
+    }
+    let take = try record(), takeBytes = try Data(contentsOf: take), firstID = editor.project.tracks[0].clips[0].id
+    let deletedTake = try record()
+    editor.selection = [editor.project.tracks[0].clips.last!.id]; editor.deleteClips()
+    let imported = root.appendingPathComponent("original-import.wav")
+    try store.write(AudioSignal(channels: [Array(repeating: Float(0.1), count: 24_000)]), to: imported)
+    let originalBytes = try Data(contentsOf: imported)
+    editor.finishAudioImport([ImportedAudio(name: "Imported", url: imported, data: try store.load(imported.path))], track: editor.project.tracks[0].id, start: 1)
+    let pasteboard = NSPasteboard.general
+    let previousClipboard = (pasteboard.types ?? []).compactMap { type in pasteboard.data(forType: type).map { (type, $0) } }
+    defer { pasteboard.clearContents(); for (type, data) in previousClipboard { pasteboard.setData(data, forType: type) } }
+    editor.selection = [firstID]; editor.copyFragments()
+    let destination = root.appendingPathComponent("Saved/Project.sounder")
+    try editor.save(to: destination)
+    let media = destination.deletingLastPathComponent().appendingPathComponent("media")
+    let savedTake = editor.project.tracks[0].clips.first { $0.id == firstID }!
+    try check(!fm.fileExists(atPath: take.path) && savedTake.source.hasPrefix(media.path + "/") && (try Data(contentsOf: URL(fileURLWithPath: savedTake.source))) == takeBytes, "A successful Save moves newly recorded takes into media without changing their bytes")
+    try check(!fm.fileExists(atPath: deletedTake.path) && (try fm.contentsOfDirectory(atPath: media.path)).count == 3, "Save also moves recorded takes retained by Undo history")
+    try check(try Data(contentsOf: imported) == originalBytes && editor.project.tracks[0].clips.last!.source != imported.path, "Imported audio is copied into media while its original remains unchanged")
+    editor.undo(); editor.undo()
+    try check(editor.project.tracks[0].clips.count == 2 && editor.project.tracks[0].clips.allSatisfy { fm.fileExists(atPath: $0.source) && $0.source.hasPrefix(media.path + "/") }, "Undo restores deleted takes using relocated media instead of missing temporary files")
+    editor.redo(); editor.redo()
+    editor.cursor = 2; editor.pasteFragments()
+    try check(editor.project.tracks[0].clips.last!.source == savedTake.source && editor.project.tracks[0].clips.last!.start == 2, "The fragment clipboard still pastes a take after its temporary source moves")
+    let originalProjectBytes = try Data(contentsOf: destination)
+    let clone = root.appendingPathComponent("Clone/Copy.sounder")
+    try editor.save(to: clone)
+    try check(fm.fileExists(atPath: savedTake.source) && (try Data(contentsOf: destination)) == originalProjectBytes && editor.project.tracks[0].clips[0].source.hasPrefix(clone.deletingLastPathComponent().appendingPathComponent("media").path), "Save As copies already saved takes and leaves the original project media intact")
+    let pending = try record()
+    let invalid = root.appendingPathComponent("CannotOverwrite.sounder", isDirectory: true)
+    try fm.createDirectory(at: invalid, withIntermediateDirectories: true)
+    var failed = false; do { try editor.save(to: invalid) } catch { failed = true }
+    try check(failed && fm.fileExists(atPath: pending.path), "A failed project Save cannot remove a newly recorded temporary take")
+    try editor.save(to: clone)
+    try check(!fm.fileExists(atPath: pending.path), "A later successful Save moves the retained take after an earlier failure")
 }

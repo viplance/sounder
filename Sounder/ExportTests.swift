@@ -90,7 +90,7 @@ func runExportTests() throws {
     try check(editor.project.defaultExportSettings == settings && editor.project.exportSettingsConfirmed && editor.dirty, "A successful export becomes the next dialog's default and marks the project for Save")
     editor.projectURL = directory.appendingPathComponent("Saved.sounder")
     try check(editor.save(), "Project Save accepts the last selected export settings")
-    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!.appendingPathComponent("project.json")))
+    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!))
     try check(saved.defaultExportSettings == settings && saved.exportSettingsConfirmed && saved.audioFormat == editor.project.audioFormat, "Saving and reopening preserves export choices independently of the project format")
     let legacy = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(project))
     try check(legacy.exportSettings == nil, "Older projects without export settings remain readable")

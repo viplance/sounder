@@ -495,3 +495,41 @@ extension AppDelegate {
         snapshot("recording")
     }
 }
+
+extension AppDelegate {
+    func verifyProjectFileControlsUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        defer { editor.stop(); editor.project = original; editor.dirty = false; refresh() }
+        window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
+        func verifyEnabled(_ enabled: Bool) throws {
+            refresh()
+            let items = window.toolbar!.items.filter { ["open", "save"].contains($0.itemIdentifier.rawValue) }
+            try check(items.count == 2 && items.allSatisfy { $0.isEnabled == enabled && ($0.view as? NSControl)?.isEnabled == enabled }, "Titlebar Open/Save controls and toolbar items are \(enabled ? "enabled" : "disabled") together")
+            let file = NSApp.mainMenu!.items.first { $0.title == "File" }!.submenu!
+            file.update()
+            let actions = file.items.filter { [#selector(openProject), #selector(saveProject), #selector(saveAs)].contains($0.action) }
+            try check(actions.count == 3 && actions.allSatisfy { $0.isEnabled == enabled }, "File menu Open, Save and Save As follow transport availability")
+        }
+        try verifyEnabled(true)
+        editor.seek(to: 1); editor.playPause()
+        guard let playback = editor.player else { throw SounderError.message("File controls playback did not start") }
+        try verifyEnabled(false)
+        openProject(); saveProject(); saveAs()
+        try check(editor.player === playback && editor.isPlaying && NSApp.modalWindow == nil && !editor.save(), "Open/Save actions cannot show dialogs or interrupt playback")
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("SounderBusySave-" + UUID().uuidString + ".sounder")
+        var rejected = false; do { try editor.save(to: temporary) } catch { rejected = true }
+        try check(rejected && !FileManager.default.fileExists(atPath: temporary.path), "Programmatic Save also refuses to write during playback")
+        editor.stop(); try verifyEnabled(true)
+        let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let recorder = try LiveRecorder(url: editor.audio.freshURL(), format: editor.project.audioFormat, inputFormat: input)
+        try recorder.start(); editor.activateRecording(recorder)
+        recorder.writer.append(captureTestBuffer(format: input, start: 0, frames: 4096)); recorder.writer.waitForPendingWrites()
+        try verifyEnabled(false)
+        openProject(); saveProject(); saveAs()
+        try check(editor.isRecording && NSApp.modalWindow == nil && !editor.save(), "Open/Save stay disabled while recording without stopping capture")
+        editor.stop(); try verifyEnabled(true)
+    }
+}

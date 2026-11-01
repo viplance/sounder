@@ -380,7 +380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             item.label = label; item.toolTip = label; item.view = view
             // Custom toolbar views still receive the system glass bezel unless explicitly opted out.
             if id == "project" { item.isBordered = false }
-            if id == "export" || id == "quality" { item.autovalidates = false }
+            if ["open", "save", "export", "quality"].contains(id) { item.autovalidates = false }
             item.visibilityPriority = .high
             titlebarItems[identifier] = item
         }
@@ -418,6 +418,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             refresh()
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
+            if CommandLine.arguments.contains("--project-file-controls-ui-test") { try verifyProjectFileControlsUI() }
+            if CommandLine.arguments.contains("--fragments-system-menu-ui-test") { try verifyFragmentsSystemMenuUI() }
             if CommandLine.arguments.contains("--fragment-fades-ui-test") { try verifyFragmentFadesUI() }
             if CommandLine.arguments.contains("--track-meters-ui-test") { try verifyTrackMetersUI() }
             if CommandLine.arguments.contains("--track-solo-ui-test") { try verifyTrackSoloUI() }
@@ -773,6 +775,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         playButton.image = NSImage(systemSymbolName: editor.isPlaying ? "pause.fill" : "play.fill", accessibilityDescription: "Play / pause")
         playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isImporting; recordButton.isEnabled = !editor.busy
         editButtons.forEach { $0.isEnabled = !editor.busy }
+        for name in ["open", "save"] {
+            let item = titlebarItems[NSToolbarItem.Identifier(name)]
+            item?.isEnabled = !editor.busy
+            (item?.view as? NSControl)?.isEnabled = !editor.busy
+        }
         exportButton.isEnabled = editor.canExport
         titlebarItems[NSToolbarItem.Identifier("export")]?.isEnabled = editor.canExport
         projectLabel.stringValue = editor.projectName + (editor.dirty ? "  •" : "")
@@ -810,8 +817,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         menu("Sounder", [("About Sounder", #selector(about), ""), ("Quit Sounder", #selector(quit), "q")])
         menu("File", [("Rename Project…", #selector(renameProject), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Import Audio…", #selector(importAudio), "i"), ("Export…", #selector(exportAudio), "e")])
-        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"), ("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Mute Fragments", #selector(muteFragments), ""), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
-        if let edit = main.items.last?.submenu { edit.items.filter { [#selector(split), #selector(normalize)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
+        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v")])
+        menu("Fragments", [("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Mute Fragments", #selector(muteFragments), ""), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
+        if let fragments = main.items.last?.submenu { fragments.items.filter { [#selector(split), #selector(normalize)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
         menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
         menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
         if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
@@ -836,11 +844,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     @objc func openProject() { editor.open() }
     private func finishNameEditing() { projectNameField.finish(commit: true); timeline.nameField.finish(commit: true) }
-    @objc func saveProject() { finishNameEditing(); _ = editor.save() }
-    @objc func saveAs() { finishNameEditing(); _ = editor.save(as: true) }
+    @objc func saveProject() { guard !editor.busy else { return }; finishNameEditing(); _ = editor.save() }
+    @objc func saveAs() { guard !editor.busy else { return }; finishNameEditing(); _ = editor.save(as: true) }
     @objc func importAudio() { editor.importAudio() }
     @objc func exportAudio() { editor.export() }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if [#selector(openProject), #selector(saveProject), #selector(saveAs)].contains(menuItem.action) {
+            return !editor.busy && NSApp.modalWindow == nil
+        }
         if [#selector(selectAll(_:)), #selector(copy(_:)), #selector(paste(_:))].contains(menuItem.action) {
             if (NSApp.keyWindow ?? window)?.firstResponder is NSTextView { return true }
             guard NSApp.modalWindow == nil, NSApp.keyWindow == nil || NSApp.keyWindow === window else { return false }
@@ -848,12 +859,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if menuItem.action == #selector(copy(_:)) { return !editor.selection.isEmpty }
             return !editor.busy && NSPasteboard.general.data(forType: Editor.fragmentPasteboardType) != nil
         }
-        if menuItem.action == #selector(muteFragments) {
-            menuItem.title = editor.fragmentsAreMuted(editor.selection) ? "Unmute Fragments" : "Mute Fragments"
-            return !editor.busy && !editor.selection.isEmpty && NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
-        }
-        if [#selector(split), #selector(normalize)].contains(menuItem.action) {
+        if [#selector(split), #selector(trim), #selector(join), #selector(normalize), #selector(muteFragments), #selector(deleteClips)].contains(menuItem.action) {
+            if menuItem.action == #selector(muteFragments) { menuItem.title = editor.fragmentsAreMuted(editor.selection) ? "Unmute Fragments" : "Mute Fragments" }
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView) && !editor.busy
+                && editor.project.tracks.contains { $0.clips.contains { editor.selection.contains($0.id) } }
         }
         if menuItem.action == #selector(exportAudio) { return editor.canExport }
         if [#selector(zoomIn), #selector(zoomOut)].contains(menuItem.action) {

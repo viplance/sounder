@@ -518,7 +518,7 @@ extension AppDelegate {
         try check(!handlePhysicalShortcut(event("ы", code: 1, flags: [.option])) && !handlePhysicalShortcut(event("ы", code: 1, flags: [.control])), "Split does not consume modified S combinations")
         try check(handlePhysicalShortcut(event("ф", code: 0, flags: [.command])) && editor.selection == Set(editor.project.tracks.flatMap(\.clips).map(\.id)), "Command-A works on the Russian physical ф key")
         let splitItem = NSApp.mainMenu!.items.flatMap { $0.submenu?.items ?? [] }.first { $0.action == #selector(split) }!
-        try check(splitItem.keyEquivalent == "s" && splitItem.keyEquivalentModifierMask.isEmpty, "The Edit menu shows S instead of Command-B for Split")
+        try check(splitItem.keyEquivalent == "s" && splitItem.keyEquivalentModifierMask.isEmpty, "The Fragments menu preserves the unmodified S shortcut for Split")
         timeline.renameTrack(original.tracks[0].id)
         guard let input = timeline.nameField.currentEditor() as? NSTextView else { throw SounderError.message("No inline field editor") }
         let before = editor.project.tracks[0].clips.count
@@ -819,5 +819,35 @@ extension AppDelegate {
                 try bitmap.representation(using: .png, properties: [:])?.write(to: path)
             }
         }
+    }
+}
+
+extension AppDelegate {
+    func verifyFragmentsSystemMenuUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let selection = editor.selection
+        defer { editor.selection = selection; editor.requestingMic = false; refresh() }
+        window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
+        let roots = NSApp.mainMenu!.items
+        guard let index = roots.firstIndex(where: { $0.title == "Edit" }), index + 1 < roots.count,
+              roots[index + 1].title == "Fragments", let fragments = roots[index + 1].submenu else { throw SounderError.message("Fragments menu must immediately follow Edit") }
+        let actions = [#selector(split), #selector(trim), #selector(join), #selector(normalize), #selector(muteFragments), #selector(deleteClips)]
+        try check(fragments.items.compactMap(\.action) == actions && roots[index].submenu!.items.allSatisfy { !actions.contains($0.action!) }, "Fragment actions live exclusively in the system Fragments menu immediately after Edit")
+        editor.selection = []; fragments.update()
+        try check(fragments.items.allSatisfy { !$0.isEnabled }, "All system fragment actions disable when no fragment is selected")
+        editor.selection = [UUID()]; fragments.update()
+        try check(fragments.items.allSatisfy { !$0.isEnabled }, "Stale selection IDs cannot enable fragment actions")
+        editor.selection = [editor.project.tracks[0].clips[0].id]; fragments.update()
+        try check(fragments.items.allSatisfy(\.isEnabled), "Selecting a real fragment enables the Fragments menu actions")
+        editor.requestingMic = true; fragments.update()
+        try check(fragments.items.allSatisfy { !$0.isEnabled }, "Busy transport keeps every fragment action disabled")
+        editor.requestingMic = false
+        timeline.renameTrack(editor.project.tracks[0].id); fragments.update()
+        try check(fragments.items.allSatisfy { !$0.isEnabled }, "Editing a name disables fragment actions and preserves text shortcuts")
+        timeline.nameField.finish(commit: false); window.makeFirstResponder(timeline)
+        let split = fragments.items.first { $0.action == #selector(split) }!, normalize = fragments.items.first { $0.action == #selector(normalize) }!
+        try check(split.keyEquivalent == "s" && split.keyEquivalentModifierMask.isEmpty && normalize.keyEquivalent == "n" && normalize.keyEquivalentModifierMask.isEmpty, "Split and Normalize retain their physical unmodified shortcuts in Fragments")
     }
 }

@@ -100,7 +100,7 @@ func runTempoTests() throws {
     editor.toggleTempoMode(); editor.setTempo(93.5); editor.toggleMetronome()
     editor.projectURL = directory.appendingPathComponent("Tempo.sounder")
     try check(editor.save(), "Tempo project saves successfully")
-    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!.appendingPathComponent("project.json")))
+    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!))
     try check(saved.tempoMode && saved.metronomeEnabled && saved.tempo == 93.5, "Project Save preserves BPM, tempo ruler mode and metronome choice")
     var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(saved)) as! [String: Any]
     for key in ["tempo", "tempoMode", "metronomeEnabled"] { legacy.removeValue(forKey: key) }

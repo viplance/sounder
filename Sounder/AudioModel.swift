@@ -539,6 +539,69 @@ final class AudioStore {
         return mix
     }
 }
+enum ProjectStorage {
+    private static func requireFile(_ url: URL) throws {
+        var directory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &directory), directory.boolValue {
+            throw SounderError.message("Choose a .sounder project file")
+        }
+    }
+    static func save(_ project: Project, to url: URL, additionalSources: Set<String> = []) throws -> (project: Project, sources: [String: String]) {
+        try requireFile(url)
+        let fm = FileManager.default, document = url
+        let media = document.deletingLastPathComponent().appendingPathComponent("media", isDirectory: true)
+        try fm.createDirectory(at: media, withIntermediateDirectories: true)
+        var saved = project, sources: [String: String] = [:], copied: [URL] = []
+        var canonicalTargets: [String: URL] = [:]
+        func prepare(_ path: String) throws -> URL {
+            let original = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+            let target: URL
+            if let existing = canonicalTargets[original.path] { target = existing }
+            else if original.deletingLastPathComponent() == media.standardizedFileURL.resolvingSymlinksInPath() {
+                guard fm.fileExists(atPath: original.path) else { throw SounderError.message("Audio file is missing: " + original.lastPathComponent) }
+                target = media.appendingPathComponent(original.lastPathComponent)
+            } else {
+                var candidate = media.appendingPathComponent(original.lastPathComponent)
+                while fm.fileExists(atPath: candidate.path) {
+                    candidate = media.appendingPathComponent(UUID().uuidString).appendingPathExtension(original.pathExtension)
+                }
+                try fm.copyItem(at: original, to: candidate); copied.append(candidate); target = candidate
+            }
+            canonicalTargets[original.path] = target; sources[path] = target.path
+            return target
+        }
+        do {
+            for i in saved.tracks.indices { for j in saved.tracks[i].clips.indices {
+                let target = try prepare(saved.tracks[i].clips[j].source)
+                saved.tracks[i].clips[j].source = "media/" + target.lastPathComponent
+            } }
+            // Retain recorded takes reachable through Undo/Redo or the clipboard too.
+            for path in additionalSources.sorted() { _ = try prepare(path) }
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(saved).write(to: document, options: .atomic)
+            return (saved, sources)
+        } catch {
+            for file in copied { try? fm.removeItem(at: file) }
+            throw error
+        }
+    }
+    static func load(from url: URL) throws -> Project {
+        try requireFile(url)
+        let document = url, base = document.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+        let media = base.appendingPathComponent("media", isDirectory: true).resolvingSymlinksInPath()
+        var loaded = try JSONDecoder().decode(Project.self, from: Data(contentsOf: document))
+        try TrackHierarchy.validate(loaded.tracks)
+        for i in loaded.tracks.indices { for j in loaded.tracks[i].clips.indices {
+            let clip = loaded.tracks[i].clips[j]
+            guard clip.start.isFinite, clip.offset.isFinite, clip.duration.isFinite, clip.start >= 0, clip.offset >= 0, clip.duration > 0 else { throw SounderError.message("Invalid fragment timing") }
+            let source = base.appendingPathComponent(clip.source).standardizedFileURL.resolvingSymlinksInPath()
+            guard clip.source.hasPrefix("media/"), source.path.hasPrefix(media.path + "/"), source.path.hasPrefix(base.path == "/" ? "/" : base.path + "/") else { throw SounderError.message("Audio must be inside the project's media folder") }
+            loaded.tracks[i].clips[j].source = source.path
+        } }
+        loaded.nextOrder = max(loaded.nextOrder, (loaded.tracks.flatMap(\.clips).map(\.order).max() ?? 0) + 1)
+        return loaded
+    }
+}
 enum SounderError: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
