@@ -208,6 +208,8 @@ func runAudioTests() throws {
     try runStreamingGraphTests()
     try runTransportPositionTests()
     try runTempoTests()
+    try runTrackSoloTests()
+    try runFragmentSettingsTests()
     try runFragmentFadeTests()
     try runFragmentMuteTests()
     try runNormalizationTests()
@@ -490,4 +492,123 @@ func runFragmentFadeTests() throws {
         let shortMix = try store.renderAudio(Project(tracks: [Track(name: "Short", clips: [short])], audioFormat: format))
         try check(shortMix.frameCount == Int(rate * 0.01) && shortMix.channels[0].first == 0 && shortMix.channels[0].last == 0 && shortMix.channels[0].max()! > 0.39, "A 10 ms fragment uses shorter edge ramps without losing its peak or duration")
     }
+}
+
+func runFragmentSettingsTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderFragmentSettings-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory), source = directory.appendingPathComponent("source.wav")
+    try store.write(AudioSignal(channels: [Array(repeating: Float(0.5), count: 48_000), Array(repeating: Float(0.25), count: 48_000)]), to: source)
+    let original = Clip(name: "Settings", source: source.path, start: 0, duration: 1, order: 1)
+    var settings = FragmentSettings(original)
+    settings.volumeDB = 24; settings.fadeInMS = 20; settings.fadeOutMS = 40; settings.fadeInCurve = .exponential; settings.fadeOutCurve = .smooth
+    let edited = try settings.applying(to: original, peak: 0.5)
+    try check(abs(edited.volumeDB - 20 * log10(2)) < 1e-9 && edited.volumeDB <= 24, "Fragment volume is limited to the source's 0 dBFS peak ceiling")
+    func render(_ clip: Clip, channels: Int = 2) throws -> AudioSignal { try store.renderAudio(Project(tracks: [Track(name: "Edit", clips: [clip])], audioFormat: ProjectAudioFormat(channels: channels))) }
+    let audio = try render(edited)
+    try check(audio.channels[0].max() == 1 && audio.channels[1].max() == 0.5, "Volume preserves stereo balance without exceeding 0 dBFS")
+    try check(abs(audio.channels[0][480] - 0.25) < 1e-6 && abs(audio.channels[0][47_039] - 0.5) < 1e-6, "Independent fade lengths and curve types change the actual PCM envelope")
+    var right = edited; right.pan = 90
+    let rightAudio = try render(right)
+    var left = edited; left.pan = -90
+    let leftAudio = try render(left)
+    try check(rightAudio.channels[0].allSatisfy { $0 == 0 } && rightAudio.channels[1].max() == 0.5 && leftAudio.channels[1].allSatisfy { $0 == 0 } && leftAudio.channels[0].max() == 1, "Pan -90 and +90 isolate left and right while center remains unchanged")
+    let mono = try render(right, channels: 1)
+    try check(mono.channels[0].max() == 0.75, "Mono project playback retains its full mix without pan-related loss")
+    let graph = try StreamingGraph(project: Project(tracks: [Track(name: "Edit", clips: [right])]), store: store) { _ in throw SounderError.message("Unexpected effect") }
+    var played: [Float] = []
+    while graph.position < graph.totalFrames { played += try graph.render(frames: 512) }
+    try check(played[20_000] == rightAudio.channels[0][10_000] && played[20_001] == rightAudio.channels[1][10_000], "Streaming playback applies fragment volume, pan and fades exactly like export")
+    // Compare display buckets directly with independently rendered PCM, including
+    // stereo-to-mono cancellation and mono-to-stereo pan routing.
+    let sourceAudio = try store.load(source.path)
+    for curve in FadeCurve.allCases {
+        var visual = edited; visual.fadeInMS = 300; visual.fadeOutMS = 400
+        visual.fadeInCurve = curve; visual.fadeOutCurve = curve; visual.pan = 35
+        let pcm = try render(visual)
+        let peaks = FragmentWaveform.peaks(sourceAudio, clip: visual, rate: 48_000, channels: 2)!
+        try check(peaks == AudioData(channels: pcm.channels).channelPeaks, "Waveform matches rendered volume, pan and \(curve.title) fade curves sample for sample")
+    }
+    var trimmed = edited; trimmed.offset = 0.2; trimmed.duration = 0.6
+    trimmed.fadeInBaked = true; trimmed.fadeOutBaked = true
+    let trimmedPCM = try render(trimmed)
+    try check(FragmentWaveform.peaks(sourceAudio, clip: trimmed, rate: 48_000, channels: 2)! == AudioData(channels: trimmedPCM.channels).channelPeaks, "Trimmed waveform uses the source offset and never reapplies baked fades")
+    let monoSource = AudioData(Array(repeating: Float(0.5), count: 48_000))
+    for channels in [1, 2] {
+        let centered = FragmentWaveform.peaks(monoSource, clip: edited, rate: 48_000, channels: channels)!
+        try check(centered.count == 1 && centered[0].max() == 1, "Centered mono uses one full-amplitude waveform in a \(channels)-channel project")
+    }
+    let monoPeaks = FragmentWaveform.peaks(monoSource, clip: right, rate: 48_000, channels: 2)!
+    try check(monoPeaks.count == 2 && monoPeaks[0].allSatisfy { $0 == 0 } && monoPeaks[1].max() == 1, "Mono-source waveforms show both output channels and full-right pan")
+    let opposite = AudioData(channels: [Array(repeating: Float(0.5), count: 48_000), Array(repeating: Float(-0.5), count: 48_000)])
+    try check(FragmentWaveform.peaks(opposite, clip: right, rate: 48_000, channels: 1)![0].allSatisfy { $0 == 0 }, "Mono waveform reflects actual downmix cancellation instead of independent stereo peaks")
+    try check(FragmentWaveform.peaks(sourceAudio, clip: edited, rate: 48_000, channels: 2, cancelled: { true }) == nil, "Obsolete waveform jobs cancel before scanning source audio")
+    let saved = try JSONDecoder().decode(Clip.self, from: JSONEncoder().encode(edited))
+    try check(FragmentSettings(saved) == FragmentSettings(edited), "Fragment settings survive project serialization")
+    var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as! [String: Any]
+    for key in ["volumeDB", "pan", "fadeInMS", "fadeOutMS", "fadeInCurve", "fadeOutCurve"] { legacy.removeValue(forKey: key) }
+    let decoded = try JSONDecoder().decode(Clip.self, from: JSONSerialization.data(withJSONObject: legacy))
+    try check(decoded.volumeDB == 0 && decoded.pan == 0 && decoded.fadeInMS == 10 && decoded.fadeOutMS == 10 && decoded.fadeInCurve == .linear && decoded.fadeOutCurve == .linear, "Older fragments retain unity volume, centered pan and 10 ms linear fades")
+    let editor = Editor(store: store); editor.project = Project(tracks: [Track(name: "Edit", clips: [original])], nextOrder: 2)
+    try editor.setFragmentSettings(original.id, settings: settings, peak: 0.5)
+    try check(editor.undoStack.count == 1, "Editing all fragment settings creates one Undo step")
+    editor.undo(); try check(editor.project.tracks[0].clips[0].volumeDB == 0, "Undo restores previous fragment settings")
+    editor.redo(); try check(editor.project.tracks[0].clips[0].fadeInCurve == .exponential, "Redo restores fade settings")
+    editor.selection = [original.id]
+    let pasteboard = NSPasteboard.withUniqueName(); defer { pasteboard.releaseGlobally() }
+    editor.copyFragments(to: pasteboard); editor.cursor = 2; editor.pasteFragments(from: pasteboard)
+    try check(editor.project.tracks.flatMap(\.clips).filter { editor.selection.contains($0.id) }.allSatisfy { FragmentSettings($0) == FragmentSettings(edited) }, "Copied fragments retain volume, pan, fade lengths and curves")
+    settings.volumeDB = -100; settings.pan = 120; settings.fadeInMS = 0; settings.fadeOutMS = 0
+    let bounded = try settings.applying(to: original, peak: 0.5)
+    try check(bounded.volumeDB == -48 && bounded.pan == 90 && bounded.fadeInMS == 0, "Settings clamp volume and pan and allow disabling individual fades")
+    for curve in FadeCurve.allCases {
+        try check(curve.value(0) == 0 && curve.value(1) == 1 && curve.value(0.25) <= curve.value(0.75), "Fade curve \(curve.title) has valid monotonic endpoints")
+    }
+}
+
+func runTrackSoloTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderSolo-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory), url = store.freshURL()
+    try store.write(AudioSignal(channels: [Array(repeating: Float(0.2), count: 48_000), Array(repeating: Float(0.1), count: 48_000)]), to: url)
+    let clip = Clip(name: "Solo", source: url.path, start: 0, duration: 1, order: 1)
+    let effect = PluginEffect(name: "Gain", path: "test", classID: "gain")
+    let parent = Track(name: "Parent", clips: [clip], effects: [effect])
+    var child = Track(name: "Child", parent: parent.id, clips: [clip])
+    var sibling = Track(name: "Sibling", clips: [clip])
+    child.solo = true
+    store.processEffects = { samples, effects in effects.isEmpty ? samples : samples.map { $0 * 0.5 } }
+    func level(_ tracks: [Track]) throws -> Float { try store.renderAudio(Project(tracks: tracks)).channels[0][2000] }
+    try check(abs(try level([parent, child, sibling]) - 0.1) < 1e-6, "Child Solo retains ancestor effects but excludes ancestor fragments and sibling tracks")
+    sibling.solo = true
+    try check(abs(try level([parent, child, sibling]) - 0.3) < 1e-6, "Multiple Solo tracks are mixed together in export")
+    var soloParent = parent; soloParent.solo = true; child.solo = false; sibling.solo = false
+    try check(abs(try level([soloParent, child, sibling]) - 0.2) < 1e-6, "Parent Solo includes its subtree while excluding other roots")
+    var muted = soloParent; muted.muted = true
+    try check(try level([muted, child, sibling]) == 0, "Mute overrides Solo and silences the muted parent subtree")
+    let graph = try StreamingGraph(project: Project(tracks: [parent, child, sibling]), store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0.map { $0 * 0.5 } } }
+    _ = try graph.render(frames: 512)
+    graph.setSolo([child.id])
+    try check(abs(try graph.render(frames: 128)[0] - 0.1) < 1e-6, "Live Solo switches the next block without rebuilding playback or resetting effects")
+    graph.setSolo([child.id, sibling.id])
+    try check(abs(try graph.render(frames: 128)[0] - 0.3) < 1e-6, "Live multiple Solo preserves both selected tracks")
+    graph.setSolo([])
+    try check(abs(try graph.render(frames: 128)[0] - 0.4) < 1e-6, "Clearing the last Solo restores all unmuted tracks")
+    let initial = try StreamingGraph(project: Project(tracks: [soloParent, child, sibling]), store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0.map { $0 * 0.5 } } }
+    try check(abs(try initial.render(frames: 512)[1000] - 0.2) < 1e-6, "Solo saved before Play is active in the initial streaming graph")
+    let encoded = try JSONEncoder().encode(soloParent)
+    try check(try JSONDecoder().decode(Track.self, from: encoded).solo, "Solo persists in project track data")
+    var legacy = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]; legacy.removeValue(forKey: "solo")
+    try check(try !JSONDecoder().decode(Track.self, from: JSONSerialization.data(withJSONObject: legacy)).solo, "Legacy projects default every track to Solo off")
+    let editor = Editor(store: store); editor.project = Project(tracks: [parent, child, sibling])
+    editor.toggleSolo(child.id); editor.toggleSolo(sibling.id)
+    try check(editor.project.tracks.filter(\.solo).count == 2, "Solo toggles independently without clearing existing Solo tracks")
+    editor.undo(); try check(editor.project.tracks.filter(\.solo).map(\.id) == [child.id], "Solo supports one-step Undo")
+    editor.redo(); try check(editor.project.tracks.filter(\.solo).count == 2, "Solo supports Redo")
 }

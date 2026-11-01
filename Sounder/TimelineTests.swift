@@ -365,7 +365,8 @@ extension AppDelegate {
         try check(Set(editor.project.tracks[2].clips.map(\.id)) == [a.id, c.id] && editor.project.tracks[3].clips.contains(where: { $0.id == b.id }) && editor.project.tracks[3].clips.contains(where: { $0.id == fixed.id }), "Group moves preserve row offsets at the bottom and retain destination audio")
         editor.undo()
         send(.leftMouseDown, time: 3.25, row: 1, shift: true); send(.leftMouseDragged, time: 4.25, row: 1, shift: true); send(.leftMouseUp, time: 4.25, row: 1, shift: true)
-        try check(!editor.selection.contains(b.id) && clip(a.id).start == 1 && clip(b.id).start == 3, "Shift-deselecting a fragment does not accidentally drag the remaining group")
+        try check(editor.selection == selected && clip(a.id).start == 2 && clip(b.id).start == 4, "Shift-drag retains the group while moving freely")
+        editor.undo()
         editor.selection = selected
         let beforeCopy = editor.undoStack.count
         send(.leftMouseDown, time: 1.5, row: 0, command: true); send(.leftMouseDragged, time: 2.5, row: 1, command: true)
@@ -402,32 +403,32 @@ extension AppDelegate {
         func perform(_ item: NSMenuItem) { _ = NSApp.sendAction(item.action!, to: item.target, from: item) }
         func order() -> [UUID] { editor.project.tracks[0].clips.sorted { $0.order < $1.order }.map(\.id) }
         let bottom = menu(time: 2, y: timeline.ruler + 9)!
-        try check(bottom.items.map(\.title) == ["Move up", "Move down", "Normalize…", "Mute", "Delete"] && bottom.items[0].isEnabled && !bottom.items[1].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
+        try check(bottom.items.map(\.title) == ["Edit…", "Move up", "Move down", "Normalize…", "Mute", "Delete"] && bottom.items[1].isEnabled && !bottom.items[2].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
         let history = editor.undoStack.count
-        perform(bottom.items[0])
+        perform(bottom.items[1])
         try check(order() == [middle.id, lower.id, upper.id, isolated.id] && editor.undoStack.count == history + 1, "Move up raises the context fragment exactly one overlapping level and leaves other relative ordering intact")
-        perform(bottom.items[0])
+        perform(bottom.items[1])
         let top = menu(time: 2, y: timeline.ruler + 25)!
-        try check(!top.items[0].isEnabled && top.items[1].isEnabled && editor.selection == [lower.id], "Top layer disables Move up and enables Move down")
-        perform(top.items[1])
+        try check(!top.items[1].isEnabled && top.items[2].isEnabled && editor.selection == [lower.id], "Top layer disables Move up and enables Move down")
+        perform(top.items[2])
         try check(order() == [middle.id, lower.id, upper.id, isolated.id], "Move down lowers the selected fragment exactly one overlapping level")
         editor.undo(); try check(order() == [middle.id, upper.id, lower.id, isolated.id], "Undo restores the previous layer priority")
         editor.redo()
         let alone = menu(time: 7.5, y: timeline.ruler + 25)!
-        try check(!alone.items[0].isEnabled && !alone.items[1].isEnabled, "Both layer actions are disabled for an isolated fragment")
+        try check(!alone.items[1].isEnabled && !alone.items[2].isEnabled, "Both layer actions are disabled for an isolated fragment")
         editor.selection.insert(upper.id)
-        perform(alone.items[4])
+        perform(alone.items[5])
         try check(editor.project.tracks[0].clips.count == 3 && !editor.project.tracks[0].clips.contains(where: { $0.id == isolated.id }) && editor.project.tracks[0].clips.contains(where: { $0.id == upper.id }), "Context Delete removes only its fragment even when another fragment is selected")
         editor.undo(); try check(editor.project.tracks[0].clips.count == 4, "Context fragment deletion can be undone")
         try check(menu(time: 6, y: timeline.ruler + 25) == nil, "Empty fragment space does not open the track menu")
         editor.selection = [lower.id, upper.id]
         let group = menu(time: 2, y: timeline.ruler + 25)!
-        try check(editor.selection == [lower.id, upper.id] && !group.items[0].isEnabled && group.items[1].isEnabled, "Right-clicking a selected fragment preserves the group and enables layer actions for the whole selection")
+        try check(editor.selection == [lower.id, upper.id] && !group.items[1].isEnabled && group.items[2].isEnabled, "Right-clicking a selected fragment preserves the group and enables layer actions for the whole selection")
         let groupHistory = editor.undoStack.count
-        perform(group.items[1])
+        perform(group.items[2])
         try check(order() == [lower.id, upper.id, middle.id, isolated.id] && editor.selection == [lower.id, upper.id] && editor.undoStack.count == groupHistory + 1, "Group Move down moves selected layers together without swapping them and creates one Undo step")
         editor.undo(); editor.redo(); editor.undo()
-        perform(group.items[4])
+        perform(group.items[5])
         try check(Set(editor.project.tracks[0].clips.map(\.id)) == [middle.id, isolated.id], "Context Delete removes every selected fragment and preserves unselected audio")
         editor.undo()
         var secondLower = lower; secondLower.id = UUID(); secondLower.order = 10
@@ -435,12 +436,12 @@ extension AppDelegate {
         editor.project.tracks.append(Track(name: "Other layers", clips: [secondLower, secondUpper])); refresh()
         editor.selection = [lower.id, secondLower.id]
         let across = menu(time: 2, y: timeline.ruler + 11)!
-        try check(editor.selection == [lower.id, secondLower.id] && across.items[0].isEnabled, "Context selection is retained across different tracks")
+        try check(editor.selection == [lower.id, secondLower.id] && across.items[1].isEnabled, "Context selection is retained across different tracks")
         let batchHistory = editor.undoStack.count
-        perform(across.items[0])
+        perform(across.items[1])
         try check(order() == [middle.id, upper.id, lower.id, isolated.id] && editor.project.tracks[1].clips.sorted(by: { $0.order < $1.order }).last?.id == secondLower.id && editor.undoStack.count == batchHistory + 1, "One menu action changes layers on every selected track with one Undo step")
         editor.undo()
-        perform(across.items[4])
+        perform(across.items[5])
         try check(!editor.project.tracks.flatMap(\.clips).contains(where: { $0.id == lower.id || $0.id == secondLower.id }) && editor.project.tracks[1].clips.first?.id == secondUpper.id, "Group context deletion applies across tracks")
         editor.undo()
         editor.selection = [lower.id, upper.id]
@@ -585,5 +586,149 @@ extension AppDelegate {
         editor.redo()
         editor.project = original; editor.selection = []; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
         print("PASS: context Mute applies to the group, becomes Unmute, toolbar toggles it, no toasts appear, and Undo/Redo works")
+    }
+}
+
+extension AppDelegate {
+    func verifyFragmentSettingsUI() throws {
+        let original = editor.project, clip = editor.project.tracks[0].clips[0]
+        window.makeFirstResponder(timeline)
+        var opened = 0, failure: String?
+        fragmentDialogAutomation = { dialog in
+            opened += 1
+            if dialog.volumeSlider.minValue != -48 || dialog.volumeSlider.maxValue > 24 || dialog.panSlider.minValue != -90 || dialog.panSlider.maxValue != 90 { failure = "Fragment settings slider limits are incorrect" }
+            dialog.volume.stringValue = "24"; dialog.pan.stringValue = "-30"
+            dialog.fadeIn.stringValue = "40"; dialog.fadeOut.stringValue = "60"
+            dialog.inCurve.selectItem(at: FadeCurve.allCases.firstIndex(of: .exponential)!)
+            dialog.outCurve.selectItem(at: FadeCurve.allCases.firstIndex(of: .logarithmic)!)
+            dialog.alert.buttons[0].performClick(nil)
+        }
+        let point = NSPoint(x: timeline.header + (clip.start + 1) * editor.zoom, y: timeline.ruler + 30)
+        func event(_ type: NSEvent.EventType, clicks: Int) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
+        }
+        timeline.mouseDown(with: event(.leftMouseDown, clicks: 1)); timeline.mouseUp(with: event(.leftMouseUp, clicks: 1))
+        guard opened == 0 else { throw SounderError.message("A single click unexpectedly opened fragment settings") }
+        let history = editor.undoStack.count
+        timeline.mouseDown(with: event(.leftMouseDown, clicks: 2)); timeline.mouseUp(with: event(.leftMouseUp, clicks: 2))
+        if let failure { throw SounderError.message(failure) }
+        let edited = editor.project.tracks[0].clips[0]
+        let raw = try editor.audio.load(edited.source), peak = FragmentNormalization.peak(for: edited, data: raw, sampleRate: editor.audio.sampleRate)
+        guard opened == 1, edited.volumeDB <= (try FragmentSettings.maximumVolume(clip: clip, peak: peak)), edited.pan == -30, edited.fadeInMS == 40, edited.fadeOutMS == 60, edited.fadeInCurve == .exponential, edited.fadeOutCurve == .logarithmic, editor.undoStack.count == history + 1 else { throw SounderError.message("Double-click settings did not save bounded volume, pan and fades") }
+        fragmentDialogAutomation = { dialog in
+            opened += 1
+            if dialog.pan.stringValue != "-30" || dialog.fadeIn.stringValue != "40" { failure = "Edit did not restore saved fragment settings" }
+            dialog.pan.stringValue = "90"; dialog.alert.buttons[1].performClick(nil)
+        }
+        let menu = timeline.menu(for: event(.rightMouseDown, clicks: 1))!
+        guard let edit = menu.items.first(where: { $0.title == "Edit…" }) else { throw SounderError.message("No Edit in fragment context menu") }
+        _ = NSApp.sendAction(edit.action!, to: edit.target, from: edit)
+        if let failure { throw SounderError.message(failure) }
+        guard opened == 2, FragmentSettings(editor.project.tracks[0].clips[0]) == FragmentSettings(edited), editor.undoStack.count == history + 1 else { throw SounderError.message("Context Edit cancellation changed settings or history") }
+        fragmentDialogAutomation = nil; editor.undo()
+        guard editor.project.tracks[0].clips[0].volumeDB == clip.volumeDB else { throw SounderError.message("Fragment settings Undo failed") }
+        editor.project = original; editor.selection = []; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+        print("PASS: single click selects, double click and context Edit open settings, volume is peak-limited, Save persists all fields and Cancel/Undo work")
+    }
+}
+
+extension AppDelegate {
+    func verifyTempoSnappingUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        var a = original.tracks[0].clips[0]; a.start = 0.5; a.offset = 0.5; a.duration = 4
+        var b = a; b.id = UUID(); b.start = 3; b.offset = 0; b.duration = 0.5
+        editor.project = Project(tracks: [Track(name: "Bars", clips: [a]), Track(name: "Group", clips: [b])], tempo: 120, tempoMode: true)
+        editor.selection = [a.id, b.id]; editor.zoom = 70; refresh()
+        let scroll = timeline.enclosingScrollView!
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        func send(_ type: NSEvent.EventType, _ time: Double, shift: Bool = false, command: Bool = false) {
+            let point = NSPoint(x: timeline.header + time * editor.zoom, y: timeline.ruler + 30)
+            var flags: NSEvent.ModifierFlags = []; if shift { flags.insert(.shift) }; if command { flags.insert(.command) }
+            if type == .flagsChanged {
+                let event = NSEvent.keyEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56)!
+                timeline.flagsChanged(with: event); return
+            }
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            if type == .leftMouseDown { timeline.mouseDown(with: event) }
+            else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
+            else { timeline.mouseUp(with: event) }
+        }
+        func clip(_ id: UUID) -> Clip { editor.project.tracks.flatMap(\.clips).first { $0.id == id }! }
+        send(.leftMouseDown, 1.5); send(.leftMouseDragged, 2.7)
+        try check(clip(a.id).start == 1.5 && clip(b.id).start == 4 && timeline.fragmentSnapTime == 1.5, "Tempo group movement changes all start positions by one-beat steps from the original offset")
+        send(.flagsChanged, 2.7, shift: true)
+        try check(abs(clip(a.id).start - 1.7) < 1e-9 && abs(clip(b.id).start - 4.2) < 1e-9, "Pressing Shift mid-drag immediately restores free group movement")
+        send(.flagsChanged, 2.7)
+        try check(clip(a.id).start == 1.5, "Releasing Shift immediately restores beat steps")
+        send(.leftMouseUp, 2.7); editor.undo()
+        send(.leftMouseDown, 1.5, shift: true); send(.leftMouseDragged, 2.2, shift: true); send(.leftMouseUp, 2.2, shift: true)
+        try check(abs(clip(a.id).start - 1.2) < 1e-9 && editor.selection == [a.id, b.id], "Holding Shift before the drag bypasses beats without deselecting the group")
+        editor.undo()
+        send(.leftMouseDown, 1.5); send(.leftMouseDragged, 0.2); send(.leftMouseUp, 0.2)
+        try check(clip(a.id).start == 0 && clip(b.id).start == 2.5, "Whole-beat movement clamps the group without fractional shifts before timeline zero")
+        editor.undo(); editor.selection = [a.id]
+        let history = editor.undoStack.count
+        send(.leftMouseDown, 0.5 + 1 / editor.zoom); send(.leftMouseUp, 0.5 + 1 / editor.zoom)
+        try check(clip(a.id).start == 0.5 && editor.undoStack.count == history, "Clicking an off-grid edge does not resize or snap it")
+        send(.leftMouseDown, 0.5 + 1 / editor.zoom); send(.leftMouseDragged, 1.2 + 1 / editor.zoom)
+        try check(timeline.resizedFragment?.start == 1 && timeline.resizedFragment?.end == 4.5 && timeline.resizedFragment?.offset == 1, "Left resize aligns to an absolute beat boundary while retaining the right edge and source alignment")
+        send(.flagsChanged, 1.2, shift: true)
+        try check(abs((timeline.resizedFragment?.start ?? 0) - 1.2) < 1e-9, "Shift switches an active edge resize to free timing")
+        send(.flagsChanged, 1.2)
+        try check(timeline.resizedFragment?.start == 1, "Releasing Shift snaps the edge back to a beat")
+        send(.leftMouseUp, 1.2 + 1 / editor.zoom); editor.undo()
+        send(.leftMouseDown, 4.5 - 1 / editor.zoom); send(.leftMouseDragged, 5.2 - 1 / editor.zoom); send(.leftMouseUp, 5.2 - 1 / editor.zoom)
+        try check(clip(a.id).end == 5 && clip(a.id).start == 0.5, "Right resize aligns to a beat without moving the left edge")
+        editor.undo()
+        send(.leftMouseDown, 4.5 - 1 / editor.zoom, shift: true); send(.leftMouseDragged, 5.2 - 1 / editor.zoom, shift: true); send(.leftMouseUp, 5.2 - 1 / editor.zoom, shift: true)
+        try check(abs(clip(a.id).end - 5.2) < 1e-9, "Shift-held right resize remains free from the start of the gesture")
+        editor.undo()
+        send(.leftMouseDown, 4.5 - 1 / editor.zoom); send(.leftMouseDragged, 12); send(.leftMouseUp, 12)
+        try check(clip(a.id).end == 8 && clip(a.id).offset + clip(a.id).duration == 8, "Beat resizing cannot extend beyond the original recording")
+        editor.undo(); scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        send(.leftMouseDown, 1.5, command: true); send(.leftMouseDragged, 2.7, command: true); send(.leftMouseUp, 2.7, command: true)
+        let copies = editor.project.tracks.flatMap(\.clips).filter { editor.selection.contains($0.id) }
+        try check(copies.count == 1 && copies[0].start == 1.5 && clip(a.id).start == 0.5, "Command-drag copies follow the same Tempo beat steps")
+        editor.undo(); editor.project.tempoMode = false; editor.selection = [a.id]
+        send(.leftMouseDown, 1.5); send(.leftMouseDragged, 2.2); send(.leftMouseUp, 2.2)
+        try check(abs(clip(a.id).start - 1.2) < 1e-9, "Time mode keeps the ordinary free movement behavior")
+        editor.undo(); editor.project = original; editor.selection = []; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+    }
+}
+
+extension AppDelegate {
+    func verifyTrackSoloUI() throws {
+        let original = editor.project
+        defer { editor.stop(); editor.project = original; editor.dirty = false; refresh() }
+        let root = Track(name: "Solo root", clips: Array(original.tracks[0].clips.prefix(1)))
+        let child = Track(name: "Solo child", parent: root.id)
+        let grandchild = Track(name: "Solo grandchild", parent: child.id)
+        editor.project = Project(tracks: [root, child, grandchild]); refresh()
+        for row in 0..<3 {
+            let solo = timeline.trackSoloRect(row: row, depth: row)
+            guard solo.minX > timeline.trackMuteRect(row: row, depth: row).maxX,
+                  solo.maxX < timeline.trackFXRect(row: row, depth: row).minX,
+                  timeline.trackFXRect(row: row, depth: row).maxX < timeline.fragmentLeft else { throw SounderError.message("Solo/Mute/FX overlap in nested headers") }
+            let point = timeline.convert(NSPoint(x: solo.midX, y: solo.midY), to: nil)
+            let event = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            timeline.mouseDown(with: event)
+            guard editor.project.tracks[row].solo else { throw SounderError.message("Solo button did not activate") }
+        }
+        guard editor.project.tracks.allSatisfy(\.solo) else { throw SounderError.message("Solo cleared another track") }
+        editor.seek(to: 2); editor.playPause()
+        guard let playback = editor.player else { throw SounderError.message("Solo UI playback did not start") }
+        let messages = editor.notifications.messages.count
+        for row in 0..<3 {
+            let rect = timeline.trackSoloRect(row: row, depth: row)
+            let event = NSEvent.mouseEvent(with: .leftMouseDown, location: timeline.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            timeline.mouseDown(with: event)
+            guard !editor.project.tracks[row].solo, editor.isPlaying, editor.player === playback else { throw SounderError.message("Solo must toggle during playback without replacing the stream") }
+        }
+        guard editor.notifications.messages.count == messages else { throw SounderError.message("Solo toggles must remain silent") }
+        print("PASS: Live Solo buttons toggle without replacing playback or emitting notifications")
+        print("PASS: Solo buttons sit between MUTE and FX at every nesting depth and independently activate multiple tracks")
     }
 }

@@ -213,7 +213,9 @@ extension AppDelegate {
         editor.range = 2...5
         send(.leftMouseDown, 3, y: fragmentY); send(.leftMouseUp, 3, y: fragmentY)
         try check(editor.range == 2...5, "A single fragment click preserves the range")
+        fragmentDialogAutomation = { $0.alert.buttons[1].performClick(nil) }
         send(.leftMouseDown, 3, clicks: 2, y: fragmentY); send(.leftMouseUp, 3, clicks: 2, y: fragmentY)
+        fragmentDialogAutomation = nil
         try check(editor.range == nil, "A double fragment click clears the range")
         editor.seek(to: 1); editor.playPause()
         guard let playback = editor.player else { throw SounderError.message("Range UI playback did not start") }

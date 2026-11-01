@@ -86,6 +86,29 @@ final class InlineNameField: NSTextField, NSTextFieldDelegate {
 }
 
 final class Timeline: NSView {
+    private var fragmentWaveforms: [UUID: (FragmentWaveformKey, [[Float]])] = [:]
+    private var waveformJobs: [UUID: (FragmentWaveformKey, Progress)] = [:]
+    private let waveformQueue = DispatchQueue(label: "Sounder.fragment-waveforms", qos: .userInitiated)
+    private func processedWaveform(_ clip: Clip, audio: AudioData) -> [[Float]]? {
+        let rate = editor.audio.sampleRate, channels = editor.project.audioFormat.channels
+        let key = FragmentWaveformKey(clip, rate: rate, channels: channels)
+        if let cached = fragmentWaveforms[clip.id], cached.0 == key { return cached.1 }
+        if waveformJobs[clip.id]?.0 != key {
+            waveformJobs[clip.id]?.1.cancel()
+            let cancellation = Progress(totalUnitCount: 1)
+            waveformJobs[clip.id] = (key, cancellation)
+            waveformQueue.async { [weak self] in
+                guard let peaks = FragmentWaveform.peaks(audio, clip: clip, rate: rate, channels: channels, cancelled: { cancellation.isCancelled }) else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !cancellation.isCancelled, self.waveformJobs[clip.id]?.0 == key else { return }
+                    self.fragmentWaveforms[clip.id] = (key, peaks)
+                    self.waveformJobs.removeValue(forKey: clip.id)
+                    self.needsDisplay = true
+                }
+            }
+        }
+        return nil
+    }
     let editor: Editor
     let header: CGFloat = 220
     let rowHeight: CGFloat = 116 / 1.5
@@ -93,6 +116,9 @@ final class Timeline: NSView {
     var rows: [(Track, Int)] = []
     var dragClip: UUID?
     private var pendingFragmentClick: UUID?
+    private var pendingShiftFragmentClick: UUID?
+    private var lastFragmentDragPoint: NSPoint?
+    private var didResizeFragment = false
     var dragStart = NSPoint.zero
     var originalStart = 0.0
     var dragTrack: UUID?
@@ -218,6 +244,9 @@ final class Timeline: NSView {
     }
     func refresh() {
         rows = orderedRows(trackPreview ?? editor.project.tracks)
+        let retained = Set(editor.project.tracks.flatMap(\.clips).map(\.id)).union(fragmentCopyPreviews.values.map(\.id))
+        fragmentWaveforms = fragmentWaveforms.filter { retained.contains($0.key) }
+        for id in Array(waveformJobs.keys) where !retained.contains(id) { waveformJobs.removeValue(forKey: id)?.1.cancel() }
         window?.invalidateCursorRects(for: self)
         let visible = viewportSize
         editor.zoom = max(minimumZoom, editor.zoom)
@@ -263,17 +292,23 @@ final class Timeline: NSView {
         }
         return best.map { ($0.start, Optional($0.guide)) } ?? (start, nil)
     }
-    private func updateFragmentMove(at point: NSPoint) {
+    private func updateFragmentMove(at point: NSPoint, flags: NSEvent.ModifierFlags) {
         guard let id = dragClip, let anchor = movingFragments.first(where: { $0.clip.id == id }),
               let requested = dropTrack(at: point), let targetRow = rows.firstIndex(where: { $0.0.id == requested }),
               let firstRow = movingFragments.map({ $0.row }).min(), let lastRow = movingFragments.map({ $0.row }).max() else { return }
         let rowDelta = max(-firstRow, min(targetRow - anchor.row, rows.count - 1 - lastRow))
         fragmentDestinations = Dictionary(uniqueKeysWithValues: movingFragments.map { ($0.clip.id, rows[$0.row + rowDelta].0.id) })
         dragDestination = fragmentDestinations[id]
-        let position = snappedFragmentPosition(originalStart + (point.x - dragStart.x) / editor.zoom,
-                                               clip: anchor.clip, destination: dragDestination)
-        fragmentSnapTime = position.guide
-        let delta = position.start - originalStart
+        lastFragmentDragPoint = point
+        let proposedDelta = (point.x - dragStart.x) / editor.zoom
+        let delta: Double
+        if editor.project.tempoMode && !flags.contains(.shift) {
+            delta = TempoGrid.snappedMove(delta: proposedDelta, earliestStart: movingFragments.map { $0.clip.start }.min() ?? originalStart, bpm: editor.project.tempo)
+            fragmentSnapTime = originalStart + delta
+        } else {
+            let position = snappedFragmentPosition(originalStart + proposedDelta, clip: anchor.clip, destination: dragDestination)
+            delta = position.start - originalStart; fragmentSnapTime = position.guide
+        }
         for original in movingFragments {
             if let i = editor.project.tracks.firstIndex(where: { $0.id == original.track }),
                let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == original.clip.id }) {
@@ -314,12 +349,29 @@ final class Timeline: NSView {
     }
     @discardableResult func cancelFragmentResize() -> Bool {
         guard fragmentResize != nil else { return false }
-        fragmentResize = nil; resizedFragment = nil; pendingFragmentClick = nil; refresh(); return true
+        fragmentResize = nil; resizedFragment = nil; pendingFragmentClick = nil; didResizeFragment = false; lastFragmentDragPoint = nil; refresh(); return true
     }
-    private func updateFragmentResize(at point: NSPoint) {
+    private func updateFragmentResize(at point: NSPoint, flags: NSEvent.ModifierFlags) {
         guard let resize = fragmentResize else { return }
-        resizedFragment = resize.original.resized(leftEdge: resize.leftEdge, by: (point.x - dragStart.x) / editor.zoom, sourceDuration: resize.sourceDuration)
+        lastFragmentDragPoint = point
+        var delta = (point.x - dragStart.x) / editor.zoom
+        if editor.project.tempoMode && !flags.contains(.shift) {
+            let clip = resize.original, minimum = min(Clip.minimumDuration, clip.duration, resize.sourceDuration)
+            let edge = resize.leftEdge ? clip.start : clip.end
+            let lower = resize.leftEdge ? max(0, clip.start - clip.offset) : clip.start + minimum
+            let upper = resize.leftEdge ? clip.end - minimum : clip.start + resize.sourceDuration - clip.offset
+            guard lower <= upper, let snapped = TempoGrid.snappedEdge(time: edge + delta, bounds: lower...upper, bpm: editor.project.tempo) else { resizedFragment = clip; refresh(); return }
+            delta = snapped - edge
+        }
+        resizedFragment = resize.original.resized(leftEdge: resize.leftEdge, by: delta, sourceDuration: resize.sourceDuration)
         refresh()
+    }
+    override func flagsChanged(with event: NSEvent) {
+        if let point = lastFragmentDragPoint, !editor.busy {
+            if fragmentResize != nil && didResizeFragment { updateFragmentResize(at: point, flags: event.modifierFlags) }
+            else if dragClip != nil && didCheckpoint { updateFragmentMove(at: point, flags: event.modifierFlags) }
+        }
+        super.flagsChanged(with: event)
     }
     func trackNameRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
@@ -337,9 +389,12 @@ final class Timeline: NSView {
     func trackMuteRect(row: Int, depth: Int) -> NSRect {
         NSRect(x: pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18, y: ruler + CGFloat(row) * rowHeight + 42, width: 46, height: 23)
     }
+    func trackSoloRect(row: Int, depth: Int) -> NSRect {
+        trackMuteRect(row: row, depth: depth).offsetBy(dx: 54, dy: 0)
+    }
     func trackFXRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
-        return NSRect(x: min(fragmentLeft - 72, x + 54), y: ruler + CGFloat(row) * rowHeight + 42, width: 46, height: 23)
+        return NSRect(x: min(fragmentLeft - 54, x + 108), y: ruler + CGFloat(row) * rowHeight + 42, width: 46, height: 23)
     }
     func rangeHandleRects() -> [NSRect] {
         guard let range = editor.range else { return [] }
@@ -385,9 +440,10 @@ final class Timeline: NSView {
             let depth = item.1
             for (rect, cursor) in [(trackNameHitRect(row: row, depth: depth), NSCursor.iBeam),
                                    (trackMuteRect(row: row, depth: depth), NSCursor.pointingHand),
+                                   (trackSoloRect(row: row, depth: depth), NSCursor.pointingHand),
                                    (trackFXRect(row: row, depth: depth), NSCursor.pointingHand)] {
                 let visible = rect.intersection(visibleTrackRect)
-                if !visible.isEmpty && (!editor.busy || ((rect == trackFXRect(row: row, depth: depth) || rect == trackMuteRect(row: row, depth: depth)) && !editor.isRecording && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
+                if !visible.isEmpty && (!editor.busy || ((rect == trackFXRect(row: row, depth: depth) || rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
             }
         }
     }
@@ -416,7 +472,7 @@ final class Timeline: NSView {
         }
         nameField.frame = frame
     }
-    func drawWaveform(_ peaks: [Float], partialPeak: Float? = nil, sampleRate: Double, offset: Double, gain: Double = 1, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
+    func drawWaveform(_ peaks: [Float], partialPeak: Float? = nil, sampleRate: Double, offset: Double, gain: Double = 1, fragment: Clip? = nil, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
         let top = rect.minY + 1, bottom = rect.maxY - 1
         let mid = (top + bottom) / 2, amplitude = max(1, (bottom - top) / 2)
         let lowX = max(rect.minX, dirtyRect.minX), highX = min(rect.maxX, dirtyRect.maxX)
@@ -428,12 +484,20 @@ final class Timeline: NSView {
             let last = min(count, max(first + 1, Int((seconds + 2 / editor.zoom) * sampleRate) / 128))
             var peak: Float = 0
             if first < last { for index in first..<last { peak = max(peak, index < peaks.count ? peaks[index] : (partialPeak ?? 0)) } }
-            let h = CGFloat(min(1, Double(peak) * gain)) * amplitude
+            var envelope = 1.0
+            if let fragment {
+                let frames = Int(fragment.duration * sampleRate), relative = (x - rect.minX) / editor.zoom * sampleRate
+                let (first, last) = fragment.fadeLengths(frames: frames, sampleRate: sampleRate)
+                let incoming = fragment.fadeInBaked || first == 0 ? 1 : fragment.fadeInCurve.value(relative / first)
+                let outgoing = fragment.fadeOutBaked || last == 0 ? 1 : fragment.fadeOutCurve.value((Double(frames - 1) - relative) / last)
+                envelope = min(incoming, outgoing)
+            }
+            let h = CGFloat(min(1, Double(peak) * gain * envelope)) * amplitude
             path.move(to: NSPoint(x: x, y: mid - h)); path.line(to: NSPoint(x: x, y: mid + max(0.4, h)))
         }
         color.setStroke(); path.stroke()
     }
-    func drawChannelWaveforms(_ peaks: [[Float]], partialPeaks: [Float?] = [], sampleRate: Double, offset: Double, gain: Double = 1, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
+    func drawChannelWaveforms(_ peaks: [[Float]], partialPeaks: [Float?] = [], sampleRate: Double, offset: Double, gain: Double = 1, fragment: Clip? = nil, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
         let count = min(2, peaks.count)
         guard count > 0 else { return }
         let top = rect.minY + 2, bottom = rect.maxY - 2
@@ -441,7 +505,7 @@ final class Timeline: NSView {
         let height = max(0, (bottom - top - gap) / CGFloat(count))
         for channel in 0..<count {
             let lane = NSRect(x: rect.minX, y: top + CGFloat(channel) * (height + gap), width: rect.width, height: height)
-            drawWaveform(peaks[channel], partialPeak: partialPeaks.indices.contains(channel) ? partialPeaks[channel] : nil, sampleRate: sampleRate, offset: offset, gain: gain, in: lane, dirtyRect: dirtyRect, color: color)
+            drawWaveform(peaks[channel], partialPeak: partialPeaks.indices.contains(channel) ? partialPeaks[channel] : nil, sampleRate: sampleRate, offset: offset, gain: gain * (count > 1 ? (fragment?.panGain(channel: channel, channels: editor.project.audioFormat.channels) ?? 1) : 1), fragment: fragment, in: lane, dirtyRect: dirtyRect, color: color)
         }
         if count == 2 {
             let y = top + height + gap / 2
@@ -458,8 +522,19 @@ final class Timeline: NSView {
         }
         NSGraphicsContext.restoreGraphicsState()
     }
+    private func dimmedTrackIDs() -> Set<UUID> {
+        let tracks = trackPreview ?? editor.project.tracks
+        var dimmed = Set(tracks.filter(\.muted).map(\.id))
+        var previous: Set<UUID> = []
+        while previous != dimmed {
+            previous = dimmed
+            for track in tracks where track.parent.map({ dimmed.contains($0) }) == true { dimmed.insert(track.id) }
+        }
+        return dimmed.union(Set(tracks.map(\.id)).subtracting(TrackSoloRouting(tracks: tracks).dry))
+    }
     override func draw(_ dirtyRect: NSRect) {
         fill(bounds, background)
+        let dimmed = dimmedTrackIDs()
         for tick in rulerTicks(in: dirtyRect) {
             let x = header + tick.time * editor.zoom
             let alpha = editor.project.tempoMode ? (tick.isBar ? 0.10 : 0.035) : 0.045
@@ -467,6 +542,7 @@ final class Timeline: NSView {
         }
         for (index, item) in rows.enumerated() {
             let track = item.0; let y = ruler + CGFloat(index) * rowHeight
+            let trackDimmed = dimmed.contains(track.id)
             if !NSRect(x: 0, y: y, width: bounds.width, height: rowHeight).intersects(dirtyRect) { continue }
             let color = trackColors[index % trackColors.count]
             line(NSPoint(x: 0, y: y + rowHeight), NSPoint(x: bounds.width, y: y + rowHeight), .white.withAlphaComponent(0.065))
@@ -476,14 +552,18 @@ final class Timeline: NSView {
                 let rect = clipRect(clip, row: index, layer: overlaps)
                 guard rect.intersects(dirtyRect) else { continue }
                 fill(rect.offsetBy(dx: 0, dy: 3), .black.withAlphaComponent(0.4), radius: 6)
-                fill(rect, color.blended(withFraction: clip.muted ? 0.92 : 0.78, of: background)!, radius: 6)
+                fill(rect, color.blended(withFraction: trackDimmed || clip.muted ? 0.92 : 0.78, of: background)!, radius: 6)
                 let outline = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6); outline.lineWidth = editor.selection.contains(clip.id) ? 2 : 1
                 (editor.selection.contains(clip.id) ? color : color.withAlphaComponent(0.45)).setStroke(); outline.stroke()
                 NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
                 if let data = try? editor.audio.load(clip.source) {
-                    drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, gain: clip.gain, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(track.muted || clip.muted ? 0.25 : 0.9))
+                    if let peaks = processedWaveform(clip, audio: data) {
+                        drawChannelWaveforms(peaks, sampleRate: editor.audio.sampleRate, offset: 0, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(trackDimmed || clip.muted ? 0.25 : 0.9))
+                    } else {
+                        drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, gain: clip.volumeGain, fragment: clip, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(trackDimmed || clip.muted ? 0.25 : 0.9))
+                    }
                 }
-                drawFragmentTitle(clip.name, in: rect, color: clip.muted ? .secondaryLabelColor : color)
+                drawFragmentTitle(clip.name, in: rect, color: trackDimmed || clip.muted ? .secondaryLabelColor : color)
                 NSGraphicsContext.restoreGraphicsState()
             }
             if editor.isRecording && editor.recordingTrack == track.id {
@@ -522,6 +602,7 @@ final class Timeline: NSView {
         drawRuler(in: dirtyRect)
     }
     private func drawTrackHeaders(in dirtyRect: NSRect) {
+        let dimmed = dimmedTrackIDs()
         let column = NSRect(x: pinnedHeaderX, y: ruler, width: header, height: max(0, bounds.height - ruler))
         fill(column, panelColor)
         NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: column).addClip()
@@ -529,15 +610,19 @@ final class Timeline: NSView {
             let (track, depth) = item; let y = ruler + CGFloat(index) * rowHeight
             guard NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight).intersects(dirtyRect) else { continue }
             let selected = editor.selectedTrack == track.id
+            let trackDimmed = dimmed.contains(track.id)
             fill(NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight), selected ? NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.19, alpha: 1) : panelColor)
             let color = trackColors[index % trackColors.count]
-            fill(NSRect(x: pinnedHeaderX, y: y + 1, width: 3, height: rowHeight - 2), selected ? color : .clear)
+            fill(NSRect(x: pinnedHeaderX, y: y + 1, width: 3, height: rowHeight - 2), selected ? color.withAlphaComponent(trackDimmed ? 0.3 : 1) : .clear)
             let editing = renamingTrack == track.id && nameField.isRenaming
             let title = editing ? (depth > 0 ? "↳  " : "") : (depth > 0 ? "↳  \(track.name)" : track.name)
-            label(title, trackNameRect(row: index, depth: depth), size: 13, weight: .semibold)
+            label(title, trackNameRect(row: index, depth: depth), size: 13, color: trackDimmed ? .secondaryLabelColor : .labelColor, weight: .semibold)
             let muteRect = trackMuteRect(row: index, depth: depth)
             fill(muteRect, track.muted ? NSColor.systemOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
             label(track.muted ? "MUTED" : "MUTE", NSRect(x: muteRect.minX, y: muteRect.minY + 5, width: muteRect.width, height: 15), size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, weight: .semibold, alignment: .center)
+            let soloRect = trackSoloRect(row: index, depth: depth)
+            fill(soloRect, track.solo ? NSColor.systemBlue.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+            label("SOLO", NSRect(x: soloRect.minX, y: soloRect.minY + 5, width: soloRect.width, height: 15), size: 9, color: track.solo ? .systemBlue : .secondaryLabelColor, weight: .semibold, alignment: .center)
             let fxRect = trackFXRect(row: index, depth: depth)
             fill(fxRect, track.effects.isEmpty ? NSColor.white.withAlphaComponent(0.06) : color.withAlphaComponent(0.18), radius: 5)
             label("FX", NSRect(x: fxRect.minX, y: fxRect.minY + 5, width: fxRect.width, height: 15), size: 10, color: track.effects.isEmpty ? .secondaryLabelColor : color, weight: .semibold, alignment: .center)
@@ -591,7 +676,7 @@ final class Timeline: NSView {
     }
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        pendingFragmentClick = nil
+        pendingFragmentClick = nil; pendingShiftFragmentClick = nil; lastFragmentDragPoint = nil; didResizeFragment = false
         let point = convert(event.locationInWindow, from: nil)
         // A ruler press is only a seek once released without dragging.
         // Range selection and handle resizing never touch the transport.
@@ -613,6 +698,10 @@ final class Timeline: NSView {
                 editor.selectedTrack = rows[row].0.id
                 editor.toggleMute(rows[row].0.id); return
             }
+            if rows.indices.contains(row), trackSoloRect(row: row, depth: rows[row].1).contains(point) {
+                editor.selectedTrack = rows[row].0.id
+                editor.toggleSolo(rows[row].0.id); return
+            }
             if rows.indices.contains(row), trackFXRect(row: row, depth: rows[row].1).contains(point) {
                 editor.selectedTrack = rows[row].0.id; editor.update()
                 EffectsWindow(editor: editor, trackID: rows[row].0.id).run(); return
@@ -633,6 +722,8 @@ final class Timeline: NSView {
             }
             if trackMuteRect(row: row, depth: depth).contains(p) {
                 editor.toggleMute(track.id)
+            } else if trackSoloRect(row: row, depth: depth).contains(p) {
+                editor.toggleSolo(track.id)
             } else {
                 trackDrag = track.id
                 if trackNameHitRect(row: row, depth: depth).contains(p) { pendingTrackRename = track.id }
@@ -643,6 +734,10 @@ final class Timeline: NSView {
         for (layer, clip) in clips.enumerated().reversed() {
             let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
             if clipRect(clip, row: row, layer: overlaps).contains(p) {
+                if event.clickCount == 2, !editor.busy {
+                    editor.range = nil; editor.selection = [clip.id]; pendingFragmentClick = nil; editor.update()
+                    (NSApp.delegate as? AppDelegate)?.editFragment(clip.id); return
+                }
                 if !editor.busy, let edge = fragmentEdgeRects(clipRect(clip, row: row, layer: overlaps)).firstIndex(where: { $0.contains(p) }) {
                     do {
                         let duration = try editor.audio.sourceDuration(clip.source)
@@ -656,7 +751,7 @@ final class Timeline: NSView {
                 if !event.modifierFlags.contains(.shift) { pendingFragmentClick = clip.id }
                 if event.clickCount == 2 { editor.range = nil }
                 editor.seek(to: (p.x - header) / editor.zoom)
-                if event.modifierFlags.contains(.shift) { if editor.selection.contains(clip.id) { editor.selection.remove(clip.id) } else { editor.selection.insert(clip.id) } }
+                if event.modifierFlags.contains(.shift) { if editor.selection.contains(clip.id) { pendingShiftFragmentClick = clip.id } else { editor.selection.insert(clip.id) } }
                 else if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
                 if editor.selection.contains(clip.id) { editor.hint(.selectFragments, "Shift click to multi select") }
                 if !editor.busy && editor.selection.contains(clip.id) {
@@ -715,8 +810,9 @@ final class Timeline: NSView {
         let p = convert(event.locationInWindow, from: nil)
         if fragmentResize != nil {
             guard !editor.busy else { cancelFragmentResize(); return }
-            autoscrollRange(with: event)
-            updateFragmentResize(at: convert(event.locationInWindow, from: nil)); return
+            guard didResizeFragment || abs(p.x - dragStart.x) > 2 else { return }
+            didResizeFragment = true; autoscrollRange(with: event)
+            updateFragmentResize(at: convert(event.locationInWindow, from: nil), flags: event.modifierFlags); return
         }
         if marqueeAnchor != nil {
             guard canSelectRange else { cancelMarqueeSelection(); return }
@@ -746,7 +842,7 @@ final class Timeline: NSView {
                 editor.checkpoint(); didCheckpoint = true
             }
             if copyingFragments { NSCursor.dragCopy.set() }
-            updateFragmentMove(at: p)
+            updateFragmentMove(at: p, flags: event.modifierFlags)
         }
         if trackDrag != nil {
             let point = NSPoint(x: visibleRect.midX, y: p.y)
@@ -757,7 +853,7 @@ final class Timeline: NSView {
         let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
         if let resize = fragmentResize {
             if !editor.busy {
-                updateFragmentResize(at: p)
+                if didResizeFragment { updateFragmentResize(at: p, flags: event.modifierFlags) }
                 if let clip = resizedFragment,
                    clip.start != resize.original.start || clip.duration != resize.original.duration,
                    let i = editor.project.tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == clip.id }) }),
@@ -767,7 +863,7 @@ final class Timeline: NSView {
             }
             if let clip = resizedFragment, clip.start == resize.original.start, clip.duration == resize.original.duration,
                let id = pendingFragmentClick { editor.selection = [id] }
-            fragmentResize = nil; resizedFragment = nil; pendingFragmentClick = nil; editor.update(); return
+            fragmentResize = nil; resizedFragment = nil; pendingFragmentClick = nil; didResizeFragment = false; lastFragmentDragPoint = nil; editor.update(); return
         }
         if marqueeAnchor != nil {
             guard canSelectRange else { cancelMarqueeSelection(); return }
@@ -805,7 +901,7 @@ final class Timeline: NSView {
             }
             refresh()
         }
-        if dragClip != nil, didCheckpoint, !editor.busy { updateFragmentMove(at: p) }
+        if dragClip != nil, didCheckpoint, !editor.busy { updateFragmentMove(at: p, flags: event.modifierFlags) }
         if dragClip != nil, didCheckpoint, !editor.busy, copyingFragments {
             var copies = Set<UUID>()
             for original in movingFragments.sorted(by: { $0.clip.order < $1.clip.order }) {
@@ -831,8 +927,9 @@ final class Timeline: NSView {
             editor.selectedTrack = dragDestination ?? dragTrack; editor.update()
         }
         // Wait for mouse-up to distinguish a plain click from a group drag.
-        if !didCheckpoint, let id = pendingFragmentClick { editor.selection = [id]; editor.update() }
-        pendingFragmentClick = nil
+        if !didCheckpoint, let id = pendingShiftFragmentClick { editor.selection.remove(id); editor.update() }
+        else if !didCheckpoint, let id = pendingFragmentClick { editor.selection = [id]; editor.update() }
+        pendingFragmentClick = nil; pendingShiftFragmentClick = nil; lastFragmentDragPoint = nil
         if copyingFragments { NSCursor.arrow.set() }
         copyingFragments = false; fragmentCopyPreviews = [:]
         dragClip = nil; dragTrack = nil; dragDestination = nil; fragmentSnapTime = nil; movingFragments = []; fragmentDestinations = [:]
@@ -897,13 +994,16 @@ final class Timeline: NSView {
                 editor.update()
                 let menu = NSMenu(); menu.autoenablesItems = false
                 for (title, action, enabled) in [
+                    ("Edit…", #selector(editFragment(_:)), true),
                     ("Move up", #selector(moveFragmentUp(_:)), editor.canMoveFragmentLayers(editor.selection, up: true)),
                     ("Move down", #selector(moveFragmentDown(_:)), editor.canMoveFragmentLayers(editor.selection, up: false)),
                     ("Normalize…", #selector(normalizeFragments(_:)), true),
                     (editor.fragmentsAreMuted(editor.selection) ? "Unmute" : "Mute", #selector(muteFragments(_:)), true),
                     ("Delete", #selector(deleteFragment(_:)), true)] {
                     let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-                    item.target = self; item.representedObject = editor.selection; item.isEnabled = enabled; menu.addItem(item)
+                    item.target = self
+                    if action == #selector(editFragment(_:)) { item.representedObject = clip.id } else { item.representedObject = editor.selection }
+                    item.isEnabled = enabled; menu.addItem(item)
                 }
                 return menu
             }
@@ -913,6 +1013,9 @@ final class Timeline: NSView {
         let menu = NSMenu()
         for (title, action) in [("Track effects…", #selector(effects)), ("Add nested track", #selector(nest)), ("Move to root", #selector(unparent)), ("Delete track…", #selector(remove))] { let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item) }
         return menu
+    }
+    @objc func editFragment(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? UUID { (NSApp.delegate as? AppDelegate)?.editFragment(id) }
     }
     @objc func moveFragmentUp(_ sender: NSMenuItem) { if let ids = sender.representedObject as? Set<UUID> { editor.moveFragmentLayers(ids, up: true) } }
     @objc func moveFragmentDown(_ sender: NSMenuItem) { if let ids = sender.representedObject as? Set<UUID> { editor.moveFragmentLayers(ids, up: false) } }

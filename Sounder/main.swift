@@ -152,6 +152,90 @@ final class NormalizeDialog {
     }
 }
 
+final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
+    let alert = CompactSettingsAlert()
+    let volume = NSTextField(), pan = NSTextField(), fadeIn = NSTextField(), fadeOut = NSTextField()
+    let volumeSlider = NSSlider(value: 0, minValue: -48, maxValue: 24, target: nil, action: nil)
+    let panSlider = NSSlider(value: 0, minValue: -90, maxValue: 90, target: nil, action: nil)
+    let inCurve = NSPopUpButton(), outCurve = NSPopUpButton()
+    let clip: Clip
+    let store: AudioStore
+    private(set) var peak: Double?
+    init(clip: Clip, store: AudioStore, peak: Double? = nil) {
+        self.clip = clip; self.store = store; self.peak = peak
+        super.init()
+        alert.messageText = "Edit fragment"
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 190))
+        for (title, y) in [("Volume", CGFloat(156)), ("Pan", 112), ("Fade in", 56), ("Fade out", 12)] {
+            let label = NSTextField(labelWithString: title); label.frame = NSRect(x: 0, y: y + 2, width: 110, height: 24); form.addSubview(label)
+        }
+        for (slider, field, value, y, unit) in [(volumeSlider, volume, clip.volumeDB, CGFloat(156), "dB"), (panSlider, pan, clip.pan, 112, "°")] {
+            slider.frame = NSRect(x: 116, y: y, width: 216, height: 24); slider.target = self; slider.action = #selector(sliderChanged(_:)); form.addSubview(slider)
+            field.stringValue = String(format: "%g", value); field.frame = NSRect(x: 344, y: y, width: 80, height: 24); field.delegate = self; form.addSubview(field)
+            let label = NSTextField(labelWithString: unit); label.frame = NSRect(x: 432, y: y + 2, width: 45, height: 24); form.addSubview(label)
+            slider.doubleValue = value
+        }
+        for (field, popup, value, curve, y) in [(fadeIn, inCurve, clip.fadeInMS, clip.fadeInCurve, CGFloat(56)), (fadeOut, outCurve, clip.fadeOutMS, clip.fadeOutCurve, 12)] {
+            field.stringValue = String(format: "%g", value); field.frame = NSRect(x: 116, y: y, width: 80, height: 24); form.addSubview(field)
+            let label = NSTextField(labelWithString: "ms"); label.frame = NSRect(x: 204, y: y + 2, width: 32, height: 24); form.addSubview(label)
+            popup.addItems(withTitles: FadeCurve.allCases.map(\.title)); popup.selectItem(at: FadeCurve.allCases.firstIndex(of: curve)!)
+            popup.frame = NSRect(x: 244, y: y - 2, width: 234, height: 28); form.addSubview(popup)
+        }
+        for (control, title) in [(volume, "Volume (dB)"), (pan, "Pan (degrees)"), (fadeIn, "Fade in (ms)"), (fadeOut, "Fade out (ms)")] { control.setAccessibilityLabel(title) }
+        volumeSlider.setAccessibilityLabel("Volume"); panSlider.setAccessibilityLabel("Pan")
+        inCurve.setAccessibilityLabel("Fade in curve"); outCurve.setAccessibilityLabel("Fade out curve")
+        alert.accessoryView = form; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].isEnabled = false; alert.window.initialFirstResponder = volume
+        if let peak { prepare(peak) }
+    }
+    private func number(_ field: NSTextField) -> Double? {
+        guard let value = Double(field.stringValue.replacingOccurrences(of: ",", with: ".")), value.isFinite else { return nil }; return value
+    }
+    private func prepare(_ peak: Double) {
+        do {
+            let maximum = try FragmentSettings.maximumVolume(clip: clip, peak: peak)
+            self.peak = peak; volumeSlider.maxValue = maximum
+            volumeSlider.toolTip = String(format: "Maximum without clipping: %.2f dB", maximum)
+            volumeSlider.doubleValue = max(-48, min(number(volume) ?? clip.volumeDB, maximum))
+            volume.stringValue = String(format: "%g", volumeSlider.doubleValue); alert.buttons[0].isEnabled = true
+        } catch { alert.informativeText = error.localizedDescription; alert.buttons[0].isEnabled = false; alert.layout() }
+    }
+    @objc private func sliderChanged(_ sender: NSSlider) {
+        (sender === volumeSlider ? volume : pan).stringValue = String(format: "%g", (sender.doubleValue * 100).rounded() / 100)
+    }
+    func controlTextDidEndEditing(_ notification: Notification) {
+        if let field = notification.object as? NSTextField, let value = number(field) {
+            let slider = field === volume ? volumeSlider : panSlider
+            slider.doubleValue = max(slider.minValue, min(value, slider.maxValue))
+            field.stringValue = String(format: "%g", slider.doubleValue)
+        }
+    }
+    func runModal() -> FragmentSettings? {
+        if peak == nil {
+            let cached = store.cache[clip.source], rate = store.sampleRate
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                do {
+                    let data = try cached ?? AudioStore.decode(URL(fileURLWithPath: clip.source), sampleRate: rate)
+                    let measured = FragmentNormalization.peak(for: clip, data: data, sampleRate: rate)
+                    DispatchQueue.main.async { [self] in
+                        if store.sampleRate == rate { store.cache[clip.source] = data }
+                        prepare(measured)
+                    }
+                } catch { DispatchQueue.main.async { [self] in alert.informativeText = error.localizedDescription; alert.layout() } }
+            }
+        }
+        while alert.runModal() == .alertFirstButtonReturn {
+            guard let peak, let volumeDB = number(volume), let panValue = number(pan), let first = number(fadeIn), let last = number(fadeOut) else { alert.informativeText = "Enter valid numeric values."; continue }
+            var settings = FragmentSettings(clip)
+            settings.volumeDB = volumeDB; settings.pan = panValue; settings.fadeInMS = first; settings.fadeOutMS = last
+            settings.fadeInCurve = FadeCurve.allCases[inCurve.indexOfSelectedItem]; settings.fadeOutCurve = FadeCurve.allCases[outCurve.indexOfSelectedItem]
+            do { return FragmentSettings(try settings.applying(to: clip, peak: peak)) }
+            catch { alert.informativeText = error.localizedDescription }
+        }
+        return nil
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate {
     var window: NSWindow!
     var editor: Editor!
@@ -174,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("quality"), .flexibleSpace, NSToolbarItem.Identifier("open"), NSToolbarItem.Identifier("save"), NSToolbarItem.Identifier("export")]
     var closingConfirmed = false
     var dialogAutomation: ((NSAlert) -> Void)?
+    var fragmentDialogAutomation: ((FragmentSettingsDialog) -> Void)?
     private var shortcutMonitor: Any?
     func applicationDidFinishLaunching(_ notification: Notification) {
         for app in NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "enotix.Sounder") where app.processIdentifier != ProcessInfo.processInfo.processIdentifier { app.terminate() }
@@ -211,13 +296,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         tempoButton.font = .systemFont(ofSize: 11, weight: .semibold)
         tempoButton.widthAnchor.constraint(equalToConstant: 47).isActive = true
         bpmButton = textButton("120 BPM", size: 18, action: #selector(editTempo), cursor: .iBeam)
-        bpmButton.contentTintColor = accent; bpmButton.toolTip = "Edit tempo (4/4)"; bpmButton.isHidden = true
+        bpmButton.contentTintColor = .systemOrange; bpmButton.toolTip = "Edit tempo (4/4)"; bpmButton.isHidden = true
         timeLabel = NSTextField(labelWithString: "00:00.000"); timeLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .light); timeLabel.textColor = accent
         bpmButton.font = timeLabel.font
         let positionDisplay = NSStackView(views: [timeLabel, bpmButton]); positionDisplay.spacing = 6; positionDisplay.alignment = .centerY
         let tempoSpacer = NSView()
         tempoSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let tempoRow = NSStackView(views: [positionDisplay, metronomeButton, tempoSpacer, tempoButton])
+        let tempoRow = NSStackView(views: [positionDisplay, tempoSpacer, metronomeButton, tempoButton])
         tempoRow.orientation = .horizontal; tempoRow.alignment = .centerY; tempoRow.spacing = 2
         let timelineControls = NSView()
         tempoRow.translatesAutoresizingMaskIntoConstraints = false; timelineControls.addSubview(tempoRow)
@@ -307,6 +392,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             refresh()
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
+            if CommandLine.arguments.contains("--track-solo-ui-test") { try verifyTrackSoloUI() }
+            if CommandLine.arguments.contains("--tempo-snapping-ui-test") { try verifyTempoSnappingUI() }
+            if CommandLine.arguments.contains("--fragment-settings-ui-test") { try verifyFragmentSettingsUI() }
             if CommandLine.arguments.contains("--fragment-mute-ui-test") { try verifyFragmentMuteUI() }
             if CommandLine.arguments.contains("--normalize-ui-test") { try verifyNormalizationUI() }
             if CommandLine.arguments.contains("--stop-return-ui-test") { try verifyStopReturnUI() }
@@ -641,11 +729,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let time = editor.cursor; timeLabel.stringValue = String(format: "%02d:%02d.%03d", Int(time) / 60, Int(time) % 60, Int(time * 1000) % 1000)
         timeLabel.isHidden = editor.project.tempoMode; bpmButton.isHidden = !editor.project.tempoMode
         metronomeButton.isHidden = !editor.project.tempoMode
-        bpmButton.title = (editor.project.tempo.rounded() == editor.project.tempo ? String(Int(editor.project.tempo)) : String(format: "%.1f", editor.project.tempo)) + " BPM"
+        let showingBeatPosition = editor.isPlaying || editor.isRecording
+        bpmButton.title = showingBeatPosition ? TempoGrid.positionLabel(time: time, bpm: editor.project.tempo) : (editor.project.tempo.rounded() == editor.project.tempo ? String(Int(editor.project.tempo)) : String(format: "%.1f", editor.project.tempo)) + " BPM"
+        bpmButton.toolTip = showingBeatPosition ? "Current bar.beat · Click to edit tempo" : "Edit tempo (4/4)"
+        bpmButton.setAccessibilityLabel(showingBeatPosition ? "Current bar and beat: \(bpmButton.title)" : "Tempo: \(bpmButton.title)")
         tempoButton.state = editor.project.tempoMode ? .on : .off
+        tempoButton.bezelColor = editor.project.tempoMode ? .systemOrange : nil
+        tempoButton.contentTintColor = editor.project.tempoMode ? .white : .labelColor
         metronomeButton.state = editor.project.metronomeEnabled ? .on : .off
         metronomeButton.image = NSImage(systemSymbolName: editor.project.metronomeEnabled ? "metronome.fill" : "metronome", accessibilityDescription: "Metronome")
-        metronomeButton.contentTintColor = editor.project.metronomeEnabled ? accent : .secondaryLabelColor
+        metronomeButton.contentTintColor = editor.project.metronomeEnabled ? .systemOrange : .secondaryLabelColor
         metronomeButton.toolTip = editor.project.metronomeEnabled ? "Metronome on" : "Metronome off"
         tempoButton.isEnabled = !editor.isImporting && !editor.requestingMic
         bpmButton.isEnabled = tempoButton.isEnabled; metronomeButton.isEnabled = tempoButton.isEnabled
@@ -766,6 +859,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func stop() { if timeline.cancelFragmentResize() || timeline.cancelMarqueeSelection() { return }; if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stopAndReturnToStart(); timeline.centerOnPlayhead() } }
     @objc func record() { editor.record() }
     @objc func rewind() { if editor.isRecording { editor.stop() }; editor.seek(to: 0) }
+    func editFragment(_ id: UUID) {
+        guard !editor.busy, let clip = editor.project.tracks.flatMap(\.clips).first(where: { $0.id == id }) else { return }
+        let dialog = FragmentSettingsDialog(clip: clip, store: editor.audio)
+        var timer: Timer?
+        if let automate = fragmentDialogAutomation {
+            let action = Timer(timeInterval: 0.05, repeats: true) { tick in
+                guard dialog.peak != nil else { return }; tick.invalidate(); automate(dialog)
+            }
+            timer = action; RunLoop.main.add(action, forMode: .common)
+        }
+        defer { timer?.invalidate() }
+        if let settings = dialog.runModal(), let peak = dialog.peak {
+            do { try editor.setFragmentSettings(id, settings: settings, peak: peak) } catch { editor.error(error) }
+        }
+    }
     @objc func muteFragments() { editor.toggleFragmentMute() }
     @objc func normalize() {
         guard !editor.busy else { return }

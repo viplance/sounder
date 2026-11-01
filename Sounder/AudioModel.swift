@@ -9,6 +9,14 @@ enum NameRules {
 }
 
 let sampleRate = 48_000.0
+enum FadeCurve: String, Codable, CaseIterable {
+    case linear, smooth, exponential, logarithmic
+    var title: String { switch self { case .linear: return "Linear"; case .smooth: return "S-curve"; case .exponential: return "Exponential"; case .logarithmic: return "Logarithmic" } }
+    func value(_ progress: Double) -> Double {
+        let t = max(0, min(1, progress))
+        switch self { case .linear: return t; case .smooth: return t * t * (3 - 2 * t); case .exponential: return t * t; case .logarithmic: return sqrt(t) }
+    }
+}
 struct Clip: Codable, Identifiable {
     static let minimumDuration = 0.010
     var id = UUID()
@@ -22,8 +30,26 @@ struct Clip: Codable, Identifiable {
     var muted = false
     var fadeInBaked = false
     var fadeOutBaked = false
+    var volumeDB = 0.0
+    var pan = 0.0
+    var fadeInMS = 10.0
+    var fadeOutMS = 10.0
+    var fadeInCurve = FadeCurve.linear
+    var fadeOutCurve = FadeCurve.linear
     var end: Double { start + duration }
 
+    var volumeGain: Double { gain * pow(10, volumeDB / 20) }
+    func panGain(channel: Int, channels: Int) -> Double {
+        guard channels > 1 else { return 1 }
+        let attenuation = channel == 0 ? max(0, pan) : max(0, -pan)
+        return attenuation >= 90 ? 0 : cos(attenuation / 90 * .pi / 2)
+    }
+    func fadeLengths(frames: Int, sampleRate: Double) -> (Double, Double) {
+        let available = Double(max(0, frames - 1))
+        var first = min(available, fadeInMS * sampleRate / 1000), last = min(available, fadeOutMS * sampleRate / 1000)
+        if first + last > available { let scale = available / (first + last); first *= scale; last *= scale }
+        return (first, last)
+    }
     func resized(leftEdge: Bool, by delta: Double, sourceDuration: Double) -> Clip {
         var result = self
         // A source shorter than 10 ms cannot be extended with invented audio.
@@ -40,13 +66,20 @@ struct Clip: Codable, Identifiable {
     }
 }
 extension Clip {
-    enum CodingKeys: String, CodingKey { case id, name, source, start, offset, duration, order, gain, muted, fadeInBaked, fadeOutBaked }
+    enum CodingKeys: String, CodingKey { case id, name, source, start, offset, duration, order, gain, muted, fadeInBaked, fadeOutBaked, volumeDB, pan, fadeInMS, fadeOutMS, fadeInCurve, fadeOutCurve }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id); name = try values.decode(String.self, forKey: .name)
         source = try values.decode(String.self, forKey: .source); start = try values.decode(Double.self, forKey: .start)
         offset = try values.decodeIfPresent(Double.self, forKey: .offset) ?? 0
         duration = try values.decode(Double.self, forKey: .duration); order = try values.decode(Int.self, forKey: .order)
+        volumeDB = try values.decodeIfPresent(Double.self, forKey: .volumeDB) ?? 0
+        pan = try values.decodeIfPresent(Double.self, forKey: .pan) ?? 0
+        fadeInMS = try values.decodeIfPresent(Double.self, forKey: .fadeInMS) ?? 10
+        fadeOutMS = try values.decodeIfPresent(Double.self, forKey: .fadeOutMS) ?? 10
+        fadeInCurve = try values.decodeIfPresent(FadeCurve.self, forKey: .fadeInCurve) ?? .linear
+        fadeOutCurve = try values.decodeIfPresent(FadeCurve.self, forKey: .fadeOutCurve) ?? .linear
+        guard volumeDB.isFinite, (-48...24).contains(volumeDB), pan.isFinite, (-90...90).contains(pan), fadeInMS.isFinite, fadeInMS >= 0, fadeOutMS.isFinite, fadeOutMS >= 0 else { throw SounderError.message("Invalid fragment settings") }
         fadeInBaked = try values.decodeIfPresent(Bool.self, forKey: .fadeInBaked) ?? false
         fadeOutBaked = try values.decodeIfPresent(Bool.self, forKey: .fadeOutBaked) ?? false
         muted = try values.decodeIfPresent(Bool.self, forKey: .muted) ?? false
@@ -58,14 +91,46 @@ enum FragmentNormalization {
     static func validate(_ level: Double) throws {
         guard level.isFinite && (-120...0).contains(level) else { throw SounderError.message("Enter a maximum level between -120 and 0 dBFS.") }
     }
-    static func gain(for clip: Clip, data: AudioData, sampleRate: Double, level: Double) -> Double {
+    static func peak(for clip: Clip, data: AudioData, sampleRate: Double) -> Double {
         let first = min(data.frameCount, max(0, Int(clip.offset * sampleRate)))
         let last = min(data.frameCount, first + max(0, Int(clip.duration * sampleRate)))
         var peak = 0.0
         for channel in data.channels {
             for sample in channel[first..<last] where sample.isFinite { peak = max(peak, abs(Double(sample))) }
         }
+        return peak
+    }
+    static func gain(for clip: Clip, data: AudioData, sampleRate: Double, level: Double) -> Double {
+        let peak = peak(for: clip, data: data, sampleRate: sampleRate) * pow(10, clip.volumeDB / 20)
         return peak > 0 ? pow(10, level / 20) / peak : clip.gain
+    }
+}
+struct FragmentSettings: Equatable {
+    var volumeDB: Double
+    var pan: Double
+    var fadeInMS: Double
+    var fadeOutMS: Double
+    var fadeInCurve: FadeCurve
+    var fadeOutCurve: FadeCurve
+    init(_ clip: Clip) {
+        volumeDB = clip.volumeDB; pan = clip.pan; fadeInMS = clip.fadeInMS; fadeOutMS = clip.fadeOutMS
+        fadeInCurve = clip.fadeInCurve; fadeOutCurve = clip.fadeOutCurve
+    }
+    static func maximumVolume(clip: Clip, peak: Double) throws -> Double {
+        let maximum = peak > 0 && clip.gain > 0 ? min(24, -20 * log10(peak) - 20 * log10(clip.gain)) : 24
+        guard maximum >= -48 else { throw SounderError.message("Normalize this source before adjusting its volume.") }
+        return maximum
+    }
+    func applying(to clip: Clip, peak: Double) throws -> Clip {
+        guard volumeDB.isFinite, pan.isFinite, fadeInMS.isFinite, fadeOutMS.isFinite,
+              fadeInMS >= 0, fadeOutMS >= 0 else { throw SounderError.message("Enter valid volume, pan and nonnegative fade times.") }
+        var result = clip
+        result.volumeDB = max(-48, min(volumeDB, try Self.maximumVolume(clip: clip, peak: peak)))
+        result.pan = max(-90, min(90, pan)); result.fadeInMS = fadeInMS; result.fadeOutMS = fadeOutMS
+        result.fadeInCurve = fadeInCurve; result.fadeOutCurve = fadeOutCurve
+        if fadeInMS != clip.fadeInMS || fadeInCurve != clip.fadeInCurve { result.fadeInBaked = false }
+        if fadeOutMS != clip.fadeOutMS || fadeOutCurve != clip.fadeOutCurve { result.fadeOutBaked = false }
+        return result
     }
 }
 struct Track: Codable, Identifiable {
@@ -73,9 +138,33 @@ struct Track: Codable, Identifiable {
     var name: String
     var parent: UUID?
     var muted = false
+    var solo = false
     var clips: [Clip] = []
     var effects: [PluginEffect] = []
     var nextTakeNumber = 1
+}
+// Soloed parent buses include their subtree. Soloed children still pass through
+// ancestor effects, without adding the ancestors' own fragments or other branches.
+struct TrackSoloRouting {
+    var dry: Set<UUID>
+    var buses: Set<UUID> = []
+    init(tracks: [Track], soloIDs: Set<UUID>? = nil) {
+        let all = Set(tracks.map(\.id))
+        let selected = (soloIDs ?? Set(tracks.filter(\.solo).map(\.id))).intersection(all)
+        guard !selected.isEmpty else { dry = all; buses = all; return }
+        dry = selected
+        var previous: Set<UUID> = []
+        while previous != dry {
+            previous = dry
+            for track in tracks where track.parent.map({ dry.contains($0) }) == true { dry.insert(track.id) }
+        }
+        buses = dry
+        previous = []
+        while previous != buses {
+            previous = buses
+            for track in tracks where buses.contains(track.id) { if let parent = track.parent { buses.insert(parent) } }
+        }
+    }
 }
 struct FragmentClipboard: Codable {
     struct Item: Codable {
@@ -118,13 +207,14 @@ enum TrackHierarchy {
 }
 // Keep projects saved before effects and per-track take numbering readable.
 extension Track {
-    enum CodingKeys: String, CodingKey { case id, name, parent, muted, clips, effects, nextTakeNumber }
+    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, clips, effects, nextTakeNumber }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
         parent = try values.decodeIfPresent(UUID.self, forKey: .parent)
         muted = try values.decodeIfPresent(Bool.self, forKey: .muted) ?? false
+        solo = try values.decodeIfPresent(Bool.self, forKey: .solo) ?? false
         clips = try values.decode([Clip].self, forKey: .clips)
         effects = try values.decodeIfPresent([PluginEffect].self, forKey: .effects) ?? []
         nextTakeNumber = max(1, try values.decodeIfPresent(Int.self, forKey: .nextTakeNumber) ?? 1)
@@ -228,6 +318,52 @@ struct AudioData {
                 return samples[first..<min(first + 128, samples.count)].reduce(Float(0)) { max($0, abs($1)) }
             }
         }
+    }
+}
+// Peaks of the fragment's dry output, before track effects and overlap composition.
+struct FragmentWaveformKey: Equatable {
+    let source: String
+    let first: Int
+    let frames: Int
+    let rate: Double
+    let channels: Int
+    let values: [Double]
+    let curves: [FadeCurve]
+    let baked: [Bool]
+    init(_ clip: Clip, rate: Double, channels: Int) {
+        source = clip.source; self.rate = rate; self.channels = channels
+        let start = Int(clip.start * rate)
+        first = Int((clip.offset - clip.start) * rate) + start
+        frames = max(0, Int(clip.end * rate) - start)
+        values = [clip.gain, clip.volumeDB, clip.pan, clip.fadeInMS, clip.fadeOutMS]
+        curves = [clip.fadeInCurve, clip.fadeOutCurve]; baked = [clip.fadeInBaked, clip.fadeOutBaked]
+    }
+}
+enum FragmentWaveform {
+    static func peaks(_ audio: AudioData, clip: Clip, rate: Double, channels requestedChannels: Int, cancelled: () -> Bool = { false }) -> [[Float]]? {
+        // Centered mono has identical stereo outputs: show a single full-height lane.
+        let channels = audio.channels.count == 1 && clip.pan == 0 ? 1 : requestedChannels
+        let key = FragmentWaveformKey(clip, rate: rate, channels: channels)
+        let (fadeIn, fadeOut) = clip.fadeLengths(frames: key.frames, sampleRate: rate)
+        let gains = (0..<channels).map { clip.volumeGain * clip.panGain(channel: $0, channels: channels) }
+        var result = Array(repeating: [Float](), count: channels)
+        for first in stride(from: 0, to: key.frames, by: 128) {
+            if cancelled() { return nil }
+            var peaks = Array(repeating: Float(0), count: channels)
+            for frame in first..<min(first + 128, key.frames) {
+                let source = key.first + frame
+                guard source >= 0 && source < audio.frameCount else { continue }
+                let incoming = clip.fadeInBaked || fadeIn == 0 ? 1 : clip.fadeInCurve.value(Double(frame) / fadeIn)
+                let outgoing = clip.fadeOutBaked || fadeOut == 0 ? 1 : clip.fadeOutCurve.value(Double(key.frames - 1 - frame) / fadeOut)
+                let envelope = min(incoming, outgoing)
+                for channel in 0..<channels {
+                    let sample = channels == 1 ? audio.channels.reduce(Float(0)) { $0 + $1[source] } / Float(audio.channels.count) : audio.channels[min(channel, audio.channels.count - 1)][source]
+                    peaks[channel] = max(peaks[channel], abs(Float(Double(sample) * gains[channel] * envelope)))
+                }
+            }
+            for channel in 0..<channels { result[channel].append(peaks[channel]) }
+        }
+        return result
     }
 }
 final class AudioStore {
@@ -341,11 +477,12 @@ final class AudioStore {
                 let clipLast = Int((clip.end - region.lowerBound) * sampleRate)
                 let first = max(0, clipFirst), last = min(length, clipLast)
                 guard last > first else { continue }
-                let fade = max(1, min(Int((0.010 * sampleRate).rounded()), (clipLast - clipFirst - 1) / 2))
+                let (fadeIn, fadeOut) = clip.fadeLengths(frames: clipLast - clipFirst, sampleRate: sampleRate)
+                let gains = (0..<channelCount).map { clip.volumeGain * clip.panGain(channel: $0, channels: channelCount) }
                 for frame in first..<last {
                     let sourceFrame = Int((region.lowerBound - clip.start + clip.offset) * sampleRate) + frame
-                    let incoming = min(1, Double(frame - clipFirst) / Double(fade))
-                    let outgoing = min(1, Double(clipLast - 1 - frame) / Double(fade))
+                    let incoming = fadeIn == 0 ? 1 : clip.fadeInCurve.value(Double(frame - clipFirst) / fadeIn)
+                    let outgoing = fadeOut == 0 ? 1 : clip.fadeOutCurve.value(Double(clipLast - 1 - frame) / fadeOut)
                     let weight = min(incoming, outgoing)
                     let sourceWeight = min(clip.fadeInBaked ? 1 : incoming, clip.fadeOutBaked ? 1 : outgoing)
                     for channel in 0..<channelCount {
@@ -354,7 +491,7 @@ final class AudioStore {
                             if channelCount == 1 { sample = audio.channels.reduce(Float(0)) { $0 + $1[sourceFrame] } / Float(audio.channels.count) }
                             else { sample = audio.channels[min(channel, audio.channels.count - 1)][sourceFrame] }
                         }
-                        lane.channels[channel][frame] = Float(Double(lane.channels[channel][frame]) * (1 - weight) + Double(sample) * clip.gain * sourceWeight)
+                        lane.channels[channel][frame] = Float(Double(lane.channels[channel][frame]) * (1 - weight) + Double(sample) * gains[channel] * sourceWeight)
                     }
                 }
             }
@@ -367,11 +504,12 @@ final class AudioStore {
                 for i in 0..<source.frameCount { destination.channels[channel][i] += source.channels[channel][i] }
             }
         }
+        let solo = TrackSoloRouting(tracks: project.tracks)
         var visited = Set<UUID>()
         func bus(_ track: Track) throws -> AudioSignal {
             guard visited.insert(track.id).inserted else { throw SounderError.message("Invalid track hierarchy") }
-            guard !track.muted else { return silence(length) }
-            var signal = try raw(track)
+            guard !track.muted, solo.buses.contains(track.id) else { return silence(length) }
+            var signal = solo.dry.contains(track.id) ? try raw(track) : silence(length)
             for child in project.tracks where child.parent == track.id { sum(try bus(child), into: &signal) }
             if let processEffects { return AudioSignal(channels: try signal.channels.map { try processEffects($0, track.effects) }) }
             return try PluginProcessing.apply(signal, effects: track.effects, format: project.audioFormat)

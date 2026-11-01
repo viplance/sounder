@@ -197,6 +197,14 @@ final class Editor: NSObject {
             }
         }
     }
+    func setFragmentSettings(_ id: UUID, settings: FragmentSettings, peak: Double) throws {
+        guard !busy, let i = project.tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == id }) }),
+              let j = project.tracks[i].clips.firstIndex(where: { $0.id == id }) else { return }
+        let original = project.tracks[i].clips[j]
+        let edited = try settings.applying(to: original, peak: peak)
+        guard FragmentSettings(edited) != FragmentSettings(original) else { return }
+        checkpoint(); project.tracks[i].clips[j] = edited; update("Fragment updated")
+    }
     func fragmentsAreMuted(_ ids: Set<UUID>) -> Bool {
         let clips = project.tracks.flatMap(\.clips).filter { ids.contains($0.id) }
         return !clips.isEmpty && clips.allSatisfy(\.muted)
@@ -404,6 +412,14 @@ final class Editor: NSObject {
         checkpoint()
         project.tracks[index].muted.toggle()
         player?.setMuted(project.tracks[index].muted, trackID: trackID)
+        update()
+    }
+    func toggleSolo(_ trackID: UUID) {
+        guard !isRecording, !requestingMic, !isImporting,
+              let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
+        checkpoint()
+        project.tracks[index].solo.toggle()
+        player?.setSolo(Set(project.tracks.filter(\.solo).map(\.id)))
         update()
     }
     func effectsChanged() {

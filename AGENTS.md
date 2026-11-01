@@ -35,6 +35,8 @@
 - Waveforms fill the fragment height. Draw fragment names over the waveform, with no reserved title row. Do not draw a RECORDING label or indicator icon inside the live recording fragment.
 - Draw stereo fragments as separate waveforms: left channel above right, using actual per-channel PCM peaks for both imported audio and live recording. Mono sources use one waveform.
 
+- Fragment waveforms use peaks of actual dry output samples after volume/normalization, output-channel pan and fade curves. Respect baked fades and project Mono/Stereo routing, including mono sources panned in stereo and phase cancellation in mono. A mono source with pan exactly zero displays one full-height waveform regardless of project format; panned mono sources in stereo display both output channels. Prepare peaks off the UI thread, cache per fragment settings/source bounds/format, cancel stale work, and do not apply gain or envelopes a second time while drawing cached peaks.
+
 ## Live recording
 
 - During recording, Space finalizes and retains the take and returns the cursor to its recording start. Enter (including keypad Enter) discards the current unsaved take and its file, then immediately starts a fresh take on the same track at the same recording start. Discarded takes must not consume take numbers or create Undo entries; keep earlier fragments intact.
@@ -104,10 +106,10 @@
 
 - Tempo settings include a Tap button beside the BPM field. Compute BPM from monotonic tap intervals using a rolling recent window, update the field on every tap after the first, reset after a long pause and ignore accidental double taps. Keep values within 20–300 BPM and retain Save/Cancel semantics.
 
-- Place Tempo, Metronome and the timer/BPM display in the pinned top-left timeline corner in place of the TRACKS caption. Use one vertically centered row: timer/BPM, metronome icon, flexible space, then Tempo pinned to the right edge beside the timeline. Use matching 18 pt light monospaced timer/BPM fonts and pin the controls on both scroll axes. The metronome uses an outline icon when off and a filled accent-colored icon when on.
+- Place Tempo, Metronome and the timer/BPM display in the pinned top-left timeline corner in place of the TRACKS caption. Use one vertically centered row: timer/BPM, flexible space, then metronome icon immediately before Tempo pinned to the right edge beside the timeline. Use matching 18 pt light monospaced timer/BPM fonts and pin the controls on both scroll axes. The metronome uses an outline icon when off and a filled orange icon when on.
 
-- Show the metronome icon only in Tempo mode, to the right of Tempo. BPM uses exactly the timer font (18-point monospaced digits, light weight).
-- Tempo toggles a 4/4 bar/beat ruler and replaces the timer with clickable BPM (20–300, initially 120). A Metronome icon button controls audible clicks during playback and recording, with a stronger first beat every four beats. Persist BPM, ruler mode and metronome choice in the project.
+- Show the metronome icon only in Tempo mode, immediately to the left of Tempo. BPM uses exactly the timer font (18-point monospaced digits, light weight).
+- Active Tempo uses an orange button background and an orange BPM value. While playing or recording in Tempo mode, replace the BPM text with the current 1-based bar.beat at the transport cursor, using current BPM and four beats per bar; restore editable BPM when stopped. Keep its font and orange color, follow seeks and capture progress, and retain click-to-edit-tempo. Tempo toggles a 4/4 bar/beat ruler and replaces the timer with clickable BPM (20–300, initially 120). A Metronome icon button controls audible clicks during playback and recording, with a stronger first beat every four beats. Persist BPM, ruler mode and metronome choice in the project.
 - Derive metronome timing from audio frames and absolute timeline position, not UI timers. Seeking and recording restarts must preserve beat alignment. Mix playback clicks only after track effects; route recording clicks to the output mixer separately from the microphone input tap. Never include the metronome in recorded files or exports. Tempo and metronome changes must not stop active capture or playback.
 
 ## Track dragging
@@ -136,7 +138,7 @@
 
 - A plain click on a selected group member selects only that fragment on mouse-up. Preserve the group on mouse-down so an actual drag still moves it together. Shift-click toggles selection; selection-only clicks do not create Undo entries. Apply the same plain-click behavior to fragment edges when no resizing occurs.
 
-- Dragging the body of any selected fragment moves all selected fragments with one common time delta and preserves their time spacing, source offsets and durations. Clamp the whole group at timeline zero, never individual fragments. On cross-track moves, preserve relative visible row offsets and clamp the group to existing track bounds; preview every selected waveform on its destination. Snap the whole group rigidly, exclude its members from snap targets, retain selection after drop, and use one Undo step for all time/track changes. Shift-deselecting a fragment must not start a group move. Edge resizing still affects only the grabbed edge's fragment.
+- Dragging the body of any selected fragment moves all selected fragments with one common time delta and preserves their time spacing, source offsets and durations. Clamp the whole group at timeline zero, never individual fragments. On cross-track moves, preserve relative visible row offsets and clamp the group to existing track bounds; preview every selected waveform on its destination. Snap the whole group rigidly, exclude its members from snap targets, retain selection after drop, and use one Undo step for all time/track changes. Shift-click toggles membership on mouse-up; Shift-drag keeps the group together and bypasses Tempo snapping. Edge resizing still affects only the grabbed edge's fragment.
 
 ## Fragment context menu
 
@@ -161,3 +163,15 @@
 ## Automatic fragment fades
 
 - Apply 10 ms linear fade-in/out in the shared dry fragment renderer before track effects. At overlaps, crossfade the incoming/outgoing fragment against the already composed underlying audio, retaining newest-fragment priority outside the ramps and linked stereo weights. Short fragments cap ramps at half their length; use absolute fragment bounds so seeking, range export and streaming block boundaries do not restart fades. Preserve source files and duration. Join bakes the existing fades/crossfades and marks its two edges as baked to avoid applying them twice; split, trim and resize restore automatic fading on newly created/changed edges. Persist baked-edge metadata with legacy defaults false.
+
+## Fragment settings
+
+- Double-clicking a fragment (including its edge) or its context Edit opens a compact Edit fragment dialog for that fragment only. Single clicks retain selection behavior. Provide volume -48…+24 dB limited by the source interval's peak and normalization gain to keep individual peaks at or below 0 dBFS; pan -90…+90 degrees; independent fade-in/out times in ms and Linear, S-curve, Exponential, Logarithmic curves. Analyze peaks off the main thread. Stereo balance keeps center unchanged and attenuates the opposite channel toward either endpoint; mono output ignores pan. Save settings in the project, preserve them in split/trim/copies, honor them in waveform/playback/export/joins, and support one Undo step. Cancel changes nothing. Defaults for older clips are 0 dB, centered pan, 10 ms linear fades.
+
+## Tempo edit snapping
+
+- In Tempo mode, fragment body drags (including groups and Command copies) move by whole beat durations (60/BPM, one quarter of a 4/4 bar) relative to their original positions; do not let overlap snapping override those deltas. Resize either edge to absolute beat boundaries that satisfy source bounds, timeline zero and the 10 ms minimum; if none exist, retain the original edge. A click without a drag must not snap or resize. Shift bypasses beat movement and beat-edge snapping, including when pressed/released mid-drag, retaining normal source limits and group spacing. Outside Tempo, keep ordinary editing behavior.
+
+## Track Solo
+
+- Add SOLO immediately right of MUTE and before FX, with equal button widths, centered labels, a pointing-hand cursor and a clear blue active state. Multiple Solo selections remain enabled independently. Dim excluded tracks and their fragments the same way as muted tracks; respect audible nested branches. No Solo means all unmuted tracks play; Solo parent includes its subtree, while Solo child passes through ancestor effects without ancestor dry fragments or unrelated branches. Mute remains authoritative. Use the same routing for playback and export; dry fragment processing/joining stays independent. Apply live changes on the playback worker without seeking, rebuilding the graph or resetting effects. Persist Solo with legacy default false, support Undo/Redo, and keep toggles silent.

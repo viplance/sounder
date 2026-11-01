@@ -102,6 +102,21 @@ struct TempoTick {
     let isBar: Bool
 }
 enum TempoGrid {
+    static func positionLabel(time: Double, bpm: Double) -> String {
+        let beat = Int(floor(max(0, time) * bpm / 60))
+        return "\(beat / 4 + 1).\(beat % 4 + 1)"
+    }
+
+    static func snappedMove(delta: Double, earliestStart: Double, bpm: Double) -> Double {
+        let beat = 60 / bpm
+        return max(ceil(-earliestStart / beat), (delta / beat).rounded()) * beat
+    }
+    static func snappedEdge(time: Double, bounds: ClosedRange<Double>, bpm: Double) -> Double? {
+        let beat = 60 / bpm, first = ceil(bounds.lowerBound / beat), last = floor(bounds.upperBound / beat)
+        guard first <= last else { return nil }
+        return max(first, min(last, (time / beat).rounded())) * beat
+    }
+
     static func ticks(from start: Double, to end: Double, zoom: Double, bpm: Double) -> [TempoTick] {
         guard end >= start, zoom > 0 else { return [] }
         let beat = 60 / bpm, bar = beat * 4

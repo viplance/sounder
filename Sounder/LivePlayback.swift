@@ -25,6 +25,8 @@ private final class SampleDelay {
 final class StreamingGraph {
     private final class Bus {
         var muted: Bool
+        var soloDry = true
+        var soloBus = true
         let dry: [Float]
         let children: [Bus]
         let effects: [StreamingEffect]
@@ -45,7 +47,7 @@ final class StreamingGraph {
         func render(position: Int, frames: Int) throws -> [Float] {
             var input = [Float](repeating: 0, count: frames * channels)
             let first = position * channels
-            if first < dry.count {
+            if soloDry && first < dry.count {
                 let count = min(input.count, dry.count - first)
                 input.replaceSubrange(0..<count, with: dry[first..<(first + count)])
             }
@@ -55,10 +57,11 @@ final class StreamingGraph {
                 for i in input.indices { input[i] += signal[i] }
             }
             for effect in effects { input = try effect.process(input) }
-            return muted ? [Float](repeating: 0, count: input.count) : input
+            return muted || !soloBus ? [Float](repeating: 0, count: input.count) : input
         }
     }
     private var buses: [UUID: Bus] = [:]
+    private let tracks: [Track]
     private let roots: [Bus]
     private let delays: [SampleDelay]
     let channels: Int
@@ -66,6 +69,7 @@ final class StreamingGraph {
     let totalFrames: Int
     private(set) var position = 0
     init(project: Project, store: AudioStore, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
+        tracks = project.tracks
         channels = project.audioFormat.channels
         let channelCount = channels
         var visited = Set<UUID>()
@@ -88,9 +92,14 @@ final class StreamingGraph {
         delays = roots.map { SampleDelay(frames: masterLatency - $0.latency, channels: channelCount) }
         let end = project.tracks.flatMap(\.clips).map(\.end).max() ?? 0
         totalFrames = Int(end * project.audioFormat.sampleRate) + (roots.map(\.tail).max() ?? 0)
+        setSolo(Set(project.tracks.filter(\.solo).map(\.id)))
     }
     // Call on the playback worker, alongside render, to preserve processor state.
     func setMuted(_ muted: Bool, trackID: UUID) { buses[trackID]?.muted = muted }
+    func setSolo(_ ids: Set<UUID>) {
+        let routing = TrackSoloRouting(tracks: tracks, soloIDs: ids)
+        for (id, bus) in buses { bus.soloDry = routing.dry.contains(id); bus.soloBus = routing.buses.contains(id) }
+    }
     func render(frames: Int) throws -> [Float] {
         precondition(frames > 0 && frames <= 512)
         var mix = [Float](repeating: 0, count: frames * channels)
@@ -188,6 +197,7 @@ final class LivePlayback {
     func setMuted(_ muted: Bool, trackID: UUID) {
         queue.async { self.graph.setMuted(muted, trackID: trackID) }
     }
+    func setSolo(_ ids: Set<UUID>) { queue.async { self.graph.setSolo(ids) } }
     func stop() { queue.sync { running = false }; node.stop(); engine.stop() }
     deinit { engine.stop() }
 }

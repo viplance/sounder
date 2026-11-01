@@ -5,6 +5,8 @@ func runTempoTests() throws {
     func check(_ condition: Bool, _ message: String) throws {
         guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
     }
+    try check([0.0, 0.499, 0.5, 1.999, 2.0, 4.5].map { TempoGrid.positionLabel(time: $0, bpm: 120) } == ["1.1", "1.1", "1.2", "1.4", "2.1", "3.2"], "Transport bar/beat display follows beat boundaries and bar rollover")
+    try check(TempoGrid.positionLabel(time: 4, bpm: 90) == "2.3" && TempoGrid.positionLabel(time: 60, bpm: 93.5) == "24.2", "Bar/beat display follows the current BPM including fractional tempos")
     var tap = TapTempo()
     try check(tap.tap(at: 0) == nil && tap.tap(at: 0.5) == 120 && tap.tap(at: 1) == 120, "Tap tempo derives BPM from successive monotonic click intervals")
     try check(tap.tap(at: 1.03) == nil && tap.tap(at: 1.5) == 120, "Tap tempo ignores accidental double clicks without disturbing the beat")
@@ -14,6 +16,9 @@ func runTempoTests() throws {
     var fast = TapTempo(); _ = fast.tap(at: 0)
     var slow = TapTempo(); _ = slow.tap(at: 0)
     try check(fast.tap(at: 0.15) == 300 && slow.tap(at: 3) == 20, "Tap tempo respects the project's 20–300 BPM limits")
+    try check(TempoGrid.snappedMove(delta: 1.2, earliestStart: 0.5, bpm: 120) == 1 && TempoGrid.snappedMove(delta: -4, earliestStart: 0.5, bpm: 120) == -0.5, "Tempo moves use whole-beat deltas without taking the group before zero")
+    try check(abs(TempoGrid.snappedMove(delta: 0.8, earliestStart: 0, bpm: 90) - 60 / 90) < 1e-9, "Movement beat snapping follows the current BPM")
+    try check(TempoGrid.snappedEdge(time: 5.1, bounds: 0.51...7.9, bpm: 120) == 5 && TempoGrid.snappedEdge(time: 7.9, bounds: 0.51...7.9, bpm: 120) == 7.5 && TempoGrid.snappedEdge(time: 1, bounds: 0.1...0.49, bpm: 120) == nil, "Resize snapping uses only beat boundaries allowed by source and minimum-length bounds")
     let fm = FileManager.default
     let directory = fm.temporaryDirectory.appendingPathComponent("SounderTempo-" + UUID().uuidString)
     defer { try? fm.removeItem(at: directory) }
@@ -125,6 +130,22 @@ extension AppDelegate {
             let rect = control.convert(control.bounds, to: window.contentView)
             guard rect.minX >= 0 && rect.maxX <= window.contentView!.bounds.maxX else { throw SounderError.message("Tempo controls do not fit the minimum window width") }
         }
+        editor.seek(to: 2); editor.playPause()
+        guard editor.isPlaying, bpmButton.title == "1.4" else { throw SounderError.message("Playback did not replace BPM with the current bar and beat") }
+        editor.seek(to: 4)
+        guard bpmButton.title == "2.3" else { throw SounderError.message("Bar/beat display did not follow live seeking") }
+        editor.stop(); refresh()
+        guard bpmButton.title == "90 BPM" else { throw SounderError.message("Stopped playback did not restore BPM") }
+        let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let recorder = try LiveRecorder(url: editor.audio.freshURL(), format: editor.project.audioFormat, inputFormat: input)
+        try recorder.start(); editor.cursor = 2.6; editor.activateRecording(recorder)
+        guard editor.isRecording, bpmButton.title == "1.4" else { throw SounderError.message("Recording did not replace BPM with the current bar and beat") }
+        recorder.writer.append(captureTestBuffer(format: input, start: 0, frames: 24_000))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2)); editor.updateTransportPosition()
+        guard bpmButton.title == "2.1" else { throw SounderError.message("Recording bar/beat display did not advance with captured audio") }
+        editor.stop(); refresh()
+        guard bpmButton.title == "90 BPM" else { throw SounderError.message("Stopped recording did not restore BPM") }
+        print("PASS: Playback and recording show current bar.beat, follow live seeking/capture, and restore BPM on stop")
         editor.dirty = false
         RunLoop.current.run(until: Date().addingTimeInterval(5.1))
         print("PASS: Tempo switches to editable BPM and a 4/4 ruler, Metronome toggles, and controls fit a 1000-point window")
