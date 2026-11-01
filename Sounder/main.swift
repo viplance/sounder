@@ -128,6 +128,30 @@ final class CompactSettingsAlert: NSAlert {
     }
 }
 
+final class NormalizeDialog {
+    let alert = CompactSettingsAlert()
+    let field: NSTextField
+    init(level: Double) {
+        field = NSTextField(string: String(format: "%g", level))
+        alert.messageText = "Normalize"
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 28))
+        let label = NSTextField(labelWithString: "Maximum level")
+        label.frame = NSRect(x: 0, y: 3, width: 130, height: 22); form.addSubview(label)
+        field.frame = NSRect(x: 140, y: 1, width: 100, height: 26); field.setAccessibilityLabel("Maximum level (dBFS)"); form.addSubview(field)
+        let unit = NSTextField(labelWithString: "dBFS"); unit.frame = NSRect(x: 250, y: 3, width: 50, height: 22); form.addSubview(unit)
+        alert.accessoryView = form; alert.addButton(withTitle: "Process"); alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+    }
+    func runModal() -> Double? {
+        while alert.runModal() == .alertFirstButtonReturn {
+            let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+            if let value = Double(text), (try? FragmentNormalization.validate(value)) != nil { return value }
+            alert.informativeText = "Enter a maximum level between -120 and 0 dBFS."
+        }
+        return nil
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate {
     var window: NSWindow!
     var editor: Editor!
@@ -168,10 +192,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toolbar.addArrangedSubview(section("PLAYER", [button("Return to start", "backward.end.fill", #selector(rewind)), playButton, button("Stop and return to playback start · Escape", "stop.fill", #selector(stop)), recordButton]))
         let split = button("Split at playhead · S", "scissors", #selector(split)); let trim = button("Trim to ruler selection", "crop", #selector(trim)); let delete = button("Delete fragments · Delete", "trash", #selector(deleteClips))
         let join = button("Join selected fragments · ⌘J", "link", #selector(join))
+        let normalize = button("Normalize · N", "waveform.path", #selector(normalize))
         let importButton = button("Import audio · ⌘I", "square.and.arrow.down.on.square", #selector(importAudio))
-        toolbar.addArrangedSubview(section("FRAGMENTS", [split, trim, delete, join, importButton]))
+        toolbar.addArrangedSubview(section("FRAGMENTS", [split, trim, delete, join, normalize, importButton]))
         let addTrack = button("Add track · ⌘T", "plus", #selector(addTrack)); let nest = button("Add nested track", "arrow.turn.down.right", #selector(nest)); let removeTrack = button("Delete track", "minus", #selector(removeTrack))
-        toolbar.addArrangedSubview(section("TRACKS", [addTrack, nest, removeTrack])); editButtons = [split, trim, delete, join, addTrack, nest, removeTrack, importButton]
+        toolbar.addArrangedSubview(section("TRACKS", [addTrack, nest, removeTrack])); editButtons = [split, trim, delete, join, normalize, addTrack, nest, removeTrack, importButton]
         toolbar.addArrangedSubview(section("VIEW", [button("Zoom out", "minus.magnifyingglass", #selector(zoomOut)), button("Zoom in", "plus.magnifyingglass", #selector(zoomIn))]))
         let spacer2 = NSView(); spacer2.setContentHuggingPriority(.defaultLow, for: .horizontal); toolbar.addArrangedSubview(spacer2)
         metronomeButton = PointerButton(image: NSImage(systemSymbolName: "metronome", accessibilityDescription: "Metronome")!, target: self, action: #selector(toggleMetronome))
@@ -280,6 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             refresh()
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
+            if CommandLine.arguments.contains("--normalize-ui-test") { try verifyNormalizationUI() }
             if CommandLine.arguments.contains("--stop-return-ui-test") { try verifyStopReturnUI() }
             if CommandLine.arguments.contains("--physical-shortcuts-ui-test") { try verifyPhysicalShortcutsUI() }
             if CommandLine.arguments.contains("--tap-tempo-ui-test") { try verifyTapTempoUI() }
@@ -656,8 +682,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         menu("Sounder", [("About Sounder", #selector(about), ""), ("Quit Sounder", #selector(quit), "q")])
         menu("File", [("Rename Project…", #selector(renameProject), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Import Audio…", #selector(importAudio), "i"), ("Export…", #selector(exportAudio), "e")])
-        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"), ("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
-        if let edit = main.items.last?.submenu { edit.items.first(where: { $0.action == #selector(split) })?.keyEquivalentModifierMask = [] }
+        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"), ("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
+        if let edit = main.items.last?.submenu { edit.items.filter { [#selector(split), #selector(normalize)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
         menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
         menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
         if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
@@ -668,7 +694,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard event.type == .keyDown, NSApp.modalWindow == nil,
               event.window === window, !(window.firstResponder is NSTextView) else { return false }
         let flags = event.modifierFlags.intersection([.command, .shift, .control, .option])
-        let letters: [UInt16: String] = [0: "a", 1: "s", 3: "f", 6: "z", 8: "c", 9: "v", 12: "q", 14: "e", 15: "r", 17: "t", 31: "o", 34: "i", 38: "j"]
+        let letters: [UInt16: String] = [0: "a", 1: "s", 3: "f", 6: "z", 8: "c", 9: "v", 12: "q", 14: "e", 15: "r", 17: "t", 31: "o", 34: "i", 38: "j", 45: "n"]
         guard let letter = letters[event.keyCode] else { return false }
         for root in NSApp.mainMenu?.items ?? [] {
             for item in root.submenu?.items ?? [] where item.keyEquivalent.lowercased() == letter {
@@ -694,7 +720,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if menuItem.action == #selector(copy(_:)) { return !editor.selection.isEmpty }
             return !editor.busy && NSPasteboard.general.data(forType: Editor.fragmentPasteboardType) != nil
         }
-        if menuItem.action == #selector(split) {
+        if [#selector(split), #selector(normalize)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView) && !editor.busy
         }
         if menuItem.action == #selector(exportAudio) { return editor.canExport }
@@ -729,6 +755,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func stop() { if timeline.cancelFragmentResize() || timeline.cancelMarqueeSelection() { return }; if timeline.trackDrag != nil { timeline.cancelTrackDrag() } else { editor.stopAndReturnToStart(); timeline.centerOnPlayhead() } }
     @objc func record() { editor.record() }
     @objc func rewind() { if editor.isRecording { editor.stop() }; editor.seek(to: 0) }
+    @objc func normalize() {
+        guard !editor.busy else { return }
+        guard !editor.selection.isEmpty else { editor.notifications.show("Select fragments to normalize", style: .hint); return }
+        if let level = NormalizeDialog(level: editor.project.normalizationLevel).runModal() { editor.normalize(to: level) }
+    }
     @objc func split() { editor.split() }
     @objc func trim() { editor.trim() }
     @objc func join() { editor.join() }

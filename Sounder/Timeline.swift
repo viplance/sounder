@@ -416,7 +416,7 @@ final class Timeline: NSView {
         }
         nameField.frame = frame
     }
-    func drawWaveform(_ peaks: [Float], partialPeak: Float? = nil, sampleRate: Double, offset: Double, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
+    func drawWaveform(_ peaks: [Float], partialPeak: Float? = nil, sampleRate: Double, offset: Double, gain: Double = 1, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
         let top = rect.minY + 1, bottom = rect.maxY - 1
         let mid = (top + bottom) / 2, amplitude = max(1, (bottom - top) / 2)
         let lowX = max(rect.minX, dirtyRect.minX), highX = min(rect.maxX, dirtyRect.maxX)
@@ -428,12 +428,12 @@ final class Timeline: NSView {
             let last = min(count, max(first + 1, Int((seconds + 2 / editor.zoom) * sampleRate) / 128))
             var peak: Float = 0
             if first < last { for index in first..<last { peak = max(peak, index < peaks.count ? peaks[index] : (partialPeak ?? 0)) } }
-            let h = CGFloat(min(1, peak)) * amplitude
+            let h = CGFloat(min(1, Double(peak) * gain)) * amplitude
             path.move(to: NSPoint(x: x, y: mid - h)); path.line(to: NSPoint(x: x, y: mid + max(0.4, h)))
         }
         color.setStroke(); path.stroke()
     }
-    func drawChannelWaveforms(_ peaks: [[Float]], partialPeaks: [Float?] = [], sampleRate: Double, offset: Double, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
+    func drawChannelWaveforms(_ peaks: [[Float]], partialPeaks: [Float?] = [], sampleRate: Double, offset: Double, gain: Double = 1, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
         let count = min(2, peaks.count)
         guard count > 0 else { return }
         let top = rect.minY + 2, bottom = rect.maxY - 2
@@ -441,7 +441,7 @@ final class Timeline: NSView {
         let height = max(0, (bottom - top - gap) / CGFloat(count))
         for channel in 0..<count {
             let lane = NSRect(x: rect.minX, y: top + CGFloat(channel) * (height + gap), width: rect.width, height: height)
-            drawWaveform(peaks[channel], partialPeak: partialPeaks.indices.contains(channel) ? partialPeaks[channel] : nil, sampleRate: sampleRate, offset: offset, in: lane, dirtyRect: dirtyRect, color: color)
+            drawWaveform(peaks[channel], partialPeak: partialPeaks.indices.contains(channel) ? partialPeaks[channel] : nil, sampleRate: sampleRate, offset: offset, gain: gain, in: lane, dirtyRect: dirtyRect, color: color)
         }
         if count == 2 {
             let y = top + height + gap / 2
@@ -481,7 +481,7 @@ final class Timeline: NSView {
                 (editor.selection.contains(clip.id) ? color : color.withAlphaComponent(0.45)).setStroke(); outline.stroke()
                 NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
                 if let data = try? editor.audio.load(clip.source) {
-                    drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(track.muted ? 0.3 : 0.9))
+                    drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, gain: clip.gain, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(track.muted ? 0.3 : 0.9))
                 }
                 drawFragmentTitle(clip.name, in: rect, color: color)
                 NSGraphicsContext.restoreGraphicsState()
@@ -866,6 +866,7 @@ final class Timeline: NSView {
     }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 1 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { editor.split() }
+        else if event.keyCode == 45 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { NSApp.sendAction(#selector(AppDelegate.normalize), to: NSApp.delegate, from: self) }
         else if event.keyCode == 123 { if event.modifierFlags.contains(.command) { seekBoundary(end: false) } else { movePlayhead(direction: -1) } }
         else if event.keyCode == 124 { if event.modifierFlags.contains(.command) { seekBoundary(end: true) } else { movePlayhead(direction: 1) } }
         else if event.keyCode == 126 { NSApp.sendAction(#selector(AppDelegate.zoomIn), to: NSApp.delegate, from: self) }
@@ -898,6 +899,7 @@ final class Timeline: NSView {
                 for (title, action, enabled) in [
                     ("Move up", #selector(moveFragmentUp(_:)), editor.canMoveFragmentLayers(editor.selection, up: true)),
                     ("Move down", #selector(moveFragmentDown(_:)), editor.canMoveFragmentLayers(editor.selection, up: false)),
+                    ("Normalize…", #selector(normalizeFragments(_:)), true),
                     ("Delete", #selector(deleteFragment(_:)), true)] {
                     let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
                     item.target = self; item.representedObject = editor.selection; item.isEnabled = enabled; menu.addItem(item)
@@ -913,6 +915,10 @@ final class Timeline: NSView {
     }
     @objc func moveFragmentUp(_ sender: NSMenuItem) { if let ids = sender.representedObject as? Set<UUID> { editor.moveFragmentLayers(ids, up: true) } }
     @objc func moveFragmentDown(_ sender: NSMenuItem) { if let ids = sender.representedObject as? Set<UUID> { editor.moveFragmentLayers(ids, up: false) } }
+    @objc func normalizeFragments(_ sender: NSMenuItem) {
+        guard !editor.busy, let ids = sender.representedObject as? Set<UUID> else { return }
+        editor.selection = ids; NSApp.sendAction(#selector(AppDelegate.normalize), to: NSApp.delegate, from: sender)
+    }
     @objc func deleteFragment(_ sender: NSMenuItem) {
         guard !editor.busy, let ids = sender.representedObject as? Set<UUID> else { return }
         editor.selection = ids; editor.deleteClips()

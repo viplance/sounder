@@ -208,6 +208,7 @@ func runAudioTests() throws {
     try runStreamingGraphTests()
     try runTransportPositionTests()
     try runTempoTests()
+    try runNormalizationTests()
     try runExportTests()
     try runLiveRecordingTests()
     try runResamplingTests()
@@ -336,4 +337,61 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
         host.detachEditor(); window.orderOut(nil)
         print("PASS: native plug-in editor attached, rendered and detached")
     }
+}
+
+func runNormalizationTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderNormalize-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let source = store.freshURL()
+    let left = Array(repeating: Float(0.8), count: 24_000) + Array(repeating: Float(0.1), count: 24_000)
+    let right = Array(repeating: Float(0.4), count: 24_000) + Array(repeating: Float(0.2), count: 24_000)
+    try store.write(AudioSignal(channels: [left, right]), to: source, bitDepth: 32)
+    let originalBytes = try Data(contentsOf: source)
+    let a = Clip(name: "Quiet interval", source: source.path, start: 0, offset: 0.5, duration: 0.5, order: 1)
+    let b = Clip(name: "Loud interval", source: source.path, start: 1, duration: 0.5, order: 2)
+    let editor = Editor(store: store); editor.project = Project(tracks: [Track(name: "Normalize", clips: [a, b])], nextOrder: 3)
+    editor.selection = [a.id, b.id]
+    func process(_ level: Double) throws {
+        editor.normalize(to: level)
+        let limit = Date().addingTimeInterval(10)
+        while editor.isNormalizing && Date() < limit { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        try check(!editor.isNormalizing, "Normalization finishes without blocking the main run loop")
+    }
+    try process(-3)
+    let target = pow(10, -3.0 / 20)
+    let normalized = try store.renderAudio(editor.project)
+    try check(abs(Double(normalized.channels[1][100]) - target) < 1e-6 && abs(Double(normalized.channels[0][48_100]) - target) < 1e-6, "Each fragment independently reaches its requested peak using only its trimmed source interval")
+    try check(abs(normalized.channels[1][100] / normalized.channels[0][100] - 2) < 1e-6 && editor.project.tracks[0].clips[0].offset == 0.5, "Normalization links stereo gain and preserves source offset and timing")
+    try check(try Data(contentsOf: source) == originalBytes && editor.undoStack.count == 1 && editor.project.normalizationLevel == -3, "Normalization leaves originals unchanged and stores the level with one Undo action")
+    let graph = try StreamingGraph(project: editor.project, store: store) { _ in throw SounderError.message("Unexpected effect") }
+    var peak: Float = 0
+    while graph.position < graph.totalFrames { peak = max(peak, try graph.render(frames: 512).map { abs($0) }.max() ?? 0) }
+    try check(abs(Double(peak) - target) < 1e-6, "Live playback and offline export use the same normalized gain")
+    let gain = editor.project.tracks[0].clips[0].gain
+    try process(-3)
+    try check(editor.project.tracks[0].clips[0].gain == gain, "Repeated normalization does not accumulate gain or alter source data")
+    editor.undo(); editor.undo()
+    try check(editor.project.tracks[0].clips.allSatisfy { $0.gain == 1 } && editor.project.normalizationLevel == -1, "Undo restores original gain and the previous normalization level")
+    editor.redo()
+    editor.projectURL = directory.appendingPathComponent("Normalized.sounder")
+    try check(editor.save(), "Normalized project saves successfully")
+    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!.appendingPathComponent("project.json")))
+    try check(saved.normalizationLevel == -3 && saved.tracks[0].clips[0].gain == gain, "Save/load preserves normalized gains and the last chosen level")
+    var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(saved)) as! [String: Any]
+    legacy.removeValue(forKey: "normalizationLevel")
+    var tracks = legacy["tracks"] as! [[String: Any]]
+    var clips = tracks[0]["clips"] as! [[String: Any]]
+    for i in clips.indices { clips[i].removeValue(forKey: "gain") }
+    tracks[0]["clips"] = clips; legacy["tracks"] = tracks
+    let decoded = try JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: legacy))
+    try check(decoded.normalizationLevel == -1 && decoded.tracks[0].clips.allSatisfy { $0.gain == 1 }, "Legacy projects default to unity gain and a -1 dBFS normalization target")
+    let silence = AudioData(channels: [Array(repeating: Float(0), count: 48_000)])
+    try check(FragmentNormalization.gain(for: b, data: silence, sampleRate: 48_000, level: -1) == 1, "Silent fragments remain finite and unchanged")
+    var rejected = false
+    do { try FragmentNormalization.validate(1) } catch { rejected = true }
+    try check(rejected, "Normalization rejects a peak target above 0 dBFS")
 }

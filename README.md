@@ -119,3 +119,5 @@ The **Stop** icon (or Escape outside a drag/selection gesture) stops audio and r
 In **Import multiple files**, **Tab**, **Shift-Tab**, **↑** and **↓** switch between Separate tracks and One track. Enter confirms the import; Escape cancels.
 
 If a time range is selected on the timeline, **Export audio** shows a **Selected range** checkbox at the bottom. Enable it to export just that interval in WAV, MP3 or OGG; leave it unchecked to export the whole project. Selected empty space is exported as silence, and effects retain the history preceding the selected start.
+
+Select fragments and press **N** (physical key, also Russian **т**) or choose **Normalize…** from FRAGMENTS, Edit or the fragment context menu. Enter the desired maximum peak level in dBFS (for example -1, -2 or -3) and click **Process**. Each fragment is normalized independently, with linked stereo gain, without changing original files. The waveform, playback and export reflect the gain. Undo/Redo is supported, and the last processed level and fragment gain are saved with the project.

@@ -18,6 +18,7 @@ struct Clip: Codable, Identifiable {
     var offset: Double = 0
     var duration: Double
     var order: Int
+    var gain = 1.0
     var end: Double { start + duration }
 
     func resized(leftEdge: Bool, by delta: Double, sourceDuration: Double) -> Clip {
@@ -31,6 +32,32 @@ struct Clip: Codable, Identifiable {
             result.duration = max(minimum, min(duration + delta, sourceDuration - offset))
         }
         return result
+    }
+}
+extension Clip {
+    enum CodingKeys: String, CodingKey { case id, name, source, start, offset, duration, order, gain }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id); name = try values.decode(String.self, forKey: .name)
+        source = try values.decode(String.self, forKey: .source); start = try values.decode(Double.self, forKey: .start)
+        offset = try values.decodeIfPresent(Double.self, forKey: .offset) ?? 0
+        duration = try values.decode(Double.self, forKey: .duration); order = try values.decode(Int.self, forKey: .order)
+        gain = try values.decodeIfPresent(Double.self, forKey: .gain) ?? 1
+        guard gain.isFinite && gain >= 0 else { throw SounderError.message("Invalid fragment gain") }
+    }
+}
+enum FragmentNormalization {
+    static func validate(_ level: Double) throws {
+        guard level.isFinite && (-120...0).contains(level) else { throw SounderError.message("Enter a maximum level between -120 and 0 dBFS.") }
+    }
+    static func gain(for clip: Clip, data: AudioData, sampleRate: Double, level: Double) -> Double {
+        let first = min(data.frameCount, max(0, Int(clip.offset * sampleRate)))
+        let last = min(data.frameCount, first + max(0, Int(clip.duration * sampleRate)))
+        var peak = 0.0
+        for channel in data.channels {
+            for sample in channel[first..<last] where sample.isFinite { peak = max(peak, abs(Double(sample))) }
+        }
+        return peak > 0 ? pow(10, level / 20) / peak : clip.gain
     }
 }
 struct Track: Codable, Identifiable {
@@ -139,13 +166,14 @@ struct Project: Codable {
     var tempo = 120.0
     var tempoMode = false
     var metronomeEnabled = false
+    var normalizationLevel = -1.0
     var defaultExportSettings: ExportSettings {
         if exportSettingsConfirmed, let exportSettings { return exportSettings }
         return ExportSettings(projectFormat: audioFormat)
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, tempo, tempoMode, metronomeEnabled }
+    enum CodingKeys: String, CodingKey { case tracks, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, tempo, tempoMode, metronomeEnabled, normalizationLevel }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
@@ -160,6 +188,8 @@ extension Project {
         tempo = try values.decodeIfPresent(Double.self, forKey: .tempo) ?? 120
         tempoMode = try values.decodeIfPresent(Bool.self, forKey: .tempoMode) ?? false
         metronomeEnabled = try values.decodeIfPresent(Bool.self, forKey: .metronomeEnabled) ?? false
+        normalizationLevel = try values.decodeIfPresent(Double.self, forKey: .normalizationLevel) ?? -1
+        try FragmentNormalization.validate(normalizationLevel)
         guard tempo.isFinite && (20...300).contains(tempo) else { throw SounderError.message("Tempo must be between 20 and 300 BPM") }
     }
 }
@@ -309,7 +339,7 @@ final class AudioStore {
                             if channelCount == 1 { sample = audio.channels.reduce(Float(0)) { $0 + $1[sourceFrame] } / Float(audio.channels.count) }
                             else { sample = audio.channels[min(channel, audio.channels.count - 1)][sourceFrame] }
                         }
-                        lane.channels[channel][frame] = sample
+                        lane.channels[channel][frame] = Float(Double(sample) * clip.gain)
                     }
                 }
             }

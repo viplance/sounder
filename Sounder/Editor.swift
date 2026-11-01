@@ -33,11 +33,12 @@ final class Editor: NSObject {
     var recordingStart = 0.0
     var timer: Timer?
     var importer: AudioImportController?
+    private(set) var isNormalizing = false
     var isImporting: Bool { importer?.isRunning == true }
     var requestingMic = false
     var isRecording: Bool { recorder != nil }
     var isPlaying: Bool { player?.isPlaying == true }
-    var busy: Bool { isRecording || isPlaying || requestingMic || isImporting }
+    var busy: Bool { isRecording || isPlaying || requestingMic || isImporting || isNormalizing }
     var canExport: Bool { !busy && duration > 0 }
     var duration: Double { project.tracks.flatMap(\.clips).map(\.end).max() ?? 0 }
     var projectName: String { project.name ?? projectURL?.deletingPathExtension().lastPathComponent ?? "MY PROJECT" }
@@ -162,6 +163,39 @@ final class Editor: NSObject {
             }
             selectedTrack = targets[base]; update()
         } catch { self.error(error) }
+    }
+    func normalize(to level: Double, completion: (() -> Void)? = nil) {
+        guard !busy else { completion?(); return }
+        let clips = project.tracks.flatMap(\.clips).filter { selection.contains($0.id) }
+        guard !clips.isEmpty else { notifications.show("Select fragments to normalize", style: .hint); completion?(); return }
+        do { try FragmentNormalization.validate(level) } catch { self.error(error); completion?(); return }
+        let rate = audio.sampleRate, cached = audio.cache
+        isNormalizing = true; update()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            do {
+                var prepared: [String: AudioData] = [:], gains: [UUID: Double] = [:]
+                for clip in clips {
+                    let data: AudioData
+                    if let available = prepared[clip.source] ?? cached[clip.source] { data = available }
+                    else { data = try AudioStore.decode(URL(fileURLWithPath: clip.source), sampleRate: rate) }
+                    prepared[clip.source] = data
+                    gains[clip.id] = FragmentNormalization.gain(for: clip, data: data, sampleRate: rate, level: level)
+                }
+                let results = gains, cache = prepared
+                DispatchQueue.main.async { [self] in
+                    checkpoint()
+                    for i in project.tracks.indices {
+                        for j in project.tracks[i].clips.indices {
+                            if let gain = results[project.tracks[i].clips[j].id] { project.tracks[i].clips[j].gain = gain }
+                        }
+                    }
+                    for (path, data) in cache { audio.cache[path] = data }
+                    project.normalizationLevel = level; isNormalizing = false; update("Normalization completed"); completion?()
+                }
+            } catch {
+                DispatchQueue.main.async { [self] in isNormalizing = false; self.error(error); completion?() }
+            }
+        }
     }
     func fragmentLayerNeighbor(_ id: UUID, up: Bool) -> UUID? {
         guard let track = project.tracks.first(where: { $0.clips.contains(where: { $0.id == id }) }) else { return nil }
@@ -498,7 +532,7 @@ final class Editor: NSObject {
         } catch { self.error(error) }
     }
     func save(as: Bool = false) -> Bool {
-        guard !isRecording, !isImporting else { return false }
+        guard !isRecording, !isImporting, !isNormalizing else { return false }
         var destination = projectURL
         if destination == nil || `as` {
             let panel = NSSavePanel(); panel.nameFieldStringValue = suggestedFilename; panel.canCreateDirectories = true

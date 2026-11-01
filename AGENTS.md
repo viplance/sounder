@@ -149,3 +149,7 @@
 ## Keyboard layout independence
 
 - Split uses the unmodified physical S key (including Russian ы), shown as S in the menu and toolbar tooltip. Resolve app-owned letter shortcuts by physical key codes in the main editor window while respecting their exact modifier masks, validation, dialogs and plugin windows. Keep normal typing and native text shortcuts in text editors; Command-S remains Save. Arrow and transport key codes remain layout-independent.
+
+## Fragment normalization
+
+- Normalize is available from FRAGMENTS, the Edit menu and the fragment context menu, applying to the captured selection. Use unmodified physical N (including Russian т). Show a compact Normalize dialog with Maximum level in dBFS, Process and Cancel; accept -120…0 dBFS, initially -1 dBFS. Remember the last successfully processed level in the project and use it on reopening the dialog. Analyze the actual selected source interval off the UI thread, independently per fragment with linked stereo-channel gain; leave silence unchanged. Apply non-destructive gain before track effects, reflect it in waveforms, preserve originals and source bounds, and support one-step Undo/Redo. Gain and the level must survive save/load; legacy clips use unity gain. Splits, trims, clipboard copies, playback, export and joining must honor gain without applying it twice.

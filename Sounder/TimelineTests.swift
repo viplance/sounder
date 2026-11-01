@@ -402,7 +402,7 @@ extension AppDelegate {
         func perform(_ item: NSMenuItem) { _ = NSApp.sendAction(item.action!, to: item.target, from: item) }
         func order() -> [UUID] { editor.project.tracks[0].clips.sorted { $0.order < $1.order }.map(\.id) }
         let bottom = menu(time: 2, y: timeline.ruler + 9)!
-        try check(bottom.items.map(\.title) == ["Move up", "Move down", "Delete"] && bottom.items[0].isEnabled && !bottom.items[1].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
+        try check(bottom.items.map(\.title) == ["Move up", "Move down", "Normalize…", "Delete"] && bottom.items[0].isEnabled && !bottom.items[1].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
         let history = editor.undoStack.count
         perform(bottom.items[0])
         try check(order() == [middle.id, lower.id, upper.id, isolated.id] && editor.undoStack.count == history + 1, "Move up raises the context fragment exactly one overlapping level and leaves other relative ordering intact")
@@ -416,7 +416,7 @@ extension AppDelegate {
         let alone = menu(time: 7.5, y: timeline.ruler + 25)!
         try check(!alone.items[0].isEnabled && !alone.items[1].isEnabled, "Both layer actions are disabled for an isolated fragment")
         editor.selection.insert(upper.id)
-        perform(alone.items[2])
+        perform(alone.items[3])
         try check(editor.project.tracks[0].clips.count == 3 && !editor.project.tracks[0].clips.contains(where: { $0.id == isolated.id }) && editor.project.tracks[0].clips.contains(where: { $0.id == upper.id }), "Context Delete removes only its fragment even when another fragment is selected")
         editor.undo(); try check(editor.project.tracks[0].clips.count == 4, "Context fragment deletion can be undone")
         try check(menu(time: 6, y: timeline.ruler + 25) == nil, "Empty fragment space does not open the track menu")
@@ -427,7 +427,7 @@ extension AppDelegate {
         perform(group.items[1])
         try check(order() == [lower.id, upper.id, middle.id, isolated.id] && editor.selection == [lower.id, upper.id] && editor.undoStack.count == groupHistory + 1, "Group Move down moves selected layers together without swapping them and creates one Undo step")
         editor.undo(); editor.redo(); editor.undo()
-        perform(group.items[2])
+        perform(group.items[3])
         try check(Set(editor.project.tracks[0].clips.map(\.id)) == [middle.id, isolated.id], "Context Delete removes every selected fragment and preserves unselected audio")
         editor.undo()
         var secondLower = lower; secondLower.id = UUID(); secondLower.order = 10
@@ -440,7 +440,7 @@ extension AppDelegate {
         perform(across.items[0])
         try check(order() == [middle.id, upper.id, lower.id, isolated.id] && editor.project.tracks[1].clips.sorted(by: { $0.order < $1.order }).last?.id == secondLower.id && editor.undoStack.count == batchHistory + 1, "One menu action changes layers on every selected track with one Undo step")
         editor.undo()
-        perform(across.items[2])
+        perform(across.items[3])
         try check(!editor.project.tracks.flatMap(\.clips).contains(where: { $0.id == lower.id || $0.id == secondLower.id }) && editor.project.tracks[1].clips.first?.id == secondUpper.id, "Group context deletion applies across tracks")
         editor.undo()
         editor.selection = [lower.id, upper.id]
@@ -526,5 +526,37 @@ extension AppDelegate {
         try check(input.string.contains("ы") && editor.project.tracks[0].clips.count == before, "Russian ы remains ordinary text while editing")
         timeline.nameField.finish(commit: false); window.makeFirstResponder(timeline)
         editor.project = original; editor.selection = []; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+    }
+}
+
+extension AppDelegate {
+    func verifyNormalizationUI() throws {
+        let original = editor.project
+        let clip = original.tracks[0].clips[0]
+        editor.selection = [clip.id]; window.makeFirstResponder(timeline)
+        var failure: String?
+        func field(_ view: NSView) -> NSTextField? {
+            if let input = view as? NSTextField, input.isEditable { return input }
+            return view.subviews.lazy.compactMap { field($0) }.first
+        }
+        let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
+            guard let root = NSApp.modalWindow?.contentView, let input = field(root) else { failure = "No Normalize level field"; NSApp.stopModal(withCode: .alertSecondButtonReturn); return }
+            if input.stringValue != "-1" { failure = "Normalize must initially default to -1 dBFS" }
+            input.stringValue = "-3"; NSApp.stopModal(withCode: .alertFirstButtonReturn)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "т", charactersIgnoringModifiers: "т", isARepeat: false, keyCode: 45)!
+        guard handlePhysicalShortcut(event) else { throw SounderError.message("Physical N/т shortcut did not open Normalize") }
+        if let failure { throw SounderError.message(failure) }
+        let limit = Date().addingTimeInterval(10)
+        while editor.isNormalizing && Date() < limit { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        guard !editor.isNormalizing, editor.project.normalizationLevel == -3, editor.project.tracks[0].clips[0].gain != 1 else { throw SounderError.message("Process failed to normalize the selected fragment") }
+        let dialog = NormalizeDialog(level: editor.project.normalizationLevel)
+        guard dialog.field.stringValue == "-3", dialog.alert.buttons[0].title == "Process" else { throw SounderError.message("Normalize did not remember the last processed level") }
+        let cancel = Timer(timeInterval: 0.1, repeats: false) { _ in dialog.field.stringValue = "-6"; dialog.alert.buttons[1].performClick(nil) }
+        RunLoop.main.add(cancel, forMode: .common)
+        guard dialog.runModal() == nil, editor.project.normalizationLevel == -3 else { throw SounderError.message("Normalize Cancel changed the last chosen level") }
+        editor.project = original; editor.selection = []; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+        print("PASS: physical N/т opens Normalize, Process changes gain, the next dialog recalls the target, and Cancel preserves it")
     }
 }
