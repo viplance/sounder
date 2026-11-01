@@ -3,8 +3,30 @@ import AVFoundation
 
 final class PointerButton: NSButton {
     private var pointerTracking: NSTrackingArea?
+    private(set) var isHovering = false
+    var contentPadding = NSSize.zero { didSet { invalidateIntrinsicContentSize() } }
+    override var intrinsicContentSize: NSSize {
+        let size = super.intrinsicContentSize
+        return NSSize(width: size.width + contentPadding.width * 2, height: size.height + contentPadding.height * 2)
+    }
+    private func drawHover() {
+        let rect: NSRect
+        let path: NSBezierPath
+        if imagePosition == .imageOnly {
+            let size = max(0, min(bounds.width, bounds.height) - 2)
+            rect = NSRect(x: bounds.midX - size / 2, y: bounds.midY - size / 2, width: size, height: size)
+            path = NSBezierPath(ovalIn: rect)
+        } else {
+            rect = bounds.insetBy(dx: 0.5, dy: 1)
+            path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+        }
+        NSColor.labelColor.withAlphaComponent(isBordered ? 0.06 : 0.10).setFill(); path.fill()
+        if isBordered { NSColor.labelColor.withAlphaComponent(0.16).setStroke(); path.lineWidth = 0.7; path.stroke() }
+    }
     var activeAppearanceColor: NSColor? { didSet { needsDisplay = true } }
     override func draw(_ dirtyRect: NSRect) {
+        let hover = isHovering && isEnabled && window?.isKeyWindow == true
+        defer { if hover { drawHover() } }
         guard state == .on, isEnabled, let color = activeAppearanceColor else { super.draw(dirtyRect); return }
         if imagePosition == .imageOnly, let image {
             let tinted = NSImage(size: image.size, flipped: false) { rect in
@@ -22,12 +44,15 @@ final class PointerButton: NSButton {
             (title as NSString).draw(at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2), withAttributes: attributes)
         }
     }
-    var interactionCursor: NSCursor = .pointingHand {
+    var interactionCursor: NSCursor = .arrow {
         didSet { window?.invalidateCursorRects(for: self) }
     }
     override var isEnabled: Bool {
         didSet {
-            if isEnabled != oldValue { window?.invalidateCursorRects(for: self) }
+            if isEnabled != oldValue {
+                if !isEnabled { isHovering = false }
+                needsDisplay = true; window?.invalidateCursorRects(for: self)
+            }
         }
     }
     override func resetCursorRects() {
@@ -37,9 +62,11 @@ final class PointerButton: NSButton {
     override func updateTrackingAreas() {
         if let pointerTracking { removeTrackingArea(pointerTracking) }
         super.updateTrackingAreas()
-        let area = NSTrackingArea(rect: .zero, options: [.cursorUpdate, .activeInKeyWindow, .inVisibleRect], owner: self)
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .cursorUpdate, .activeInKeyWindow, .inVisibleRect], owner: self)
         addTrackingArea(area); pointerTracking = area
     }
+    override func mouseEntered(with event: NSEvent) { isHovering = isEnabled; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { isHovering = false; needsDisplay = true }
     override func cursorUpdate(with event: NSEvent) {
         // Native toolbar tracking can supersede the custom view's cursor rectangles.
         (isEnabled ? interactionCursor : NSCursor.arrow).set()
@@ -364,6 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         projectNameField.textColor = projectLabel.textColor
         projectNameView = ProjectNameView(label: projectLabel, field: projectNameField)
         qualityButton = textButton(ProjectAudioFormat().label, size: 10, action: #selector(audioSettings)); qualityButton.toolTip = "Project audio settings"
+        (qualityButton as? PointerButton)?.contentPadding = NSSize(width: 10, height: 5)
         let export = PointerButton(title: "Export", target: self, action: #selector(exportAudio)); export.bezelStyle = .rounded
         export.widthAnchor.constraint(equalToConstant: export.intrinsicContentSize.width + 16).isActive = true
         exportButton = export
@@ -418,6 +446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             refresh()
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
+            if CommandLine.arguments.contains("--button-hover-ui-test") { try verifyButtonHoverUI() }
             if CommandLine.arguments.contains("--project-file-controls-ui-test") { try verifyProjectFileControlsUI() }
             if CommandLine.arguments.contains("--fragments-system-menu-ui-test") { try verifyFragmentsSystemMenuUI() }
             if CommandLine.arguments.contains("--fragment-fades-ui-test") { try verifyFragmentFadesUI() }
@@ -696,7 +725,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard projectNameView.frame.width >= min(640, projectLabel.intrinsicContentSize.width) - 0.5 else { throw SounderError.message("Toolbar clips the committed project name despite available space") }
         print("PASS: clicking audio label edits rate/channels; Undo/Redo updates the label")
     }
-    func textButton(_ title: String, size: CGFloat, action: Selector, cursor: NSCursor = .pointingHand) -> NSButton {
+    func textButton(_ title: String, size: CGFloat, action: Selector, cursor: NSCursor = .arrow) -> NSButton {
         let button = PointerButton(title: title, target: self, action: action)
         button.interactionCursor = cursor
         button.isBordered = false; button.bezelStyle = .inline

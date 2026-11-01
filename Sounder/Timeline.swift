@@ -150,6 +150,8 @@ final class Timeline: NSView {
     private(set) var renamingTrack: UUID?
     private(set) var headerControls: NSView?
     private var scrollObserver: NSObjectProtocol?
+    private var controlsTracking: NSTrackingArea?
+    private var hoveredTrackControl: (id: UUID, kind: Int)?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     init(_ editor: Editor) { self.editor = editor; super.init(frame: .zero); addSubview(nameField); nameField.font = .systemFont(ofSize: 13, weight: .semibold); nameField.setAccessibilityLabel("Track name"); nameField.textChanged = { [weak self] in self?.layoutNameField() } }
@@ -163,10 +165,41 @@ final class Timeline: NSView {
         scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
             guard let self else { return }
             self.positionHeaderControls()
+            if let window = self.window { self.updateTrackControlHover(at: self.convert(window.mouseLocationOutsideOfEventStream, from: nil)) }
             self.layoutNameField()
             self.setNeedsDisplay(self.visibleRect)
             self.window?.invalidateCursorRects(for: self)
         }
+    }
+    override func updateTrackingAreas() {
+        if let controlsTracking { removeTrackingArea(controlsTracking) }
+        super.updateTrackingAreas()
+        let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area); controlsTracking = area
+        window?.acceptsMouseMovedEvents = true
+    }
+    private func updateTrackControlHover(at point: NSPoint?) {
+        var next: (id: UUID, kind: Int)?
+        if let point, visibleTrackRect.contains(point), point.x < fragmentLeft,
+           !editor.isRecording, !editor.requestingMic, !editor.isImporting {
+            let row = Int((point.y - ruler) / rowHeight)
+            if rows.indices.contains(row) {
+                let (track, depth) = rows[row]
+                let rects = [trackMuteRect(row: row, depth: depth), trackSoloRect(row: row, depth: depth), trackFXRect(row: row, depth: depth)]
+                if let index = rects.firstIndex(where: { $0.contains(point) }) { next = (track.id, index) }
+            }
+        }
+        if next?.id != hoveredTrackControl?.id || next?.kind != hoveredTrackControl?.kind { hoveredTrackControl = next; needsDisplay = true }
+    }
+    override func mouseMoved(with event: NSEvent) { updateTrackControlHover(at: convert(event.locationInWindow, from: nil)) }
+    override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
+    override func mouseExited(with event: NSEvent) { updateTrackControlHover(at: nil) }
+    private func drawTrackControlHover(_ id: UUID, kind: Int, rect: NSRect) {
+        guard window?.isKeyWindow == true, hoveredTrackControl?.id == id, hoveredTrackControl?.kind == kind,
+              !editor.isRecording, !editor.requestingMic, !editor.isImporting else { return }
+        fill(rect, NSColor.white.withAlphaComponent(0.10), radius: 5)
+        NSColor.white.withAlphaComponent(0.16).setStroke()
+        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.4, dy: 0.4), xRadius: 5, yRadius: 5); path.lineWidth = 0.7; path.stroke()
     }
     func installHeaderControls(_ view: NSView) {
         headerControls?.removeFromSuperview(); headerControls = view
@@ -257,6 +290,8 @@ final class Timeline: NSView {
         frame.size = NSSize(width: width, height: max(visible.height, ruler + CGFloat(rows.count) * rowHeight + 110))
         positionHeaderControls()
         layoutNameField()
+        if let window, window.isKeyWindow { updateTrackControlHover(at: convert(window.mouseLocationOutsideOfEventStream, from: nil)) }
+        else { updateTrackControlHover(at: nil) }
         needsDisplay = true
         if editor.isRecording, let scroll = enclosingScrollView {
             let visible = scroll.documentVisibleRect, x = header + editor.cursor * editor.zoom
@@ -534,9 +569,9 @@ final class Timeline: NSView {
             }
             let depth = item.1
             for (rect, cursor) in [(trackNameHitRect(row: row, depth: depth), NSCursor.iBeam),
-                                   (trackMuteRect(row: row, depth: depth), NSCursor.pointingHand),
-                                   (trackSoloRect(row: row, depth: depth), NSCursor.pointingHand),
-                                   (trackFXRect(row: row, depth: depth), NSCursor.pointingHand)] {
+                                   (trackMuteRect(row: row, depth: depth), NSCursor.arrow),
+                                   (trackSoloRect(row: row, depth: depth), NSCursor.arrow),
+                                   (trackFXRect(row: row, depth: depth), NSCursor.arrow)] {
                 let visible = rect.intersection(visibleTrackRect)
                 if !visible.isEmpty && (!editor.busy || ((rect == trackFXRect(row: row, depth: depth) || rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
             }
@@ -729,12 +764,15 @@ final class Timeline: NSView {
             label(title, trackNameRect(row: index, depth: depth), size: 13, color: trackDimmed ? .secondaryLabelColor : .labelColor, weight: .semibold)
             let muteRect = trackMuteRect(row: index, depth: depth)
             fill(muteRect, track.muted ? NSColor.systemOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+            drawTrackControlHover(track.id, kind: 0, rect: muteRect)
             label(track.muted ? "MUTED" : "MUTE", NSRect(x: muteRect.minX, y: muteRect.minY + 5, width: muteRect.width, height: 15), size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, weight: .semibold, alignment: .center)
             let soloRect = trackSoloRect(row: index, depth: depth)
             fill(soloRect, track.solo ? NSColor.systemBlue.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+            drawTrackControlHover(track.id, kind: 1, rect: soloRect)
             label("SOLO", NSRect(x: soloRect.minX, y: soloRect.minY + 5, width: soloRect.width, height: 15), size: 9, color: track.solo ? .systemBlue : .secondaryLabelColor, weight: .semibold, alignment: .center)
             let fxRect = trackFXRect(row: index, depth: depth)
             fill(fxRect, track.effects.isEmpty ? NSColor.white.withAlphaComponent(0.06) : color.withAlphaComponent(0.18), radius: 5)
+            drawTrackControlHover(track.id, kind: 2, rect: fxRect)
             label("FX", NSRect(x: fxRect.minX, y: fxRect.minY + 5, width: fxRect.width, height: 15), size: 10, color: track.effects.isEmpty ? .secondaryLabelColor : color, weight: .semibold, alignment: .center)
             line(NSPoint(x: pinnedHeaderX, y: y + rowHeight), NSPoint(x: fragmentLeft, y: y + rowHeight), .white.withAlphaComponent(0.065))
         }

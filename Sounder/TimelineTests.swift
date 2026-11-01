@@ -851,3 +851,56 @@ extension AppDelegate {
         try check(split.keyEquivalent == "s" && split.keyEquivalentModifierMask.isEmpty && normalize.keyEquivalent == "n" && normalize.keyEquivalentModifierMask.isEmpty, "Split and Normalize retain their physical unmodified shortcuts in Fragments")
     }
 }
+
+extension AppDelegate {
+    func verifyButtonHoverUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline); refresh()
+        let deadline = Date().addingTimeInterval(2)
+        while !window.isKeyWindow && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        try check(window.isKeyWindow, "Main window is active before testing hover feedback")
+        guard let icon = window.toolbar?.items.first(where: { $0.itemIdentifier.rawValue == "open" })?.view as? PointerButton else { throw SounderError.message("Open button missing") }
+        func event(_ type: NSEvent.EventType, point: NSPoint, view: NSView) -> NSEvent {
+            let location = view.convert(point, to: nil)
+            if type == .mouseEntered || type == .mouseExited {
+                return NSEvent.enterExitEvent(with: type, location: location, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
+            }
+            return NSEvent.mouseEvent(with: type, location: location, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+        }
+        func pixels(_ view: NSView) -> Data {
+            let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            return bitmap.representation(using: .png, properties: [:])!
+        }
+        let center = NSPoint(x: icon.bounds.midX, y: icon.bounds.midY)
+        let entered = event(.mouseEntered, point: center, view: icon), exited = event(.mouseExited, point: center, view: icon)
+        icon.mouseExited(with: exited); let normal = pixels(icon)
+        icon.mouseEntered(with: entered); let hover = pixels(icon)
+        try check(icon.interactionCursor == .arrow && icon.isHovering && hover != normal, "Icon buttons use an arrow and gain a visible lighter hover background (arrow: \(icon.interactionCursor == .arrow), hover: \(icon.isHovering), key: \(window.isKeyWindow), changed: \(hover != normal))")
+        icon.mouseExited(with: exited)
+        try check(!icon.isHovering && pixels(icon) == normal, "Moving off an icon removes its hover background")
+        icon.isEnabled = false; icon.mouseEntered(with: entered)
+        try check(!icon.isHovering, "Disabled buttons never highlight on hover")
+        icon.isEnabled = true
+        if let export = exportButton as? PointerButton {
+            let old = export.isEnabled; export.isEnabled = true
+            let point = NSPoint(x: export.bounds.midX, y: export.bounds.midY)
+            let exit = event(.mouseExited, point: point, view: export), enter = event(.mouseEntered, point: point, view: export)
+            export.mouseExited(with: exit); let before = pixels(export)
+            export.mouseEntered(with: enter)
+            try check(export.interactionCursor == .arrow && pixels(export) != before, "Text buttons retain an arrow and gain rounded hover feedback")
+            export.mouseExited(with: exit); export.isEnabled = old
+        }
+        let buttonRect = timeline.trackMuteRect(row: 0, depth: timeline.rows[0].1)
+        let point = NSPoint(x: buttonRect.midX, y: buttonRect.midY)
+        timeline.mouseExited(with: event(.mouseExited, point: point, view: timeline)); let baseline = pixels(timeline)
+        timeline.mouseMoved(with: event(.mouseMoved, point: point, view: timeline))
+        try check(pixels(timeline) != baseline, "Drawn track MUTE/SOLO/FX controls also provide hover feedback")
+        timeline.mouseExited(with: event(.mouseExited, point: point, view: timeline))
+        try check((bpmButton as? PointerButton)?.interactionCursor == .iBeam, "Editable BPM retains its text cursor")
+        refresh()
+    }
+}

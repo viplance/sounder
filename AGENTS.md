@@ -12,16 +12,16 @@
 - Opening or refreshing an editor or effects panel is not a successful edit and must not emit a success notification. Transport state belongs in transport controls, not success notifications.
 - Use the shared ToastCenter and ToastOverlay for future features. Keep decision dialogs for actions requiring a choice; operational errors use notifications.
 
-- Muting or unmuting a track must not emit notifications; the MUTE control shows its state. MUTE remains clickable with a pointing-hand cursor during playback. Update the streaming graph on its worker without stopping audio, seeking, rebuilding the graph or resetting plug-ins. Parent mute silences its subtree; unmute also works for tracks muted before Play.
+- Muting or unmuting a track must not emit notifications; the MUTE control shows its state. MUTE remains clickable with the standard arrow cursor during playback. Update the streaming graph on its worker without stopping audio, seeking, rebuilding the graph or resetting plug-ins. Parent mute silences its subtree; unmute also works for tracks muted before Play.
 - Track and fragment deletion notifications use a red background with white text.
 - Successful splitting or moving audio fragments must not emit success notifications or UX hints.
 - Invalid FRAGMENTS actions (Split, Trim, Delete, Join) show a yellow selection/instruction notification on every attempt, including repeated clicks. Successful Split and fragment moves remain silent. Only first-drag and first-selection onboarding hints are limited to once per session.
 
 ## Button cursors
 
-- Use PointerButton for app-owned clickable buttons, including all icon buttons. Enabled buttons show the pointing-hand cursor; disabled buttons retain the standard cursor.
+- Use PointerButton for app-owned clickable buttons, including all icon buttons. Buttons and icons use the standard arrow cursor. Provide subtle Apple-style hover feedback: a lighter circular background for icon buttons and a rounded highlight for text buttons, including MUTE/SOLO/FX. Disabled controls do not highlight. Keep I-beam cursors for editable text and dedicated resize/fade cursors.
 - Track rename hit areas and I-beam regions cover only the rendered name text, not the rest of the header or the nesting arrow. Edit project and track names inline at the label position, without a popup, field background, border or automatic select-all. Activation must preserve text geometry and neighboring positions; grow the editor with the typed text, capped at its existing layout boundary. Limit project and track names to 100 Swift Characters (including spaces; do not split emoji). Scroll overflowing inline text horizontally to keep the insertion point and latest typed character visible after layout. Enter commits a nonempty trimmed name, Escape cancels, and leaving the field commits a valid name (an empty field retains the previous name). Keep transport shortcuts inactive while typing.
-- Project and track rename targets use the I-beam text cursor. Track MUTE and FX controls use the pointing-hand cursor. Refresh timeline cursor regions when tracks, layout, or editing availability change.
+- Project and track rename targets use the I-beam text cursor. Track MUTE and FX controls use the standard arrow cursor. Refresh timeline cursor regions when tracks, layout, or editing availability change.
 
 ## Project audio format
 
@@ -176,7 +176,7 @@
 
 ## Track Solo
 
-- Add SOLO immediately right of MUTE and before FX, with equal button widths, centered labels, a pointing-hand cursor and a clear blue active state. Multiple Solo selections remain enabled independently. Dim excluded tracks and their fragments the same way as muted tracks; respect audible nested branches. No Solo means all unmuted tracks play; Solo parent includes its subtree, while Solo child passes through ancestor effects without ancestor dry fragments or unrelated branches. Mute remains authoritative. Use the same routing for playback and export; dry fragment processing/joining stays independent. Apply live changes on the playback worker without seeking, rebuilding the graph or resetting effects. Persist Solo with legacy default false, support Undo/Redo, and keep toggles silent.
+- Add SOLO immediately right of MUTE and before FX, with equal button widths, centered labels, the standard arrow cursor and a clear blue active state. Multiple Solo selections remain enabled independently. Dim excluded tracks and their fragments the same way as muted tracks; respect audible nested branches. No Solo means all unmuted tracks play; Solo parent includes its subtree, while Solo child passes through ancestor effects without ancestor dry fragments or unrelated branches. Mute remains authoritative. Use the same routing for playback and export; dry fragment processing/joining stays independent. Apply live changes on the playback worker without seeking, rebuilding the graph or resetting effects. Persist Solo with legacy default false, support Undo/Redo, and keep toggles silent.
 
 ## Track header meters
 
