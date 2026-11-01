@@ -150,6 +150,7 @@ extension AppDelegate {
         editor.seek(to: 2); editor.playPause()
         guard editor.isPlaying, bpmButton.title == "1.4" else { throw SounderError.message("Playback did not replace BPM with the current bar and beat") }
         editor.seek(to: 4)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.12)); editor.updateTransportPosition()
         guard bpmButton.title == "2.3" else { throw SounderError.message("Bar/beat display did not follow live seeking") }
         editor.stop(); refresh()
         guard bpmButton.title == "90 BPM" else { throw SounderError.message("Stopped playback did not restore BPM") }

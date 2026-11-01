@@ -18,11 +18,23 @@ final class Editor: NSObject {
     var dirty = false
     var projectURL: URL?
     var player: LivePlayback?
+    private var pausedPlayer: LivePlayback?
+    private var pausedMixKey: Data?
+    private var followsPausedCursor = false
+    private var pausedCursorSnapshot: Double?
+    private var pausedCursorIsCurrent: Bool { followsPausedCursor && pausedCursorSnapshot == cursor }
     private(set) var shuttle: ShuttlePlayback?
     private var shuttleGesture: (direction: Double, resume: Bool)?
     private var shuttleReleasing = false
     private var mixCache: (key: Data, graph: StreamingGraph)?
-    func invalidateMixCache() { mixCache = nil }
+    func invalidateMixCache() { mixCache = nil; discardPausedPlayback() }
+    private func discardPausedPlayback() {
+        guard let paused = pausedPlayer else { return }
+        if pausedCursorIsCurrent { cursor = paused.currentTime }
+        pausedPlayer = nil; pausedMixKey = nil; followsPausedCursor = false
+        timer?.invalidate(); timer = nil
+        paused.stop()
+    }
     private func mixCacheKey() throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
         return try encoder.encode(project)
@@ -296,7 +308,7 @@ final class Editor: NSObject {
     }
     func importAudio(urls: [URL], placement: AudioImportPlacement = .singleTrack) {
         guard !busy, !urls.isEmpty else { return }
-        if player != nil { stop() }
+        if player != nil || pausedPlayer != nil { stop() }
         importer?.close()
         let job = AudioImportController(editor: self, urls: urls, placement: placement)
         importer = job; job.startImport()
@@ -336,7 +348,7 @@ final class Editor: NSObject {
     }
     func record() {
         guard !busy else { return }
-        if player != nil { stop() }
+        if player != nil || pausedPlayer != nil { stop() }
         requestingMic = true; update()
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             DispatchQueue.main.async {
@@ -424,6 +436,10 @@ final class Editor: NSObject {
                 player.completeReturn(); shuttleReleasing = false; shuttleGesture = nil
             }
         } else if let shuttle { cursor = shuttle.currentTime }
+        else if followsPausedCursor, let pausedPlayer {
+            if pausedCursorIsCurrent { cursor = pausedPlayer.currentTime; pausedCursorSnapshot = cursor }
+            else { followsPausedCursor = false; timer?.invalidate(); timer = nil }
+        }
         changed?()
     }
     func startTimer() {
@@ -472,27 +488,42 @@ final class Editor: NSObject {
     func effectsChanged() {
         invalidateMixCache()
         let playing = isPlaying
-        if player != nil { stop() }
+        if player != nil || pausedPlayer != nil { stop() }
         let ids = Set(project.tracks.flatMap(\.effects).map(\.id))
         pluginHosts = pluginHosts.filter { ids.contains($0.key) }
         if playing { startPlayback(rememberStart: false) }
     }
-    // There is no retained paused stream: cursor is the sole stopped position.
+    // Explicit Stop destroys active and paused transports; Space retains only
+    // an unchanged prepared transport, with cursor as the source of truth.
     private func stopPlayback(at position: Double? = nil) {
         timer?.invalidate(); timer = nil
-        guard let playback = player else { return }
-        let stoppedPosition = position ?? playback.currentTime
-        player = nil // Detach before stop can publish any completion callbacks.
+        guard let playback = player ?? pausedPlayer else { return }
+        let stoppedPosition = position ?? (player != nil || pausedCursorIsCurrent ? playback.currentTime : cursor)
+        player = nil; pausedPlayer = nil; pausedMixKey = nil; followsPausedCursor = false // Detach before callbacks.
         playback.stop()
         stopTrackMeters()
         cursor = stoppedPosition
     }
     func seek(to position: Double) {
         guard !isRecording, !requestingMic, !isImporting, position.isFinite else { return }
+        let target = max(0, position)
+        if !isShuttling, let playback = player, playback.isPlaying {
+            guard target < Double(playback.graph.totalFrames) / audio.sampleRate else {
+                stopPlayback(at: target); update(); return
+            }
+            playback.seek(to: target)
+            lastPlaybackStart = playback.start
+            cursor = playback.currentTime
+            update(); return
+        }
+        if player == nil, pausedPlayer != nil, !isShuttling {
+            followsPausedCursor = false; timer?.invalidate(); timer = nil
+            cursor = target; update(); return
+        }
         let continuePlaying = shuttleGesture?.resume ?? isPlaying
         endShuttle(resume: false)
         stopPlayback()
-        cursor = max(0, position)
+        cursor = target
         if continuePlaying { startPlayback() } else { update() }
     }
     func playPause() {
@@ -502,15 +533,28 @@ final class Editor: NSObject {
             stop(); cursor = start; update(); return
         }
         guard !requestingMic, !isImporting else { return }
-        if player != nil { stop(); return }
+        if let playback = player {
+            do {
+                try playback.pause()
+                pausedMixKey = try mixCacheKey(); pausedPlayer = playback; player = nil
+                followsPausedCursor = true; cursor = playback.currentTime; pausedCursorSnapshot = cursor
+                playback.didPause = { [weak self, weak playback] position in
+                    guard let self, let playback, self.pausedPlayer === playback, self.pausedCursorIsCurrent else { return }
+                    self.cursor = position; self.pausedCursorSnapshot = position; self.timer?.invalidate(); self.timer = nil; self.update()
+                }
+                stopTrackMeters(); update()
+            } catch { stopPlayback(); self.error(error) }
+            return
+        }
         startPlayback()
     }
     func restartFromLastStart() {
         if isRecording { restartRecording(); return }
         guard !requestingMic, !isImporting else { return }
         let start = lastPlaybackStart ?? 0
+        if !isShuttling, isPlaying { seek(to: start); return }
         endShuttle(resume: false)
-        stopPlayback()
+        followsPausedCursor = false
         cursor = start
         startPlayback()
     }
@@ -537,6 +581,7 @@ final class Editor: NSObject {
     }
     func beginShuttle(direction: Double) {
         guard !isRecording, !requestingMic, !isImporting, !isNormalizing, duration > 0 else { return }
+        discardPausedPlayback()
         let direction = direction < 0 ? -1.0 : 1.0
         if shuttleGesture?.direction == direction && !shuttleReleasing { return }
         shuttleReleasing = false
@@ -608,6 +653,21 @@ final class Editor: NSObject {
         do {
             guard duration > 0 else { return }
             flushPluginEdits()
+            if let playback = pausedPlayer, pausedMixKey == (try mixCacheKey()) {
+                let position = pausedCursorIsCurrent ? playback.pausePosition : max(0, cursor)
+                guard position < Double(playback.graph.totalFrames) / audio.sampleRate else { update(); return }
+                pausedPlayer = nil; pausedMixKey = nil; followsPausedCursor = false
+                player = playback
+                playback.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
+                try playback.resume(to: position)
+                playback.didResume = { [weak self, weak playback] in
+                    guard let self, let playback, self.player === playback else { return }
+                    self.updateTransportPosition()
+                }
+                if rememberStart { lastPlaybackStart = playback.start }
+                cursor = playback.currentTime; startTimer(); update(); return
+            }
+            discardPausedPlayback()
             let graph = try playbackGraph()
             let start = max(0, cursor)
             guard start < Double(graph.totalFrames) / audio.sampleRate else { update(); return }
@@ -776,6 +836,7 @@ final class Editor: NSObject {
     }
     func open(from url: URL) throws {
         guard !busy else { throw SounderError.message("Stop the current operation before opening a project") }
+        discardPausedPlayback()
         do {
             let loaded = try ProjectStorage.load(from: url)
             audio.configure(loaded.audioFormat)

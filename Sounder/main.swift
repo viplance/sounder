@@ -370,7 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         notificationOverlay = ToastOverlay.install(in: content, center: editor.notifications)
         editor.changed = { [weak self] in self?.refresh() }
         buildMenu()
-        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
             if self.handleShuttleShortcut(event) { return nil }
             return self.handlePhysicalShortcut(event) ? nil : event
@@ -861,16 +861,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
     }
     private var shuttleKey: UInt16?
-    @objc private func cancelShuttle() { shuttleKey = nil; editor.endShuttle(resume: false) }
+    private var releasedShuttleKey: UInt16?
+    @objc private func cancelShuttle() { shuttleKey = nil; releasedShuttleKey = nil; editor.endShuttle(resume: false) }
     @discardableResult func handleShuttleShortcut(_ event: NSEvent) -> Bool {
+        if event.type == .flagsChanged {
+            if let key = shuttleKey, !event.modifierFlags.contains(.shift) {
+                releasedShuttleKey = key; shuttleKey = nil
+                editor.releaseShuttle(); timeline.centerOnPlayhead()
+            }
+            return false
+        }
         guard event.keyCode == 123 || event.keyCode == 124 else { return false }
         if event.type == .keyUp {
+            if releasedShuttleKey == event.keyCode { releasedShuttleKey = nil; return true }
             guard shuttleKey == event.keyCode else { return false }
             shuttleKey = nil; editor.releaseShuttle(); timeline.centerOnPlayhead(); return true
         }
+        if event.type == .keyDown, releasedShuttleKey == event.keyCode {
+            if event.isARepeat { return true }
+            releasedShuttleKey = nil
+        }
         guard event.type == .keyDown, event.window === window, NSApp.modalWindow == nil,
               !(window.firstResponder is NSTextView), timeline.canSelectRange,
-              event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty else { return false }
+              event.modifierFlags.intersection([.command, .shift, .option, .control]) == [.shift] else { return false }
         if !event.isARepeat || shuttleKey != event.keyCode {
             shuttleKey = event.keyCode
             timeline.beginShuttle(direction: event.keyCode == 123 ? -1 : 1)

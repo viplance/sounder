@@ -253,7 +253,9 @@ extension AppDelegate {
         editor.playPause()
         try check(editor.isPlaying && editor.player?.start == 1.25, "Play starts exactly at the ruler's selected time")
         RunLoop.current.run(until: Date().addingTimeInterval(0.04))
-        editor.playPause(); let stoppedAt = editor.cursor
+        editor.playPause()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        let stoppedAt = editor.cursor
         RunLoop.current.run(until: Date().addingTimeInterval(0.08))
         try check(editor.cursor == stoppedAt && editor.player == nil, "Stopped cursor remains fixed without a hidden paused stream")
         editor.playPause()
@@ -261,7 +263,7 @@ extension AppDelegate {
         RunLoop.current.run(until: Date().addingTimeInterval(0.16))
         try check(editor.cursor >= stoppedAt && editor.cursor < stoppedAt + 0.4, "Cursor follows continued playback without jumping to the previous start")
         click(time: 2.5, y: timeline.ruler + timeline.rowHeight / 2)
-        try check(editor.isPlaying && editor.player?.start == 2.5 && editor.cursor == 2.5 && !editor.selection.isEmpty, "Clicking a fragment seeks and keeps playback active")
+        try check(editor.isPlaying && editor.player?.start == 2.5 && !editor.selection.isEmpty, "Clicking a fragment seeks and keeps playback active (playing: \(editor.isPlaying), start: \(String(describing: editor.player?.start)), cursor: \(editor.cursor), selection: \(editor.selection.count), visible: \(timeline.visibleRect))")
         click(time: 1, y: timeline.ruler / 2)
         try check(editor.isPlaying && editor.player?.start == 1, "Clicking the ruler during playback immediately plays from the selected time")
         click(time: 3, y: timeline.ruler + timeline.rowHeight * 2.5)
@@ -301,7 +303,7 @@ func runTransportPositionTests() throws {
         return playback
     })
     editor.project.tracks[0].clips = [Clip(name: "Position marker", source: url.path, start: 0, duration: 4, order: 1)]
-    func verifyAudioAndCursor(blocks: Int) throws {
+    func verifyAudioAndCursor(blocks: Int, fadeIn: Bool = false, transition: Bool = false) throws {
         guard let playback = editor.player else { throw SounderError.message("Playback did not start") }
         let first = Int((playback.start * sampleRate).rounded())
         let buffer = AVAudioPCMBuffer(pcmFormat: playback.engine.manualRenderingFormat, frameCapacity: 512)!
@@ -309,53 +311,72 @@ func runTransportPositionTests() throws {
         for block in 0..<blocks {
             RunLoop.current.run(until: Date().addingTimeInterval(0.001)); playback.queue.sync {}
             guard try playback.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Could not render transport test") }
+            if transition && block < 8 { editor.updateTransportPosition(); lastCursor = editor.cursor; continue }
+            let sourceFirst = transition ? Int(((Double(buffer.floatChannelData![0][0]) - 0.05) / 0.4 * Double(frames)).rounded()) : first + block * 512
+            guard sourceFirst >= first && sourceFirst + 512 <= frames else { throw SounderError.message("Transport resumed an obsolete source position") }
             for channel in 0..<2 { for frame in 0..<512 {
                 let actual = buffer.floatChannelData![channel][frame]
-                let expected = source.channels[channel][first + block * 512 + frame]
+                let gain = fadeIn ? Float(min(1, Double(block * 512 + frame) / 479)) : 1
+                let expected = source.channels[channel][sourceFirst + frame] * gain
                 guard abs(actual - expected) < 0.000001 else { throw SounderError.message("Rendered audio does not match the cursor's selected source position") }
             } }
             editor.updateTransportPosition()
-            let end = Double(first + (block + 1) * 512) / sampleRate
+            let end = Double(sourceFirst + 512) / sampleRate
             guard editor.cursor >= lastCursor && abs(editor.cursor - end) <= 512 / sampleRate else { throw SounderError.message("Cursor jumped backwards or diverged from the rendered audio") }
             lastCursor = editor.cursor
         }
+    }
+    func settlePause(_ playback: LivePlayback) throws {
+        let buffer = AVAudioPCMBuffer(pcmFormat: playback.engine.manualRenderingFormat, frameCapacity: 512)!
+        for _ in 0..<12 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.002)); playback.queue.sync {}
+            if playback.pauseComplete { break }
+            guard try playback.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render Space pause fade") }
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        try check(playback.pauseComplete && playback.engine.isRunning && !playback.node.isPlaying, "Space finishes its fade and pauses only the node, retaining the running engine")
     }
     editor.restartFromLastStart()
     try check(editor.player?.start == 0 && editor.lastPlaybackStart == 0, "Enter before the first start plays from zero")
     editor.stop()
     editor.seek(to: 0.75); editor.playPause()
     try verifyAudioAndCursor(blocks: 19)
-    editor.playPause()
+    let prepared = editor.player!
+    editor.playPause(); try settlePause(prepared)
     let stoppedAt = editor.cursor
-    try check(editor.player == nil && !editor.isPlaying, "Stopping releases all queued audio and stores one cursor position")
+    try check(editor.player == nil && !editor.isPlaying, "Space pauses at one audible cursor position")
     RunLoop.current.run(until: Date().addingTimeInterval(0.06))
     try check(editor.cursor == stoppedAt, "Cursor remains exactly at the stopped audio position")
     for _ in 0..<3 {
         let selected = editor.cursor
         editor.playPause()
         try check(editor.player?.start == selected, "Play starts from the stopped cursor on every continuation")
-        try verifyAudioAndCursor(blocks: 21)
-        editor.playPause()
+        try check(editor.player === prepared, "Space resumes the same prepared transport")
+        try verifyAudioAndCursor(blocks: 21, fadeIn: true)
+        editor.playPause(); try settlePause(prepared)
         try check(editor.cursor > selected && editor.player == nil, "Sound and cursor advance together across repeated stop/continue cycles")
     }
+    let pausedMarker = editor.lastPlaybackStart!
+    editor.seek(to: 0.25); editor.restartFromLastStart()
+    try check(editor.player === prepared && editor.player?.start == pausedMarker, "Enter from pause reuses the prepared engine and selects the last-start marker")
+    try verifyAudioAndCursor(blocks: 12, fadeIn: true)
+    editor.playPause(); try settlePause(prepared)
     editor.seek(to: 0.25); editor.playPause()
-    try verifyAudioAndCursor(blocks: 23)
-    editor.seek(to: 2.25)
-    try check(editor.isPlaying && editor.player?.start == 2.25, "Seeking forward during playback stays active at the new position")
-    try verifyAudioAndCursor(blocks: 17)
-    editor.seek(to: 0.5)
-    try check(editor.isPlaying && editor.player?.start == 0.5, "Seeking backward during playback stays active at the new position")
-    try verifyAudioAndCursor(blocks: 17)
-    editor.seek(to: 2.25)
+    try check(editor.player === prepared, "Moving the paused cursor keeps the prepared engine for Space")
+    try verifyAudioAndCursor(blocks: 23, fadeIn: true)
+    editor.stop()
+    try runLiveSeekAudioTests()
+    editor.seek(to: 2.25); editor.playPause()
     try verifyAudioAndCursor(blocks: 17)
     editor.stop()
-    try check(editor.cursor > 2.25, "Seeking backwards and forwards starts both rendered channels and the cursor at the selected frame")
     editor.seek(to: 3)
     editor.restartFromLastStart()
     try check(editor.player?.start == 2.25 && editor.lastPlaybackStart == 2.25, "Enter ignores a stopped cursor move and plays from the last start")
     try verifyAudioAndCursor(blocks: 17)
+    let beforeEnter = editor.player!
     editor.restartFromLastStart()
-    try verifyAudioAndCursor(blocks: 17)
+    try check(editor.player === beforeEnter, "Enter while playing seeks in the same running transport")
+    try verifyAudioAndCursor(blocks: 17, transition: true)
     editor.stop()
     try check(editor.lastPlaybackStart == 2.25, "Repeated Enter preserves the marked start and renders the corresponding PCM")
     editor.restartFromLastStart()
@@ -394,7 +415,7 @@ extension AppDelegate {
         key(123)
         try check(editor.cursor == 0 && !editor.isPlaying, "Command-Left seeks to zero while stopped")
         key(124, command: false)
-        try check(editor.cursor == 0 && editor.isShuttling, "Unmodified Right starts continuous shuttle at the current position without a seek step")
+        try check(editor.cursor > 0 && editor.cursor < editor.duration && !editor.isShuttling, "Unmodified Right retains its original one-percent seek step")
         editor.seek(to: 3); editor.playPause(); key(123)
         try check(editor.isPlaying && editor.player?.start == 0, "Command-Left restarts active playback at the beginning without pausing")
         key(124)
@@ -712,7 +733,7 @@ extension AppDelegate {
         func check(_ value: Bool, _ message: String) throws {
             guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
         }
-        func key(_ type: NSEvent.EventType, _ code: UInt16, repeatKey: Bool = false, flags: NSEvent.ModifierFlags = []) -> NSEvent {
+        func key(_ type: NSEvent.EventType, _ code: UInt16, repeatKey: Bool = false, flags: NSEvent.ModifierFlags = [.shift]) -> NSEvent {
             NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: repeatKey, keyCode: code)!
         }
         func waitFor(_ condition: () -> Bool) {
@@ -725,8 +746,23 @@ extension AppDelegate {
         }
         window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
         editor.stop(); editor.zoom = 500; editor.seek(to: 5); refresh()
+        let originalTempo = editor.project.tempoMode
+        for tempo in [false, true] {
+            editor.project.tempoMode = tempo; editor.seek(to: 5); refresh()
+            let step = (timeline.visibleRect.width - timeline.header) / editor.zoom * 0.01
+            let right = key(.keyDown, 124, flags: [])
+            try check(!handleShuttleShortcut(right), "Plain arrows never enter shuttle (Tempo: \(tempo))")
+            timeline.keyDown(with: right)
+            try check(abs(editor.cursor - (5 + step)) < 1e-6 && !editor.isShuttling && !editor.isPlaying, "Plain Right restores the historical viewport step (Tempo: \(tempo))")
+            timeline.keyDown(with: key(.keyDown, 123, flags: []))
+            try check(abs(editor.cursor - 5) < 1e-6, "Plain Left restores the same step in the opposite direction (Tempo: \(tempo))")
+            editor.playPause(); timeline.keyDown(with: right)
+            try check(editor.isPlaying && !editor.isShuttling && editor.player?.isShuttling == false, "Plain seeking preserves normal playback (Tempo: \(tempo))")
+            editor.stop()
+        }
+        editor.project.tempoMode = originalTempo; editor.seek(to: 5); refresh()
         let before = editor.cursor
-        try check(handleShuttleShortcut(key(.keyDown, 123)), "Unmodified Left is captured before native menu key equivalents")
+        try check(handleShuttleShortcut(key(.keyDown, 123)), "Shift-Left is captured before native menu key equivalents")
         try check(editor.player == nil && editor.shuttle != nil && editor.isShuttling && editor.cursor == before && centered(), "Arrow-down immediately creates shuttle at the exact paused cursor, without a step or hold timer")
         _ = handleShuttleShortcut(key(.keyUp, 123))
         waitFor { !editor.isShuttling }
@@ -800,6 +836,266 @@ extension AppDelegate {
         _ = handleShuttleShortcut(key(.keyUp, 124)); editor.stop()
         RunLoop.current.run(until: Date().addingTimeInterval(0.25))
         try check(editor.player == nil && editor.shuttle == nil && !editor.isShuttling && !editor.isPlaying, "Stop cancels background effect restoration without a delayed playback restart")
+        editor.seek(to: 5)
+        _ = handleShuttleShortcut(key(.keyDown, 124))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        let shiftUp = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56)!
+        _ = handleShuttleShortcut(shiftUp)
+        try check(handleShuttleShortcut(key(.keyDown, 124, repeatKey: true, flags: [])), "Releasing Shift suppresses repeats from the already-held arrow during braking")
+        waitFor { !editor.isShuttling }
+        try check(!editor.isPlaying && !editor.isShuttling, "Releasing Shift alone smoothly ends paused shuttle")
+        _ = handleShuttleShortcut(key(.keyUp, 124, flags: []))
         editor.seek(to: 5.8); editor.zoom = 70; refresh()
     }
+}
+
+
+// Inspect actual device-graph output, including the old queued samples and the
+// complete crossfade. A correct cursor alone must not mask a silent restart.
+func runLiveSeekAudioTests() throws {
+    func check(_ condition: Bool, _ message: String) throws {
+        guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SounderLiveSeek-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = try AudioStore(directory: dir)
+    let format = ProjectAudioFormat(bitDepth: 32)
+    store.configure(format)
+    let samples = (0..<192_000).map { Float(0.1 + Double($0) / 480_000) }
+    let url = store.freshURL()
+    try store.write(AudioSignal(channels: [samples, samples.map { -$0 * 0.5 }]), to: url)
+    let effect = PluginEffect(name: "Live gain", path: "test", classID: "test")
+    let track = Track(name: "Seek", clips: [Clip(name: "Seek", source: url.path, start: 0, duration: 4, order: 1)], effects: [effect])
+    let project = Project(tracks: [track], audioFormat: format)
+    var instances = 0, calls = 0
+    let graph = try StreamingGraph(project: project, store: store) { _ in
+        instances += 1
+        return StreamingEffect(latency: 0, tail: 0) { samples in calls += 1; return samples.map { $0 * 0.5 } }
+    }
+    let playback = LivePlayback(graph: graph, format: format, start: 0.5)
+    let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+    try playback.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+    let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+    try playback.startPlayback()
+    defer { playback.stop() }
+    let engine = playback.engine, node = playback.node
+    var outputFrames = 0
+    func capture() throws -> [Float] {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.001)); playback.queue.sync {}
+        guard try engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render in-place seek") }
+        outputFrames += 512
+        return (0..<512).flatMap { i in [buffer.floatChannelData![0][i], buffer.floatChannelData![1][i]] }
+    }
+    for _ in 0..<12 { _ = try capture() }
+    var sourceOrigin = 24_000, outputOrigin = 0
+    for target in [96_000, 12_000, 144_000] {
+        playback.queue.sync {}
+        let oldNext = graph.position
+        let boundary = outputOrigin + oldNext - sourceOrigin
+        let callsBefore = calls
+        let began = ProcessInfo.processInfo.systemUptime
+        playback.seek(to: Double(target) / 48_000)
+        playback.queue.sync {}
+        let elapsed = ProcessInfo.processInfo.systemUptime - began
+        try check(engine.isRunning && node.isPlaying && playback.engine === engine && playback.node === node && playback.graph === graph && instances == 1,
+                  "Live seek retains the running engine, player, graph and effect instances")
+        try check(calls - callsBefore <= 2, "Live seek processes only the short transition, never project history")
+        try check(elapsed < 0.1, "Live seek preparation finishes without a main-thread rebuild (\(elapsed * 1000) ms)")
+        var maximum = 0.0, previous: Float?
+        for _ in 0..<14 {
+            let first = outputFrames
+            let values = try capture()
+            for i in 0..<512 {
+                let index = first + i
+                let delta = index - boundary
+                let oldFrame = oldNext + delta
+                let expected: Double
+                if delta < 0 { expected = Double(samples[sourceOrigin + index - outputOrigin]) * 0.5 }
+                else if delta < 480 {
+                    let blend = Double(delta) / 479
+                    expected = Double(samples[oldFrame]) * 0.5 * (1 - blend) + Double(samples[target + delta]) * 0.5 * blend
+                } else { expected = Double(samples[target + delta]) * 0.5 }
+                maximum = max(maximum, abs(Double(values[i * 2]) - expected), abs(Double(values[i * 2 + 1]) + expected * 0.5))
+                if let previous { try checkSeekStep(abs(values[i * 2] - previous) < 0.001) }
+                previous = values[i * 2]
+            }
+            // The visible cursor must follow the source actually being heard.
+            let audible = playback.currentTime * 48_000
+            let expectedCursor = outputFrames < boundary ? sourceOrigin + outputFrames - outputOrigin : target + outputFrames - boundary
+            try checkSeekStep(abs(audible - Double(expectedCursor)) <= 512)
+        }
+        try check(maximum < 0.000001, "Both rendered channels preserve queued audio and a sample-accurate 10 ms seek crossfade (error: \(maximum))")
+        sourceOrigin = target; outputOrigin = boundary
+    }
+    // Latest pending request wins, without reviving any discarded stream.
+    playback.queue.suspend()
+    playback.seek(to: 2); playback.seek(to: 0.25); playback.seek(to: 1.5)
+    playback.queue.resume(); playback.queue.sync {}
+    try check(playback.seekPosition == 1.5 && graph.position == 72_000, "Rapid pending seeks coalesce to the latest position")
+    for _ in 0..<12 { _ = try capture() }
+    try check(playback.currentTime >= 1.5 && playback.currentTime < 1.8, "Rapid seeking leaves cursor and audio on the latest destination")
+    var completions = 0
+    playback.finished = { _ in completions += 1 }
+    playback.seek(to: Double(graph.totalFrames - 700) / 48_000); playback.queue.sync {}
+    for _ in 0..<2 { _ = try capture() }
+    playback.seek(to: 0.5); playback.queue.sync {}
+    for _ in 0..<16 { _ = try capture() }
+    try check(completions == 0 && playback.isPlaying && playback.currentTime >= 0.5 && playback.currentTime < 0.8,
+              "Seeking away from an already queued final buffer does not stop the new destination")
+    // A processor with real delay must receive only its latency worth of
+    // pre-roll, without rebuilding or replaying earlier project audio.
+    let latency = 2048
+    var delay = [Float](repeating: 0, count: latency * 2), delayPosition = 0, delayedCalls = 0
+    let delayed = try StreamingGraph(project: project, store: store) { _ in
+        StreamingEffect(latency: latency, tail: 0) { input in
+            delayedCalls += 1
+            return input.map { value in
+                let output = delay[delayPosition]
+                delay[delayPosition] = value; delayPosition = (delayPosition + 1) % delay.count
+                return output
+            }
+        }
+    }
+    _ = try delayed.render(frames: 512)
+    let before = delayedCalls
+    try delayed.seek(to: 96_000)
+    let delayedOutput = try delayed.render(frames: 512)
+    try check(delayedCalls - before == 5 && (0..<512).allSatisfy { abs(delayedOutput[$0 * 2] - samples[96_000 + $0]) < 1e-6 },
+              "Declared effect latency is compensated after seeking with bounded pre-roll")
+    playback.stop()
+    for rate in [44_100.0, 192_000.0] {
+        let settings = ProjectAudioFormat(sampleRate: rate, bitDepth: 32)
+        store.configure(settings)
+        let formatProject = Project(tracks: [Track(name: "Format", clips: track.clips)], audioFormat: settings)
+        let reference = try store.renderAudio(formatProject, onlyTrack: formatProject.tracks[0].id)
+        let formatGraph = try StreamingGraph(project: formatProject, store: store) { _ in fatalError("No effects") }
+        let live = LivePlayback(graph: formatGraph, format: settings, start: 0)
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2)!
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        let captured = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+        try live.startPlayback()
+        var frame = 0
+        func block() throws {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.001)); live.queue.sync {}
+            guard try live.engine.renderOffline(512, to: captured) == .success else { throw SounderError.message("Cannot render format seek") }
+        }
+        for _ in 0..<10 { try block(); frame += 512 }
+        // AVAudioPlayerNode delivers consumption notifications asynchronously
+        // after offline rendering returns. Drain them before fixing the queue
+        // boundary; no output clock runs while this offline engine is idle.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        live.queue.sync {}
+        let boundary = formatGraph.position
+        // Both requests are processed before any new audio is queued. The
+        // second must fade from the audible stream, never the unheard target.
+        live.seek(to: 1); live.queue.sync {}
+        live.seek(to: 2); live.queue.sync {}
+        let target = Int(2 * rate), fade = Int(rate * 0.010)
+        var maximum = 0.0, detail = ""
+        for _ in 0..<26 {
+            try block()
+            for i in 0..<512 {
+                let delta = frame + i - boundary
+                for ch in 0..<2 {
+                    let expected: Float
+                    if delta < 0 { expected = reference.channels[ch][frame + i] }
+                    else if delta < fade {
+                        let blend = Float(delta) / Float(fade - 1)
+                        expected = reference.channels[ch][boundary + delta] * (1 - blend) + reference.channels[ch][target + delta] * blend
+                    } else { expected = reference.channels[ch][target + delta] }
+                    let difference = abs(Double(captured.floatChannelData![ch][i] - expected))
+                    if difference > maximum { maximum = difference; detail = "index=\(frame + i) boundary=\(boundary) ch=\(ch) actual=\(captured.floatChannelData![ch][i]) expected=\(expected) cursor=\(live.currentTime) graph=\(formatGraph.position)" }
+                }
+            }
+            frame += 512
+        }
+        try check(maximum < 1e-6 && live.isPlaying && live.currentTime >= 2,
+                  "Repeated processed seeks preserve the audible crossfade at \(Int(rate)) Hz (error: \(maximum), \(detail))")
+        live.stop()
+    }
+    let cache = try ProcessedMixCache(channels: 2)
+    try cache.write([0.25, -0.5, 0.1, -0.2], at: 1000)
+    try check(cache.cachedRegions(in: 0..<2000) == [1000..<1002] && cache.cachedRegions(in: 0..<512).isEmpty,
+              "Sparse processed cache never treats skipped audio as cached silence")
+    try check(try cache.read(1000..<1002) == [0.25, -0.5, 0.1, -0.2], "Sparse cache retains exact processed samples at their source positions")
+}
+
+private func checkSeekStep(_ value: Bool) throws {
+    guard value else { throw SounderError.message("Seek output clicks, contains a gap, or diverges from its audible cursor") }
+}
+
+func runPauseContinuityTests() throws {
+    func check(_ condition: Bool, _ message: String) throws {
+        guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SounderPause-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = try AudioStore(directory: dir)
+    let format = ProjectAudioFormat(bitDepth: 32)
+    let values = (0..<192_000).map { Float(0.1 + Double($0) / 480_000) }
+    let url = store.freshURL()
+    try store.write(AudioSignal(channels: [values, values.map { -$0 * 0.5 }]), to: url)
+    let project = Project(tracks: [Track(name: "Pause", clips: [Clip(name: "Pause", source: url.path, start: 0, duration: 4, order: 1)])], audioFormat: format)
+    let graph = try StreamingGraph(project: project, store: store) { _ in fatalError("No effects") }
+    let live = LivePlayback(graph: graph, format: format, start: 0.5)
+    let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+    try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+    let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+    try live.startPlayback()
+    defer { live.stop() }
+    func block() throws -> [Float] {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.002)); live.queue.sync {}
+        guard try live.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render pause audio") }
+        return (0..<512).flatMap { [buffer.floatChannelData![0][$0], buffer.floatChannelData![1][$0]] }
+    }
+    for _ in 0..<10 { _ = try block() }
+    RunLoop.current.run(until: Date().addingTimeInterval(0.01)); live.queue.sync {}
+    try live.pause()
+    let end = Int((live.pausePosition * 48_000).rounded()), fadeStart = end - 480
+    var sourceFrame = 24_000 + 5120, error = 0.0
+    for _ in 0..<10 {
+        if live.pauseComplete { break }
+        let output = try block()
+        for i in 0..<512 {
+            let frame = sourceFrame + i
+            let gain = frame < fadeStart ? 1 : max(0, 1 - Double(frame - fadeStart) / 479)
+            let expected = Float(Double(values[frame]) * gain)
+            error = max(error, abs(Double(output[i * 2] - expected)), abs(Double(output[i * 2 + 1] + expected * 0.5)))
+        }
+        sourceFrame += 512
+    }
+    try check(error < 1e-6 && live.pauseComplete && live.engine.isRunning && !live.node.isPlaying && live.currentTime == live.pausePosition,
+              "Space renders a sample-accurate stereo fade-out and freezes at its audible end (error: \(error))")
+    let frozen = live.currentTime, rendered = live.renderedFrames
+    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+    try check(live.currentTime == frozen && live.renderedFrames == rendered, "Paused transport does not advance the cursor or process audio")
+    let engine = live.engine, node = live.node
+    try live.resume(to: frozen)
+    error = 0
+    for n in 0..<12 {
+        let output = try block()
+        for i in 0..<512 {
+            let frame = n * 512 + i
+            let gain = min(1, Double(frame) / 479)
+            let expected = Float(Double(values[end + frame]) * gain)
+            error = max(error, abs(Double(output[i * 2] - expected)), abs(Double(output[i * 2 + 1] + expected * 0.5)))
+        }
+    }
+    try check(error < 1e-6 && live.engine === engine && live.node === node && live.graph === graph && live.isPlaying,
+              "Space resumes with a sample-accurate fade-in on the same engine, node and graph (error: \(error))")
+    // Resume before the pause fade is presented: the fade-in must already be
+    // queued, so waiting for a presentation callback cannot leave a silent gap.
+    try live.pause(); try live.resume(to: live.pausePosition)
+    var previous: Float?, jump: Float = 0, zeros = 0, longestSilence = 0
+    for _ in 0..<20 {
+        let output = try block()
+        for i in 0..<512 {
+            let value = output[i * 2]
+            if abs(value) < 1e-6 { zeros += 1; longestSilence = max(longestSilence, zeros) } else { zeros = 0 }
+            if let previous { jump = max(jump, abs(value - previous)) }
+            previous = value
+        }
+    }
+    try check(live.isPlaying && live.engine === engine && longestSilence <= 2 && jump < 0.001,
+              "Rapid Space pause/resume joins fades without a gap or obsolete pause callback (silence: \(longestSilence), jump: \(jump))")
 }

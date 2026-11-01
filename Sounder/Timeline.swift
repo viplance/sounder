@@ -1122,7 +1122,7 @@ final class Timeline: NSView {
         let fragmentWidth = max(0, visible.width - header)
         guard fragmentWidth > 0 else { return }
         let step = Double(fragmentWidth) / editor.zoom * 0.01
-        let position = editor.player?.currentTime ?? editor.cursor
+        let position = editor.player?.seekPosition ?? editor.cursor
         editor.seek(to: position + direction * step)
         centerOnPlayhead()
     }
@@ -1139,8 +1139,12 @@ final class Timeline: NSView {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 1 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { editor.split() }
         else if event.keyCode == 45 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { NSApp.sendAction(#selector(AppDelegate.normalize), to: NSApp.delegate, from: self) }
-        else if event.keyCode == 123 { if event.modifierFlags.contains(.command) { seekBoundary(end: false) } else { beginShuttle(direction: -1) } }
-        else if event.keyCode == 124 { if event.modifierFlags.contains(.command) { seekBoundary(end: true) } else { beginShuttle(direction: 1) } }
+        else if event.keyCode == 123 || event.keyCode == 124 {
+            let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            if flags.contains(.command) { seekBoundary(end: event.keyCode == 124) }
+            else if flags.isEmpty { movePlayhead(direction: event.keyCode == 123 ? -1 : 1) }
+            else if (NSApp.delegate as? AppDelegate)?.handleShuttleShortcut(event) != true { super.keyDown(with: event) }
+        }
         else if event.keyCode == 126 { NSApp.sendAction(#selector(AppDelegate.zoomIn), to: NSApp.delegate, from: self) }
         else if event.keyCode == 125 { NSApp.sendAction(#selector(AppDelegate.zoomOut), to: NSApp.delegate, from: self) }
         else if event.keyCode == 36 || event.keyCode == 76 { editor.restartFromLastStart() }
@@ -1149,8 +1153,7 @@ final class Timeline: NSView {
         else { super.keyDown(with: event) }
     }
     override func keyUp(with event: NSEvent) {
-        if event.keyCode == 123 || event.keyCode == 124 { editor.releaseShuttle(); centerOnPlayhead() }
-        else { super.keyUp(with: event) }
+        if (NSApp.delegate as? AppDelegate)?.handleShuttleShortcut(event) != true { super.keyUp(with: event) }
     }
     override func menu(for event: NSEvent) -> NSMenu? {
         guard !editor.busy else { return nil }
