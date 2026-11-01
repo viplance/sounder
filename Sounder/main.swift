@@ -392,6 +392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             refresh()
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
+            if CommandLine.arguments.contains("--track-meters-ui-test") { try verifyTrackMetersUI() }
             if CommandLine.arguments.contains("--track-solo-ui-test") { try verifyTrackSoloUI() }
             if CommandLine.arguments.contains("--tempo-snapping-ui-test") { try verifyTempoSnappingUI() }
             if CommandLine.arguments.contains("--fragment-settings-ui-test") { try verifyFragmentSettingsUI() }

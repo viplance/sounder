@@ -375,7 +375,8 @@ final class Timeline: NSView {
     }
     func trackNameRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
-        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 12, height: 22)
+        let meterWidth: CGFloat = rows.indices.contains(row) && editor.showsTrackMeter(rows[row].0.id) ? 66 : 0
+        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 12 - meterWidth, height: 22)
     }
     func trackNameHitRect(row: Int, depth: Int) -> NSRect {
         guard rows.indices.contains(row) else { return .zero }
@@ -466,7 +467,7 @@ final class Timeline: NSView {
         let rect = trackNameHitRect(row: row, depth: rows[row].1)
         let name = nameField.isRenaming ? nameField.stringValue : rows[row].0.name
         let width = ceil((name as NSString).size(withAttributes: [.font: nameField.font!]).width) + 4
-        let frame = NSRect(x: rect.minX - 2, y: rect.minY, width: min(max(4, width), fragmentLeft - rect.minX - 10), height: 22)
+        let frame = NSRect(x: rect.minX - 2, y: rect.minY, width: min(max(4, width), trackNameRect(row: row, depth: rows[row].1).maxX - rect.minX), height: 22)
         guard visibleTrackRect.contains(frame) else {
             nameField.finish(commit: true); renamingTrack = nil; return
         }
@@ -601,6 +602,10 @@ final class Timeline: NSView {
         drawTrackHeaders(in: dirtyRect)
         drawRuler(in: dirtyRect)
     }
+    private func meterColor(_ amplitude: Double) -> NSColor {
+        let db = TrackLevelMeter.decibels(amplitude)
+        return db >= -1 ? .systemRed : db >= -6 ? .systemYellow : accent
+    }
     private func drawTrackHeaders(in dirtyRect: NSRect) {
         let dimmed = dimmedTrackIDs()
         let column = NSRect(x: pinnedHeaderX, y: ruler, width: header, height: max(0, bounds.height - ruler))
@@ -612,6 +617,16 @@ final class Timeline: NSView {
             let selected = editor.selectedTrack == track.id
             let trackDimmed = dimmed.contains(track.id)
             fill(NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight), selected ? NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.19, alpha: 1) : panelColor)
+            let meter = editor.trackMeters[track.id] ?? TrackLevelMeter()
+            let recording = editor.isRecording && editor.recordingTrack == track.id
+            let headerRect = NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight)
+            if (recording || editor.isPlaying) && meter.fraction > 0 {
+                let meterTint: NSColor = recording ? .systemRed : meterColor(meter.level)
+                fill(NSRect(x: headerRect.minX, y: y, width: header * meter.fraction, height: rowHeight), meterTint.withAlphaComponent(recording ? 0.3 : 0.25))
+            }
+            if editor.showsTrackMeter(track.id) {
+                label(meter.peakText, NSRect(x: fragmentLeft - 74, y: y + 12, width: 62, height: 16), size: 9, color: recording ? .systemRed : meterColor(meter.peak), weight: .medium, alignment: .right)
+            }
             let color = trackColors[index % trackColors.count]
             fill(NSRect(x: pinnedHeaderX, y: y + 1, width: 3, height: rowHeight - 2), selected ? color.withAlphaComponent(trackDimmed ? 0.3 : 1) : .clear)
             let editing = renamingTrack == track.id && nameField.isRenaming

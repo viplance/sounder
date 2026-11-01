@@ -442,3 +442,56 @@ extension AppDelegate {
         editor.seek(to: 5.8); editor.dirty = false; refresh()
     }
 }
+
+extension AppDelegate {
+    func verifyTrackMetersUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        let originalSelection = editor.selection, originalTrack = editor.selectedTrack
+        defer { editor.stop(); editor.project = original; editor.selection = originalSelection; editor.selectedTrack = originalTrack; editor.dirty = false; refresh() }
+        var files: [URL] = []
+        defer { for file in files { try? FileManager.default.removeItem(at: file) } }
+        var tracks: [Track] = []
+        for (name, amplitude) in [("Green level", Float(0.1)), ("Yellow level", 0.6), ("Red level", 0.95)] {
+            let url = editor.audio.freshURL(); files.append(url)
+            try editor.audio.write(AudioSignal(channels: [Array(repeating: amplitude, count: 96_000), Array(repeating: -amplitude * 0.5, count: 96_000)]), to: url)
+            tracks.append(Track(name: name, clips: [Clip(name: name, source: url.path, start: 0, duration: 2, order: tracks.count)]))
+        }
+        editor.project = Project(tracks: tracks); editor.selection = []; editor.selectedTrack = tracks[0].id
+        editor.seek(to: 0); editor.playPause()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25)); editor.updateTransportPosition()
+        try check(editor.isPlaying && zip(tracks, [0.1, 0.6, 0.95]).allSatisfy { abs((editor.trackMeters[$0.0.id]?.peak ?? 0) - $0.1) < 1e-5 }, "Header meters follow actual playback peaks for green, yellow and red levels")
+        for row in tracks.indices {
+            try check(timeline.trackNameRect(row: row, depth: 0).maxX < timeline.fragmentLeft - 74, "Track name leaves room for its peak readout")
+        }
+        func snapshot(_ suffix: String) {
+            guard let index = CommandLine.arguments.firstIndex(of: "--snapshot"), index + 1 < CommandLine.arguments.count else { return }
+            let path = URL(fileURLWithPath: CommandLine.arguments[index + 1]).deletingPathExtension().appendingPathExtension(suffix + ".png")
+            let content = window.contentView!; content.layoutSubtreeIfNeeded()
+            if let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                content.cacheDisplay(in: content.bounds, to: bitmap)
+                try? bitmap.representation(using: .png, properties: [:])?.write(to: path)
+            }
+        }
+        snapshot("meters")
+        editor.toggleMute(tracks[1].id)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        guard let playback = editor.player else { throw SounderError.message("Meter UI playback stopped unexpectedly") }
+        let mutedPeak = playback.queue.sync { playback.graph.trackPeaks[tracks[1].id] }
+        try check(mutedPeak == 0, "Muted tracks report zero signal without restarting playback")
+        editor.stop(); refresh()
+        try check(editor.trackMeters.values.allSatisfy { $0.level == 0 }, "Stopping clears every header fill immediately")
+        RunLoop.current.run(until: Date().addingTimeInterval(1.05))
+        try check(editor.trackMeters.values.allSatisfy { $0.peak == 0 }, "Stopped peak readouts clear after the one-second hold")
+        editor.selectedTrack = tracks[0].id; editor.cursor = 0
+        let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let recorder = try LiveRecorder(url: editor.audio.freshURL(), format: editor.project.audioFormat, inputFormat: input)
+        files.append(recorder.url); try recorder.start(); editor.activateRecording(recorder)
+        recorder.writer.append(captureTestBuffer(format: input, start: 0, frames: 12_000)); recorder.writer.waitForPendingWrites()
+        editor.updateTransportPosition()
+        try check(editor.isRecording && (editor.trackMeters[tracks[0].id]?.peak ?? 0) > 0.4, "Recording peak readout measures actual captured microphone-format PCM")
+        snapshot("recording")
+    }
+}

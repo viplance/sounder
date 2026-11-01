@@ -1,5 +1,46 @@
 import AVFoundation
 
+struct TrackLevelMeter {
+    var level = 0.0
+    var peak = 0.0
+    private var peakTime = -Double.infinity
+    private var updatedAt: Double?
+    static func decibels(_ amplitude: Double) -> Double { amplitude > 0 ? 20 * log10(amplitude) : -.infinity }
+    var fraction: Double { max(0, min(1, (Self.decibels(level) + 60) / 60)) }
+    var peakText: String { peak > 0 ? String(format: "%.1f dB", Self.decibels(peak)) : "−∞ dB" }
+    mutating func update(_ amplitude: Double, at time: Double) {
+        let value = amplitude.isFinite ? max(0, amplitude) : 0
+        let elapsed = max(0, time - (updatedAt ?? time))
+        level = max(value, level * pow(10, -24 * elapsed / 20))
+        if level < 0.001 { level = 0 }
+        if value >= peak || time - peakTime >= 1 { peak = value; peakTime = time }
+        updatedAt = time
+    }
+}
+
+// Small snapshots follow scheduled audio time, rather than exposing render-ahead
+// peaks early. The UI only takes a short lock, never waits on the audio worker.
+final class PlaybackMeterBuffer {
+    private let lock = NSLock()
+    private var pending: [(frame: Int, peaks: [UUID: Float])] = []
+    func append(frame: Int, peaks: [UUID: Float]) {
+        lock.lock(); defer { lock.unlock() }
+        pending.append((frame, peaks))
+        if pending.count > 512 { pending.removeFirst(pending.count - 512) }
+    }
+    func consume(through frame: Int) -> [UUID: Float] {
+        lock.lock(); defer { lock.unlock() }
+        var result: [UUID: Float] = [:], count = 0
+        for item in pending {
+            guard item.frame <= frame else { break }
+            for (id, peak) in item.peaks { result[id] = max(result[id] ?? 0, peak) }
+            count += 1
+        }
+        pending.removeFirst(count)
+        return result
+    }
+}
+
 struct StreamingEffect {
     let latency: Int
     let tail: Int
@@ -27,6 +68,8 @@ final class StreamingGraph {
         var muted: Bool
         var soloDry = true
         var soloBus = true
+        var peak: Float = 0
+        var meterDelay: SampleDelay?
         let dry: [Float]
         let children: [Bus]
         let effects: [StreamingEffect]
@@ -57,11 +100,16 @@ final class StreamingGraph {
                 for i in input.indices { input[i] += signal[i] }
             }
             for effect in effects { input = try effect.process(input) }
-            return muted || !soloBus ? [Float](repeating: 0, count: input.count) : input
+            let output = muted || !soloBus ? [Float](repeating: 0, count: input.count) : input
+            let metered = meterDelay?.apply(output) ?? output
+            peak = metered.reduce(Float(0)) { $1.isFinite ? max($0, abs($1)) : $0 }
+            return output
         }
     }
     private var buses: [UUID: Bus] = [:]
     private let tracks: [Track]
+    private let parents: [UUID: UUID]
+    private(set) var trackPeaks: [UUID: Float] = [:]
     private let roots: [Bus]
     private let delays: [SampleDelay]
     let channels: Int
@@ -70,6 +118,7 @@ final class StreamingGraph {
     private(set) var position = 0
     init(project: Project, store: AudioStore, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
         tracks = project.tracks
+        parents = Dictionary(uniqueKeysWithValues: project.tracks.compactMap { track in track.parent.map { (track.id, $0) } })
         channels = project.audioFormat.channels
         let channelCount = channels
         var visited = Set<UUID>()
@@ -88,6 +137,7 @@ final class StreamingGraph {
         roots = try project.tracks.filter { $0.parent == nil }.map { try bus($0) }
         buses = trackBuses
         latency = roots.map(\.latency).max() ?? 0
+        for bus in buses.values { bus.meterDelay = SampleDelay(frames: max(0, latency - bus.latency), channels: channelCount) }
         let masterLatency = latency
         delays = roots.map { SampleDelay(frames: masterLatency - $0.latency, channels: channelCount) }
         let end = project.tracks.flatMap(\.clips).map(\.end).max() ?? 0
@@ -107,6 +157,14 @@ final class StreamingGraph {
             let output = delays[index].apply(try root.render(position: position, frames: frames))
             for i in mix.indices { mix[i] += output[i] }
         }
+        for (id, bus) in buses {
+            var ancestor: UUID? = id, audible = true
+            while let current = ancestor {
+                if let node = buses[current], node.muted || !node.soloBus { audible = false; break }
+                ancestor = parents[current]
+            }
+            trackPeaks[id] = audible ? bus.peak : 0
+        }
         position += frames
         return mix.map { $0.isFinite ? min(1, max(-1, $0)) : 0 }
     }
@@ -121,6 +179,7 @@ final class LivePlayback {
     let graph: StreamingGraph
     let format: ProjectAudioFormat
     let queue = DispatchQueue(label: "Sounder.playback", qos: .userInteractive)
+    private let meterBuffer = PlaybackMeterBuffer()
     private var running = false
     private var scheduled = 0
     private var tempo = 120.0
@@ -176,6 +235,7 @@ final class LivePlayback {
             let value = min(1, max(-1, samples[frame * format.channels + channel] + click))
             buffer.floatChannelData![channel][frame] = format.bitDepth == 32 ? value : min(scale - 1, (value * scale).rounded()) / scale
         } }
+        meterBuffer.append(frame: nextFrame + frames, peaks: graph.trackPeaks)
         nextFrame += frames; scheduled += 1
         let isLast = nextFrame == graph.totalFrames
         let completionType: AVAudioPlayerNodeCompletionCallbackType = isLast
@@ -190,6 +250,9 @@ final class LivePlayback {
                 catch { self.running = false; DispatchQueue.main.async { self.finished?(error) } }
             }
         }
+    }
+    func consumeTrackPeaks(at time: Double) -> [UUID: Float] {
+        meterBuffer.consume(through: Int(time * format.sampleRate))
     }
     func setMetronome(tempo: Double, enabled: Bool) {
         queue.async { self.tempo = tempo; self.metronomeEnabled = enabled }
@@ -223,11 +286,13 @@ func runStreamingGraphTests() throws {
     }
     let first = try graph.render(frames: 512)
     try check(abs(first[1000] - 0.35) < 0.000001 && abs(first[1001] - 0.175) < 0.000001, "Streaming graph applies child and parent effects once, with independent stereo and sibling tracks")
+    try check(abs((graph.trackPeaks[parent.id] ?? 0) - 0.15) < 1e-6 && abs((graph.trackPeaks[child.id] ?? 0) - 0.1) < 1e-6 && abs((graph.trackPeaks[sibling.id] ?? 0) - 0.2) < 1e-6, "Per-track meters measure post-effect stereo peaks including child-to-parent routing")
     gain = 0.25
     let next = try graph.render(frames: 512)
     try check(abs(next[0] - 0.2625) < 0.000001, "Changing a live parameter changes the very next block without rebuilding the mix")
     graph.setMuted(true, trackID: parent.id)
     try check(abs(try graph.render(frames: 128)[0] - 0.2) < 0.000001, "Live parent mute silences its subtree while siblings keep playing")
+    try check(graph.trackPeaks[parent.id] == 0 && graph.trackPeaks[child.id] == 0 && graph.trackPeaks[sibling.id] == 0.2, "Parent mute suppresses both its own and descendant meters while sibling meters remain live")
     graph.setMuted(false, trackID: parent.id); graph.setMuted(true, trackID: child.id)
     try check(abs(try graph.render(frames: 128)[0] - 0.25) < 0.000001, "Live child mute preserves its parent and siblings")
     graph.setMuted(false, trackID: child.id)

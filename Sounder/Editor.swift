@@ -18,6 +18,7 @@ final class Editor: NSObject {
     var dirty = false
     var projectURL: URL?
     var player: LivePlayback?
+    private(set) var trackMeters: [UUID: TrackLevelMeter] = [:]
     private let makeRecorder: (URL, ProjectAudioFormat) throws -> LiveRecorder
     private let makePlayback: (StreamingGraph, ProjectAudioFormat, Double) throws -> LivePlayback
     var pluginHosts: [UUID: SNPluginHost] = [:]
@@ -365,6 +366,22 @@ final class Editor: NSObject {
         recordingURL = recorder.url; recordingTrack = selectedTrack; recordingStart = cursor
         self.recorder = recorder; startTimer(); update()
     }
+    func showsTrackMeter(_ id: UUID) -> Bool { isPlaying || isRecording || (trackMeters[id]?.peak ?? 0) > 0 }
+    private func updateTrackMeters(_ peaks: [UUID: Float], at time: Double = ProcessInfo.processInfo.systemUptime) {
+        let ids = Set(project.tracks.map(\.id))
+        trackMeters = trackMeters.filter { ids.contains($0.key) }
+        for id in ids {
+            var meter = trackMeters[id] ?? TrackLevelMeter()
+            meter.update(Double(peaks[id] ?? 0), at: time); trackMeters[id] = meter
+        }
+    }
+    private func stopTrackMeters() {
+        for id in Array(trackMeters.keys) { trackMeters[id]?.level = 0 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, !self.isPlaying, !self.isRecording else { return }
+            self.updateTrackMeters([:]); self.changed?()
+        }
+    }
     func updateRecordingWaveform() {
         guard let recorder else { return }
         let update = recorder.writer.consumeUpdate()
@@ -372,11 +389,18 @@ final class Editor: NSObject {
         for channel in update.channelPeaks.indices { recordingChannelPeaks[channel].append(contentsOf: update.channelPeaks[channel]) }
         recordingPartialChannelPeaks = update.partialChannelPeaks
         cursor = recordingStart + Double(update.frames) / recorder.format.sampleRate
+        if let recordingTrack {
+            let peak = max(update.peaks.max() ?? 0, update.partialPeak ?? 0)
+            updateTrackMeters([recordingTrack: peak])
+        }
         if update.failure != nil { stop() }
     }
     func updateTransportPosition() {
         if recorder != nil { updateRecordingWaveform() }
-        else if let player { cursor = player.currentTime }
+        else if let player {
+            cursor = player.currentTime
+            updateTrackMeters(player.consumeTrackPeaks(at: cursor))
+        }
         changed?()
     }
     func startTimer() {
@@ -436,6 +460,7 @@ final class Editor: NSObject {
         let stoppedPosition = position ?? playback.currentTime
         player = nil // Detach before stop can publish any completion callbacks.
         playback.stop()
+        stopTrackMeters()
         cursor = stoppedPosition
     }
     func seek(to position: Double) {
@@ -520,7 +545,7 @@ final class Editor: NSObject {
                 }
             } catch { self.error(error) }
         }
-        clearRecordingState(); update()
+        clearRecordingState(); stopTrackMeters(); update()
     }
     func split() {
         guard !busy else { return }

@@ -205,6 +205,7 @@ func runAudioTests() throws {
         let error = zip(decoded.channels[0], stereoAgain.channels[0]).map { abs($0 - $1) }.max() ?? 0
         try check(error <= (depth == 16 ? 0.00004 : 0.000001), "\(depth)-bit export round-trip stays within quantization error")
     }
+    try runTrackMeterTests()
     try runStreamingGraphTests()
     try runTransportPositionTests()
     try runTempoTests()
@@ -611,4 +612,30 @@ func runTrackSoloTests() throws {
     try check(editor.project.tracks.filter(\.solo).count == 2, "Solo toggles independently without clearing existing Solo tracks")
     editor.undo(); try check(editor.project.tracks.filter(\.solo).map(\.id) == [child.id], "Solo supports one-step Undo")
     editor.redo(); try check(editor.project.tracks.filter(\.solo).count == 2, "Solo supports Redo")
+}
+
+func runTrackMeterTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    var meter = TrackLevelMeter()
+    try check(meter.fraction == 0 && meter.peakText == "−∞ dB", "Silent track meter has no fill and reports negative infinity")
+    meter.update(0.9, at: 0); meter.update(0.1, at: 0.99)
+    try check(meter.peak == 0.9, "Peak readout holds a maximum for the full one-second interval")
+    meter.update(0.1, at: 1.01)
+    try check(meter.peak == 0.1 && meter.fraction > 0, "Peak readout follows the current level after its one-second hold expires")
+    meter.update(0.95, at: 1.02)
+    try check(meter.peak == 0.95 && meter.level == 0.95, "A higher peak updates immediately during the hold interval")
+    meter.update(0, at: 6)
+    try check(meter.peak == 0 && meter.fraction == 0, "Meter release reaches silence and clears expired peak values")
+    meter.update(1.2, at: 7)
+    try check(meter.fraction == 1 && TrackLevelMeter.decibels(meter.peak) > 0, "Overload fills the header without hiding positive clipping peaks")
+    var mid = TrackLevelMeter(); mid.update(pow(10, -30 / 20), at: 0)
+    try check(abs(mid.fraction - 0.5) < 1e-9, "Header meter fills on a -60 to 0 dB scale")
+    let id = UUID(), buffer = PlaybackMeterBuffer()
+    buffer.append(frame: 512, peaks: [id: 0.9]); buffer.append(frame: 1024, peaks: [id: 0.2])
+    try check(buffer.consume(through: 0).isEmpty && buffer.consume(through: 511).isEmpty, "Render-ahead meter snapshots are not displayed before their audio plays")
+    try check(buffer.consume(through: 512)[id] == 0.9 && buffer.consume(through: 512).isEmpty && buffer.consume(through: 1024)[id] == 0.2, "Meter publication follows played frames and drains each peak once")
+    buffer.append(frame: 1536, peaks: [id: 0.3]); buffer.append(frame: 2048, peaks: [id: 0.8])
+    try check(buffer.consume(through: 2048)[id] == 0.8, "UI polling preserves brief peaks across all audio blocks since the previous update")
 }
