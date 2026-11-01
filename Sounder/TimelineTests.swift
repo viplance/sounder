@@ -732,3 +732,92 @@ extension AppDelegate {
         print("PASS: Solo buttons sit between MUTE and FX at every nesting depth and independently activate multiple tracks")
     }
 }
+
+extension AppDelegate {
+    func verifyFragmentFadesUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        defer { _ = timeline.cancelFragmentResize(); editor.project = original; editor.selection = []; editor.dirty = false; refresh() }
+        var a = original.tracks[0].clips[0]; a.start = 1; a.offset = 0.5; a.duration = 4
+        a.fadeInMS = 500; a.fadeOutMS = 750; a.fadeInCurve = .exponential; a.fadeOutCurve = .smooth
+        var b = a; b.id = UUID(); b.start = 6
+        editor.project = Project(tracks: [Track(name: "Fade controls", clips: [a, b])])
+        editor.selection = [a.id, b.id]; editor.cursor = 2.25; editor.zoom = 90; refresh()
+        let scroll = timeline.enclosingScrollView!
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        func clip() -> Clip { editor.project.tracks[0].clips.first { $0.id == a.id }! }
+        func send(_ type: NSEvent.EventType, _ point: NSPoint) {
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            if type == .leftMouseDown { timeline.mouseDown(with: event) }
+            else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
+            else { timeline.mouseUp(with: event) }
+        }
+        func handle(_ left: Bool) -> NSPoint {
+            let rect = timeline.fragmentFadeHandleRects(clip(), in: timeline.clipRect(clip(), row: 0, layer: 0))[left ? 0 : 1]
+            return NSPoint(x: rect.midX, y: rect.midY)
+        }
+        let originalRect = timeline.clipRect(a, row: 0, layer: 0)
+        var shortFade = a; shortFade.fadeInMS = 10; shortFade.fadeOutMS = 10
+        let shortAreas = timeline.fragmentFadeRects(shortFade, in: originalRect)
+        try check(abs(shortAreas[0].width - 0.9) < 1e-9 && abs(shortAreas[1].width - 0.9) < 1e-9, "10 ms fade curves occupy their true subpixel timeline duration without a visual minimum")
+        shortFade.fadeInMS = 0
+        try check(timeline.fragmentFadeRects(shortFade, in: originalRect)[0].width == 0, "A disabled fade has no visible curve width while its corner remains editable")
+        let areas = timeline.fragmentFadeRects(a, in: originalRect), handles = timeline.fragmentFadeHandleRects(a, in: originalRect)
+        try check(abs(handles[0].midX - areas[0].maxX) < 1e-9 && abs(handles[1].midX - areas[1].minX) < 1e-9, "Fade drag targets follow the current upper curve endpoints instead of the fragment corners")
+        var meeting = a; meeting.fadeInMS = 2000; meeting.fadeOutMS = 2000
+        let meetingHandles = timeline.fragmentFadeHandleRects(meeting, in: originalRect)
+        try check(meetingHandles[0].maxX <= meetingHandles[1].minX && meetingHandles.allSatisfy { $0.width > 0 }, "Both fades remain separately draggable when their upper endpoints meet")
+        for isLeft in [true, false] {
+            let target = handle(isLeft), outside = NSPoint(x: target.x, y: originalRect.minY - 3)
+            let end = NSPoint(x: outside.x + (isLeft ? 1 : -1) * editor.zoom * 0.25, y: outside.y)
+            try check(!originalRect.contains(outside) && timeline.fragmentFadeHandleRects(clip(), in: originalRect)[isLeft ? 0 : 1].contains(outside), "Fade target extends above the fragment without changing its visual curve")
+            send(.leftMouseDown, outside); send(.leftMouseDragged, end)
+            try check(timeline.fadedFragment != nil, "Dragging can start outside the fragment's upper border for either fade")
+            send(.leftMouseUp, end)
+            try check(isLeft ? clip().fadeInMS == 750 : clip().fadeOutMS == 1000, "An exterior fade drag commits the correct duration")
+            editor.undo()
+        }
+        let history = editor.undoStack.count, cursor = editor.cursor
+        let left = handle(true), leftEnd = NSPoint(x: left.x + editor.zoom, y: left.y)
+        send(.leftMouseDown, left); send(.leftMouseUp, left)
+        try check(editor.undoStack.count == history && clip().fadeInMS == 500, "Fade handle click does not change selection, duration or Undo history")
+        send(.leftMouseDown, left); send(.leftMouseDragged, leftEnd)
+        try check(timeline.fadedFragment?.fadeInMS == 1500 && clip().fadeInMS == 500 && editor.cursor == cursor, "Fade-in upper endpoint previews duration live without seeking or altering source bounds")
+        send(.leftMouseUp, leftEnd)
+        try check(clip().fadeInMS == 1500 && clip().fadeOutMS == 750 && clip().start == a.start && clip().offset == a.offset && clip().duration == a.duration && editor.selection == [a.id, b.id] && editor.undoStack.count == history + 1, "Fade drag changes only its edge and commits once while preserving the group")
+        editor.undo(); try check(clip().fadeInMS == 500, "One Undo restores the original fade")
+        editor.redo(); try check(clip().fadeInMS == 1500, "Redo restores the edited fade")
+        editor.undo()
+        let right = handle(false), rightEnd = NSPoint(x: right.x - editor.zoom * 0.5, y: right.y)
+        send(.leftMouseDown, right); send(.leftMouseDragged, rightEnd); send(.leftMouseUp, rightEnd)
+        try check(clip().fadeOutMS == 1250 && clip().fadeInMS == 500, "Fade-out upper endpoint changes duration in the mirrored horizontal direction")
+        editor.undo()
+        send(.leftMouseDown, left); send(.leftMouseDragged, NSPoint(x: left.x - editor.zoom, y: left.y)); send(.leftMouseUp, NSPoint(x: left.x - editor.zoom, y: left.y))
+        try check(clip().fadeInMS == 0, "Dragging beyond the corner clamps fade duration at zero")
+        editor.undo()
+        send(.leftMouseDown, right); send(.leftMouseDragged, NSPoint(x: right.x - editor.zoom * 8, y: right.y))
+        try check(timeline.fadedFragment?.fadeOutMS == 4000, "Fade duration cannot exceed the fragment length")
+        let beforeCancel = editor.undoStack.count
+        try check(timeline.cancelFragmentResize() && clip().fadeOutMS == 750 && editor.undoStack.count == beforeCancel, "Escape/Stop cancels the fade preview without changing project data")
+        let rect = timeline.clipRect(clip(), row: 0, layer: 0)
+        let area = timeline.fragmentFadeRects(clip(), in: rect)[0]
+        let point = NSPoint(x: area.midX, y: area.midY)
+        let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        guard let menu = timeline.menu(for: event) else { throw SounderError.message("Fade curve menu did not open") }
+        try check(menu.items.count == 4 && menu.items.allSatisfy { $0.image != nil && $0.title.isEmpty && $0.state == .off }, "Right-click fade area shows only graphical icons without titles or selection checkmarks")
+        menu.performActionForItem(at: 3)
+        try check(clip().fadeInCurve == .logarithmic && clip().fadeOutCurve == .smooth && editor.selection == [a.id, b.id], "Curve menu changes only the clicked fragment edge and preserves selection")
+        editor.undo(); try check(clip().fadeInCurve == .exponential, "Curve type selection supports Undo")
+        if let index = CommandLine.arguments.firstIndex(of: "--snapshot"), index + 1 < CommandLine.arguments.count {
+            refresh(); window.contentView!.layoutSubtreeIfNeeded()
+            let content = window.contentView!
+            if let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                content.cacheDisplay(in: content.bounds, to: bitmap)
+                let path = URL(fileURLWithPath: CommandLine.arguments[index + 1]).deletingPathExtension().appendingPathExtension("fades.png")
+                try bitmap.representation(using: .png, properties: [:])?.write(to: path)
+            }
+        }
+    }
+}

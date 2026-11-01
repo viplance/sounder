@@ -129,6 +129,9 @@ final class Timeline: NSView {
     private var fragmentCopyPreviews: [UUID: Clip] = [:]
     private(set) var fragmentSnapTime: Double?
     var didCheckpoint = false
+    private var fadeDrag: (original: Clip, left: Bool)?
+    private(set) var fadedFragment: Clip?
+    private var didDragFade = false
     private var fragmentResize: (original: Clip, leftEdge: Bool, sourceDuration: Double)?
     private(set) var resizedFragment: Clip?
     var selectingRange = false
@@ -323,6 +326,7 @@ final class Timeline: NSView {
     }
     func displayedClips(for track: Track) -> [Clip] {
         var clips = track.clips
+        if let fadedFragment, let index = clips.firstIndex(where: { $0.id == fadedFragment.id }) { clips[index] = fadedFragment }
         if let resizedFragment, let index = clips.firstIndex(where: { $0.id == resizedFragment.id }) { clips[index] = resizedFragment }
         if copyingFragments {
             for original in movingFragments where fragmentDestinations[original.clip.id] == track.id {
@@ -342,12 +346,98 @@ final class Timeline: NSView {
         }
         return clips
     }
+    func fragmentFadeHandleRects(_ clip: Clip, in rect: NSRect) -> [NSRect] {
+        let areas = fragmentFadeRects(clip, in: rect)
+        let points = [areas[0].maxX, areas[1].minX]
+        let width: CGFloat = 14
+        var handles = points.map { x in
+            NSRect(x: x - width / 2, y: rect.minY - 5, width: width, height: 18)
+        }
+        // When the curves meet, each side of the shared point edits its own fade.
+        if handles[0].maxX > handles[1].minX {
+            let middle = (points[0] + points[1]) / 2, right = handles[1].maxX
+            handles[0].size.width = max(0, middle - handles[0].minX)
+            handles[1].origin.x = middle; handles[1].size.width = max(0, right - middle)
+        }
+        return handles
+    }
+    func fragmentFadeRects(_ clip: Clip, in rect: NSRect) -> [NSRect] {
+        let rate = editor.audio.sampleRate
+        let lengths = clip.fadeLengths(frames: max(0, Int(clip.end * rate) - Int(clip.start * rate)), sampleRate: rate)
+        return [lengths.0, lengths.1].enumerated().map { edge, frames in
+            let width = min(rect.width, frames / rate * editor.zoom)
+            return NSRect(x: edge == 0 ? rect.minX : rect.maxX - width, y: rect.minY, width: width, height: rect.height)
+        }
+    }
+    private func updateFragmentFade(at point: NSPoint) {
+        guard let fadeDrag else { return }
+        let delta = (point.x - dragStart.x) / editor.zoom * 1000 * (fadeDrag.left ? 1 : -1)
+        let originalDuration = fadeDrag.left ? fadeDrag.original.fadeInMS : fadeDrag.original.fadeOutMS
+        fadedFragment = fadeDrag.original.changingFade(left: fadeDrag.left, durationMS: originalDuration + delta)
+        refresh()
+    }
+    private func drawFragmentFades(_ clip: Clip, in rect: NSRect) {
+        for (edge, area) in fragmentFadeRects(clip, in: rect).enumerated() where area.width > 0 {
+            let curve = edge == 0 ? clip.fadeInCurve : clip.fadeOutCurve
+            let path = NSBezierPath()
+            for step in 0...48 {
+                let t = Double(step) / 48
+                let duration = edge == 0 ? clip.fadeInMS : clip.fadeOutMS
+                let gain = duration == 0 ? 1 : curve.value(edge == 0 ? t : 1 - t)
+                let point = NSPoint(x: area.minX + t * area.width, y: area.maxY - 2 - gain * max(0, area.height - 4))
+                if step == 0 { path.move(to: point) } else { path.line(to: point) }
+            }
+            let shade = path.copy() as! NSBezierPath
+            shade.line(to: NSPoint(x: area.maxX, y: area.minY)); shade.line(to: area.origin); shade.close()
+            NSColor.black.withAlphaComponent(0.22).setFill(); shade.fill()
+            NSColor.white.withAlphaComponent(0.85).setStroke(); path.lineWidth = 1.25; path.stroke()
+        }
+    }
+    private static let fadeInCursor = fadeCursor(left: true)
+    private static let fadeOutCursor = fadeCursor(left: false)
+    private static func fadeCursor(left: Bool) -> NSCursor {
+        let image = NSImage(size: NSSize(width: 20, height: 20), flipped: true) { _ in
+            func point(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: (left ? x : 32 - x) * 0.625, y: y * 0.625) }
+            let path = NSBezierPath(); path.lineJoinStyle = .round; path.lineCapStyle = .round
+            path.move(to: point(3, 13)); path.line(to: point(3, 3)); path.line(to: point(13, 3))
+            path.move(to: point(6, 26)); path.curve(to: point(26, 6), controlPoint1: point(18, 26), controlPoint2: point(18, 6))
+            NSColor.black.withAlphaComponent(0.9).setStroke(); path.lineWidth = 2.5; path.stroke()
+            NSColor.white.setStroke(); path.lineWidth = 1.1; path.stroke()
+            return true
+        }
+        return NSCursor(image: image, hotSpot: NSPoint(x: left ? 1.875 : 18.125, y: 1.875))
+    }
+    private struct FadeChoice { let id: UUID; let left: Bool; let curve: FadeCurve }
+    private func fadeCurveMenu(_ clip: Clip, left: Bool) -> NSMenu {
+        let menu = NSMenu(); menu.autoenablesItems = false; menu.minimumWidth = 84
+        for curve in FadeCurve.allCases {
+            let item = NSMenuItem(title: "", action: #selector(chooseFadeCurve(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = FadeChoice(id: clip.id, left: left, curve: curve)
+            item.setAccessibilityLabel(curve.title)
+            item.image = NSImage(size: NSSize(width: 56, height: 28), flipped: true) { rect in
+                let path = NSBezierPath(); path.lineWidth = 2
+                for step in 0...40 {
+                    let t = Double(step) / 40
+                    let point = NSPoint(x: 3 + t * (rect.width - 6), y: rect.maxY - 3 - curve.value(left ? t : 1 - t) * (rect.height - 6))
+                    if step == 0 { path.move(to: point) } else { path.line(to: point) }
+                }
+                NSColor.labelColor.setStroke(); path.stroke(); return true
+            }
+            item.image?.isTemplate = true; menu.addItem(item)
+        }
+        return menu
+    }
+    @objc private func chooseFadeCurve(_ item: NSMenuItem) {
+        guard let choice = item.representedObject as? FadeChoice else { return }
+        editor.setFragmentFade(choice.id, left: choice.left, curve: choice.curve)
+    }
     func fragmentEdgeRects(_ rect: NSRect) -> [NSRect] {
         let width = min(6, rect.width / 3)
         return [NSRect(x: rect.minX, y: rect.minY, width: width, height: rect.height),
                 NSRect(x: rect.maxX - width, y: rect.minY, width: width, height: rect.height)]
     }
     @discardableResult func cancelFragmentResize() -> Bool {
+        if fadeDrag != nil { fadeDrag = nil; fadedFragment = nil; didDragFade = false; refresh(); return true }
         guard fragmentResize != nil else { return false }
         fragmentResize = nil; resizedFragment = nil; pendingFragmentClick = nil; didResizeFragment = false; lastFragmentDragPoint = nil; refresh(); return true
     }
@@ -420,10 +510,14 @@ final class Timeline: NSView {
                     clipRect(clip, row: row, layer: clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count)
                 }
                 for index in rects.indices {
-                    for edge in fragmentEdgeRects(rects[index]) {
+                    let handles = editor.selection.contains(clips[index].id) ? fragmentFadeHandleRects(clips[index], in: rects[index]) : []
+                    let newer = Array(rects.dropFirst(index + 1))
+                    let edges = fragmentEdgeRects(rects[index]).map { ($0, NSCursor.resizeLeftRight, newer + handles) }
+                    let corners = handles.enumerated().map { ($0.element, $0.offset == 0 ? Self.fadeInCursor : Self.fadeOutCursor, newer) }
+                    for (edge, cursor, covers) in edges + corners {
                         var exposed = [edge.intersection(visibleTrackRect).intersection(visibleFragmentRect)]
-                        // Hidden edges underneath newer fragments must not advertise resizing.
-                        for cover in rects.dropFirst(index + 1) {
+                        // Keep corner and edge cursors disjoint; hidden regions receive neither.
+                        for cover in covers {
                             exposed = exposed.flatMap { rect -> [NSRect] in
                                 let overlap = rect.intersection(cover)
                                 guard !overlap.isEmpty else { return [rect] }
@@ -434,7 +528,7 @@ final class Timeline: NSView {
                                     .filter { !$0.isEmpty }
                             }
                         }
-                        for rect in exposed where !rect.isEmpty { addCursorRect(rect, cursor: .resizeLeftRight) }
+                        for rect in exposed where !rect.isEmpty { addCursorRect(rect, cursor: cursor) }
                     }
                 }
             }
@@ -564,6 +658,7 @@ final class Timeline: NSView {
                         drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, gain: clip.volumeGain, fragment: clip, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(trackDimmed || clip.muted ? 0.25 : 0.9))
                     }
                 }
+                if editor.selection.contains(clip.id) { drawFragmentFades(clip, in: rect) }
                 drawFragmentTitle(clip.name, in: rect, color: trackDimmed || clip.muted ? .secondaryLabelColor : color)
                 NSGraphicsContext.restoreGraphicsState()
             }
@@ -748,10 +843,16 @@ final class Timeline: NSView {
         let clips = track.clips.sorted { $0.order < $1.order }
         for (layer, clip) in clips.enumerated().reversed() {
             let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
-            if clipRect(clip, row: row, layer: overlaps).contains(p) {
+            let rect = clipRect(clip, row: row, layer: overlaps)
+            let fadeHit = editor.selection.contains(clip.id) ? fragmentFadeHandleRects(clip, in: rect).firstIndex(where: { $0.contains(p) }) : nil
+            if rect.contains(p) || (!editor.busy && fadeHit != nil) {
                 if event.clickCount == 2, !editor.busy {
                     editor.range = nil; editor.selection = [clip.id]; pendingFragmentClick = nil; editor.update()
                     (NSApp.delegate as? AppDelegate)?.editFragment(clip.id); return
+                }
+                if !editor.busy, let edge = fadeHit {
+                    fadeDrag = (clip, edge == 0); fadedFragment = clip; didDragFade = false
+                    editor.update(); return
                 }
                 if !editor.busy, let edge = fragmentEdgeRects(clipRect(clip, row: row, layer: overlaps)).firstIndex(where: { $0.contains(p) }) {
                     do {
@@ -823,6 +924,12 @@ final class Timeline: NSView {
     }
     override func mouseDragged(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if fadeDrag != nil {
+            guard !editor.busy else { cancelFragmentResize(); return }
+            guard didDragFade || abs(p.x - dragStart.x) > 2 else { return }
+            didDragFade = true; autoscrollRange(with: event)
+            updateFragmentFade(at: convert(event.locationInWindow, from: nil)); return
+        }
         if fragmentResize != nil {
             guard !editor.busy else { cancelFragmentResize(); return }
             guard didResizeFragment || abs(p.x - dragStart.x) > 2 else { return }
@@ -866,6 +973,13 @@ final class Timeline: NSView {
     }
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
+        if let drag = fadeDrag {
+            if !editor.busy, didDragFade {
+                updateFragmentFade(at: p)
+                if let clip = fadedFragment { editor.setFragmentFade(clip.id, left: drag.left, durationMS: drag.left ? clip.fadeInMS : clip.fadeOutMS) }
+            }
+            fadeDrag = nil; fadedFragment = nil; didDragFade = false; refresh(); return
+        }
         if let resize = fragmentResize {
             if !editor.busy {
                 if didResizeFragment { updateFragmentResize(at: p, flags: event.modifierFlags) }
@@ -1003,7 +1117,16 @@ final class Timeline: NSView {
             let clips = rows[row].0.clips.sorted { $0.order < $1.order }
             for (layer, clip) in clips.enumerated().reversed() {
                 let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
-                guard clipRect(clip, row: row, layer: overlaps).contains(p) else { continue }
+                let rect = clipRect(clip, row: row, layer: overlaps)
+                let fadeHit = editor.selection.contains(clip.id) && fragmentFadeHandleRects(clip, in: rect).contains(where: { $0.contains(p) })
+                guard rect.contains(p) || fadeHit else { continue }
+                if editor.selection.contains(clip.id) {
+                    let areas = fragmentFadeRects(clip, in: rect), corners = fragmentFadeHandleRects(clip, in: rect)
+                    let hits = areas.indices.filter { areas[$0].contains(p) || corners[$0].contains(p) }
+                    if let edge = hits.min(by: { abs(p.x - ($0 == 0 ? rect.minX : rect.maxX)) < abs(p.x - ($1 == 0 ? rect.minX : rect.maxX)) }) {
+                        return fadeCurveMenu(clip, left: edge == 0)
+                    }
+                }
                 editor.selectedTrack = rows[row].0.id
                 if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
                 editor.update()

@@ -3,6 +3,25 @@ import AVFoundation
 
 final class PointerButton: NSButton {
     private var pointerTracking: NSTrackingArea?
+    var activeAppearanceColor: NSColor? { didSet { needsDisplay = true } }
+    override func draw(_ dirtyRect: NSRect) {
+        guard state == .on, isEnabled, let color = activeAppearanceColor else { super.draw(dirtyRect); return }
+        if imagePosition == .imageOnly, let image {
+            let tinted = NSImage(size: image.size, flipped: false) { rect in
+                image.draw(in: rect)
+                color.setFill(); rect.fill(using: .sourceAtop)
+                return true
+            }
+            let scale = min(1, (bounds.width - 2) / image.size.width, (bounds.height - 2) / image.size.height)
+            let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+            tinted.draw(in: NSRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2, width: size.width, height: size.height))
+        } else {
+            color.setFill(); NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 1), xRadius: 5, yRadius: 5).fill()
+            let attributes: [NSAttributedString.Key: Any] = [.font: font ?? NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.black]
+            let size = (title as NSString).size(withAttributes: attributes)
+            (title as NSString).draw(at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2), withAttributes: attributes)
+        }
+    }
     var interactionCursor: NSCursor = .pointingHand {
         didSet { window?.invalidateCursorRects(for: self) }
     }
@@ -82,13 +101,17 @@ final class ProjectNameView: NSView {
 
 // Settings use a compact form layout rather than NSAlert's reserved icon area.
 final class CompactSettingsAlert: NSAlert {
+    var minimumWidth: CGFloat = 340
+    var minimumButtonWidth: CGFloat = 96
+    var buttonSpacing: CGFloat = 12
     private var prepared = false
     override func layout() {
         if !prepared { prepared = true; super.layout() }
         let panel = super.window
         let form = accessoryView
         let errorHeight: CGFloat = informativeText.isEmpty ? 0 : 38
-        let width = max(340, (form?.frame.width ?? 0) + 40, CGFloat(buttons.count) * 108 + 40)
+        let buttonWidths = buttons.map { max(minimumButtonWidth, $0.intrinsicContentSize.width + 12) }
+        let width = max(minimumWidth, (form?.frame.width ?? 0) + 40, buttonWidths.reduce(0, +) + CGFloat(max(0, buttons.count - 1)) * buttonSpacing + 40)
         let formY: CGFloat = 66 + errorHeight
         let titleY = formY + (form?.frame.height ?? 0) + 12
         let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: titleY + 24 + 16))
@@ -105,12 +128,12 @@ final class CompactSettingsAlert: NSAlert {
         var right = width - 20
         // Preserve NSAlert response order while placing the primary action at the right.
         for (index, button) in buttons.enumerated() {
-            let buttonWidth = max(96, button.intrinsicContentSize.width + 12)
+            let buttonWidth = buttonWidths[index]
             right -= buttonWidth
             button.removeFromSuperview(); button.frame = NSRect(x: right, y: 16, width: buttonWidth, height: 32)
             button.target = self; button.action = #selector(chosen(_:)); button.tag = index
             button.keyEquivalent = index == 0 ? "\r" : index == 1 ? "\u{1b}" : ""
-            root.addSubview(button); right -= 12
+            root.addSubview(button); right -= buttonSpacing
         }
     }
     @objc private func chosen(_ sender: NSButton) {
@@ -291,9 +314,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         metronomeButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
         metronomeButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         metronomeButton.setAccessibilityLabel("Metronome")
+        (metronomeButton as? PointerButton)?.activeAppearanceColor = .systemOrange
         tempoButton = PointerButton(title: "Tempo", target: self, action: #selector(toggleTempo))
         tempoButton.bezelStyle = .rounded; tempoButton.setButtonType(.pushOnPushOff); tempoButton.controlSize = .small
         tempoButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        (tempoButton as? PointerButton)?.activeAppearanceColor = .systemOrange
         tempoButton.widthAnchor.constraint(equalToConstant: 47).isActive = true
         bpmButton = textButton("120 BPM", size: 18, action: #selector(editTempo), cursor: .iBeam)
         bpmButton.contentTintColor = .systemOrange; bpmButton.toolTip = "Edit tempo (4/4)"; bpmButton.isHidden = true
@@ -304,6 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         tempoSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let tempoRow = NSStackView(views: [positionDisplay, tempoSpacer, metronomeButton, tempoButton])
         tempoRow.orientation = .horizontal; tempoRow.alignment = .centerY; tempoRow.spacing = 2
+        tempoRow.setCustomSpacing(6, after: metronomeButton)
         let timelineControls = NSView()
         tempoRow.translatesAutoresizingMaskIntoConstraints = false; timelineControls.addSubview(tempoRow)
         NSLayoutConstraint.activate([
@@ -392,6 +418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             refresh()
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
+            if CommandLine.arguments.contains("--fragment-fades-ui-test") { try verifyFragmentFadesUI() }
             if CommandLine.arguments.contains("--track-meters-ui-test") { try verifyTrackMetersUI() }
             if CommandLine.arguments.contains("--track-solo-ui-test") { try verifyTrackSoloUI() }
             if CommandLine.arguments.contains("--tempo-snapping-ui-test") { try verifyTempoSnappingUI() }

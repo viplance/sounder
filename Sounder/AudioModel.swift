@@ -50,6 +50,20 @@ struct Clip: Codable, Identifiable {
         if first + last > available { let scale = available / (first + last); first *= scale; last *= scale }
         return (first, last)
     }
+    func changingFade(left: Bool, durationMS: Double? = nil, curve: FadeCurve? = nil) -> Clip {
+        guard durationMS?.isFinite != false else { return self }
+        var result = self
+        if left {
+            result.fadeInMS = durationMS.map { max(0, min(duration * 1000, $0)) } ?? fadeInMS
+            result.fadeInCurve = curve ?? fadeInCurve
+            if result.fadeInMS != fadeInMS || result.fadeInCurve != fadeInCurve { result.fadeInBaked = false }
+        } else {
+            result.fadeOutMS = durationMS.map { max(0, min(duration * 1000, $0)) } ?? fadeOutMS
+            result.fadeOutCurve = curve ?? fadeOutCurve
+            if result.fadeOutMS != fadeOutMS || result.fadeOutCurve != fadeOutCurve { result.fadeOutBaked = false }
+        }
+        return result
+    }
     func resized(leftEdge: Bool, by delta: Double, sourceDuration: Double) -> Clip {
         var result = self
         // A source shorter than 10 ms cannot be extended with invented audio.

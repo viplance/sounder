@@ -206,6 +206,13 @@ final class Editor: NSObject {
         guard FragmentSettings(edited) != FragmentSettings(original) else { return }
         checkpoint(); project.tracks[i].clips[j] = edited; update("Fragment updated")
     }
+    func setFragmentFade(_ id: UUID, left: Bool, durationMS: Double? = nil, curve: FadeCurve? = nil) {
+        guard !busy, let i = project.tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == id }) }),
+              let j = project.tracks[i].clips.firstIndex(where: { $0.id == id }) else { return }
+        let original = project.tracks[i].clips[j], edited = original.changingFade(left: left, durationMS: durationMS, curve: curve)
+        guard FragmentSettings(original) != FragmentSettings(edited) else { return }
+        checkpoint(); project.tracks[i].clips[j] = edited; update()
+    }
     func fragmentsAreMuted(_ ids: Set<UUID>) -> Bool {
         let clips = project.tracks.flatMap(\.clips).filter { ids.contains($0.id) }
         return !clips.isEmpty && clips.allSatisfy(\.muted)

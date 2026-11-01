@@ -26,10 +26,11 @@ final class TempoDialog: NSObject {
         self.now = now; field = NSTextField(string: String(format: "%g", bpm))
         super.init()
         alert.messageText = "Tempo"
-        let form = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
-        field.frame = NSRect(x: 0, y: 1, width: 140, height: 26); field.setAccessibilityLabel("BPM"); form.addSubview(field)
+        alert.minimumWidth = 340 / 1.5; alert.minimumButtonWidth = 80; alert.buttonSpacing = 8
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: alert.minimumWidth - 40, height: 28))
+        field.frame = NSRect(x: 0, y: 1, width: form.bounds.width - 80, height: 26); field.setAccessibilityLabel("BPM"); form.addSubview(field)
         tapButton.bezelStyle = .rounded; tapButton.target = self; tapButton.action = #selector(tap)
-        tapButton.frame = NSRect(x: 152, y: 0, width: 68, height: 28); form.addSubview(tapButton)
+        tapButton.frame = NSRect(x: field.frame.maxX + 12, y: 0, width: 68, height: 28); form.addSubview(tapButton)
         alert.accessoryView = form; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
     }

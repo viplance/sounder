@@ -112,7 +112,22 @@ extension AppDelegate {
     func verifyTempoUI() throws {
         tempoButton.performClick(nil)
         guard editor.project.tempoMode && timeLabel.isHidden && !bpmButton.isHidden else { throw SounderError.message("Tempo button did not replace the timer with BPM") }
-        let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
+        metronomeButton.performClick(nil)
+        var modalFailure: String?
+        let timer = Timer(timeInterval: 0.1, repeats: false) { [self] _ in
+            func hasOrange(_ button: NSButton) -> Bool {
+                guard let bitmap = button.bitmapImageRepForCachingDisplay(in: button.bounds) else { return false }
+                button.cacheDisplay(in: button.bounds, to: bitmap)
+                for y in 0..<bitmap.pixelsHigh { for x in 0..<bitmap.pixelsWide {
+                    if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB), color.alphaComponent > 0.5,
+                       color.redComponent > 0.8, color.greenComponent > 0.25, color.greenComponent < 0.8, color.blueComponent < 0.35 { return true }
+                } }
+                return false
+            }
+            if let modal = NSApp.modalWindow {
+                if abs(modal.contentView!.bounds.width - 340 / 1.5) > 1 { modalFailure = "Tempo dialog did not shrink to two thirds of its former width" }
+                if window.isKeyWindow || !hasOrange(tempoButton) || !hasOrange(metronomeButton) { modalFailure = "Active Tempo/Metronome must remain orange while the dialog is key" }
+            } else { modalFailure = "Tempo modal window was not shown" }
             func field(_ view: NSView) -> NSTextField? {
                 if let text = view as? NSTextField, text.isEditable { return text }
                 return view.subviews.lazy.compactMap { field($0) }.first
@@ -122,8 +137,10 @@ extension AppDelegate {
         }
         RunLoop.main.add(timer, forMode: .modalPanel)
         bpmButton.performClick(nil)
+        if let modalFailure { throw SounderError.message(modalFailure) }
+        print("PASS: Tempo popup is two thirds of its former width and active controls remain orange behind the modal window")
         guard editor.project.tempo == 90 && bpmButton.title == "90 BPM" else { throw SounderError.message("BPM could not be edited") }
-        metronomeButton.performClick(nil)
+        if !editor.project.metronomeEnabled { metronomeButton.performClick(nil) }
         guard editor.project.metronomeEnabled && metronomeButton.state == .on else { throw SounderError.message("Metronome checkbox did not change its setting") }
         window.setContentSize(NSSize(width: 1000, height: 700)); refresh(); window.contentView?.layoutSubtreeIfNeeded()
         for control in [tempoButton!, metronomeButton!, bpmButton!] {

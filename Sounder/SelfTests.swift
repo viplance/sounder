@@ -547,6 +547,11 @@ func runFragmentSettingsTests() throws {
     let opposite = AudioData(channels: [Array(repeating: Float(0.5), count: 48_000), Array(repeating: Float(-0.5), count: 48_000)])
     try check(FragmentWaveform.peaks(opposite, clip: right, rate: 48_000, channels: 1)![0].allSatisfy { $0 == 0 }, "Mono waveform reflects actual downmix cancellation instead of independent stereo peaks")
     try check(FragmentWaveform.peaks(sourceAudio, clip: edited, rate: 48_000, channels: 2, cancelled: { true }) == nil, "Obsolete waveform jobs cancel before scanning source audio")
+    var baked = edited; baked.fadeInBaked = true; baked.fadeOutBaked = true
+    let faded = baked.changingFade(left: true, durationMS: 100, curve: .logarithmic)
+    let fadedPCM = try render(faded)
+    try check(abs(fadedPCM.channels[0][2400] - Float(sqrt(0.5))) < 1e-6 && !faded.fadeInBaked && faded.fadeOutBaked, "Corner fade editing changes the actual curve envelope and only unbakes the edited edge")
+    try check(baked.changingFade(left: false, durationMS: -10).fadeOutMS == 0 && baked.changingFade(left: true, durationMS: 2000).fadeInMS == 1000, "Fade duration editing stays within zero and the fragment length")
     let saved = try JSONDecoder().decode(Clip.self, from: JSONEncoder().encode(edited))
     try check(FragmentSettings(saved) == FragmentSettings(edited), "Fragment settings survive project serialization")
     var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as! [String: Any]
