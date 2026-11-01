@@ -116,6 +116,93 @@ final class Editor: NSObject {
         checkpoint()
         for i in project.tracks.indices { project.tracks[i].clips.removeAll { selection.contains($0.id) } }; selection = []; notifications.show("Fragments deleted", style: .error); update()
     }
+    static let fragmentPasteboardType = NSPasteboard.PasteboardType("enotix.Sounder.fragments")
+    func selectAllFragments() {
+        selection = Set(project.tracks.flatMap(\.clips).map(\.id)); update()
+    }
+    func copyFragments(to pasteboard: NSPasteboard = .general) {
+        let rows = TrackHierarchy.orderedRows(project.tracks)
+        let selectedRows = rows.indices.filter { rows[$0].0.clips.contains(where: { selection.contains($0.id) }) }
+        guard let firstRow = selectedRows.first,
+              let start = project.tracks.flatMap(\.clips).filter({ selection.contains($0.id) }).map(\.start).min() else { return }
+        let items = selectedRows.flatMap { row in
+            rows[row].0.clips.filter { selection.contains($0.id) }.map { clip -> FragmentClipboard.Item in
+                var copy = clip; copy.start -= start
+                return .init(clip: copy, row: row - firstRow, trackName: rows[row].0.name)
+            }
+        }
+        guard let data = try? JSONEncoder().encode(FragmentClipboard(items: items)) else { return }
+        pasteboard.clearContents(); pasteboard.setData(data, forType: Self.fragmentPasteboardType)
+    }
+    func pasteFragments(from pasteboard: NSPasteboard = .general) {
+        guard !busy, let data = pasteboard.data(forType: Self.fragmentPasteboardType),
+              let payload = try? JSONDecoder().decode(FragmentClipboard.self, from: data), !payload.items.isEmpty else { return }
+        do {
+            for item in payload.items {
+                let clip = item.clip
+                guard (0...10_000).contains(item.row), clip.start.isFinite, clip.start >= 0,
+                      clip.offset.isFinite, clip.offset >= 0, clip.duration.isFinite, clip.duration > 0,
+                      clip.offset + clip.duration <= (try audio.sourceDuration(clip.source)) + 0.001 else { throw SounderError.message("Copied audio is unavailable or invalid") }
+            }
+            var targets = TrackHierarchy.orderedRows(project.tracks).map { $0.0.id }
+            let base = targets.firstIndex(where: { $0 == selectedTrack }) ?? 0
+            let required = base + payload.items.map(\.row).max()! + 1
+            checkpoint()
+            while targets.count < required {
+                let row = targets.count - base
+                let name = NameRules.normalized(payload.items.first(where: { $0.row == row })?.trackName ?? "Audio " + String(format: "%02d", targets.count + 1))
+                let track = Track(name: name.isEmpty ? "Audio" : name)
+                project.tracks.append(track); targets.append(track.id)
+            }
+            selection = []
+            for item in payload.items.sorted(by: { $0.clip.order < $1.clip.order }) {
+                var clip = item.clip; clip.id = UUID(); clip.start += cursor; clip.order = project.nextOrder; project.nextOrder += 1
+                let index = project.tracks.firstIndex { $0.id == targets[base + item.row] }!
+                project.tracks[index].clips.append(clip); selection.insert(clip.id)
+            }
+            selectedTrack = targets[base]; update()
+        } catch { self.error(error) }
+    }
+    func fragmentLayerNeighbor(_ id: UUID, up: Bool) -> UUID? {
+        guard let track = project.tracks.first(where: { $0.clips.contains(where: { $0.id == id }) }) else { return nil }
+        let clips = track.clips.sorted { $0.order < $1.order }
+        guard let index = clips.firstIndex(where: { $0.id == id }) else { return nil }
+        let clip = clips[index]
+        let candidates = up ? Array(clips.dropFirst(index + 1)) : Array(clips.prefix(index).reversed())
+        return candidates.first { $0.start < clip.end && $0.end > clip.start }?.id
+    }
+    private func fragmentLayerChanges(_ ids: Set<UUID>, up: Bool) -> [(index: Int, clips: [Clip])] {
+        var changes: [(Int, [Clip])] = []
+        for index in project.tracks.indices {
+            let original = project.tracks[index].clips.sorted { $0.order < $1.order }
+            var clips = original
+            let moving = original.filter { ids.contains($0.id) }
+            // Process the leading edge first so selected neighbors move together
+            // rather than swapping with each other or undoing each other's moves.
+            for clip in up ? Array(moving.reversed()) : moving {
+                guard let from = clips.firstIndex(where: { $0.id == clip.id }) else { continue }
+                let candidates = up ? Array(clips.indices.dropFirst(from + 1)) : Array(clips.indices.prefix(from).reversed())
+                guard let to = candidates.first(where: { !ids.contains(clips[$0].id) && clips[$0].start < clip.end && clips[$0].end > clip.start }) else { continue }
+                clips.insert(clips.remove(at: from), at: to)
+            }
+            if clips.map(\.id) != original.map(\.id) { changes.append((index, clips)) }
+        }
+        return changes
+    }
+    func canMoveFragmentLayers(_ ids: Set<UUID>, up: Bool) -> Bool { !fragmentLayerChanges(ids, up: up).isEmpty }
+    func moveFragmentLayer(_ id: UUID, up: Bool) { moveFragmentLayers([id], up: up) }
+    func moveFragmentLayers(_ ids: Set<UUID>, up: Bool) {
+        guard !busy else { return }
+        let changes = fragmentLayerChanges(ids, up: up)
+        guard !changes.isEmpty else { return }
+        checkpoint()
+        for change in changes {
+            var clips = change.clips
+            for i in clips.indices { clips[i].order = project.nextOrder; project.nextOrder += 1 }
+            project.tracks[change.index].clips = clips
+        }
+        update()
+    }
     func importAudio() {
         guard !busy else { return }
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.audio]; panel.allowsMultipleSelection = true

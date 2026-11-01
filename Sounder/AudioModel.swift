@@ -42,6 +42,14 @@ struct Track: Codable, Identifiable {
     var effects: [PluginEffect] = []
     var nextTakeNumber = 1
 }
+struct FragmentClipboard: Codable {
+    struct Item: Codable {
+        var clip: Clip
+        var row: Int
+        var trackName: String
+    }
+    var items: [Item]
+}
 enum TrackHierarchy {
     static let maximumDepth = 2
     static let limitMessage = "Tracks can be nested at most 2 levels"

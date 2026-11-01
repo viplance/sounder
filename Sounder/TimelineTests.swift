@@ -306,3 +306,193 @@ extension AppDelegate {
         editor.undo(); editor.project = original; editor.zoom = 70; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
     }
 }
+
+extension AppDelegate {
+    func verifyGroupFragmentDragUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        var a = original.tracks[0].clips[0]; a.start = 1; a.duration = 1; a.offset = 0
+        var b = a; b.id = UUID(); b.start = 3; b.duration = 0.5; b.offset = 0.25
+        var c = a; c.id = UUID(); c.start = 5
+        var fixed = a; fixed.id = UUID(); fixed.start = 7
+        let tracks = [Track(name: "First", clips: [a, c]), Track(name: "Second", clips: [b]), Track(name: "Third"), Track(name: "Fourth", clips: [fixed])]
+        let selected: Set<UUID> = [a.id, b.id, c.id]
+        editor.project.tracks = tracks; editor.selection = selected; editor.zoom = 70; refresh()
+        let scroll = timeline.enclosingScrollView!
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        func clip(_ id: UUID) -> Clip { editor.project.tracks.flatMap(\.clips).first { $0.id == id }! }
+        func send(_ type: NSEvent.EventType, time: Double, row: Int, shift: Bool = false, command: Bool = false) {
+            let point = NSPoint(x: timeline.header + time * editor.zoom, y: timeline.ruler + CGFloat(row) * timeline.rowHeight + 30)
+            var flags: NSEvent.ModifierFlags = []; if shift { flags.insert(.shift) }; if command { flags.insert(.command) }
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            if type == .leftMouseDown { timeline.mouseDown(with: event) }
+            else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
+            else { timeline.mouseUp(with: event) }
+        }
+        let clickHistory = editor.undoStack.count
+        send(.leftMouseDown, time: 3.25, row: 1)
+        try check(editor.selection == selected, "Mouse-down preserves the group until a click can be distinguished from dragging")
+        send(.leftMouseUp, time: 3.25, row: 1)
+        try check(editor.selection == [b.id] && editor.undoStack.count == clickHistory, "A single click selects only the clicked member of a group without an Undo entry")
+        send(.leftMouseDown, time: 1.5, row: 0, shift: true); send(.leftMouseUp, time: 1.5, row: 0, shift: true)
+        try check(editor.selection == [a.id, b.id], "Shift-click still adds a fragment without collapsing the selection")
+        send(.leftMouseDown, time: 3.25, row: 1, shift: true); send(.leftMouseUp, time: 3.25, row: 1, shift: true)
+        try check(editor.selection == [a.id], "Shift-click still toggles a selected fragment off")
+        editor.selection = selected
+        send(.leftMouseDown, time: 1 + 1 / editor.zoom, row: 0); send(.leftMouseUp, time: 1 + 1 / editor.zoom, row: 0)
+        try check(editor.selection == [a.id] && clip(a.id).duration == 1, "A plain click on a fragment edge also selects that fragment without resizing")
+        editor.selection = selected
+        let history = editor.undoStack.count
+        send(.leftMouseDown, time: 3.25, row: 1); send(.leftMouseDragged, time: 4.25, row: 1)
+        try check(clip(a.id).start == 2 && clip(b.id).start == 4 && clip(c.id).start == 6 && clip(fixed.id).start == 7 && editor.selection == selected, "Dragging any selected fragment moves the whole selection by the same time delta and leaves unselected audio fixed")
+        send(.leftMouseUp, time: 4.25, row: 1)
+        try check(clip(b.id).duration == 0.5 && clip(b.id).offset == 0.25 && editor.undoStack.count == history + 1, "Group dragging preserves source bounds and creates one Undo step")
+        editor.undo(); try check(clip(a.id).start == 1 && clip(b.id).start == 3 && clip(c.id).start == 5, "One Undo restores every selected fragment")
+        editor.redo(); try check(clip(a.id).start == 2 && clip(c.id).start == 6, "Redo restores the entire group move"); editor.undo()
+        send(.leftMouseDown, time: 3.25, row: 1); send(.leftMouseDragged, time: -1.75, row: 1); send(.leftMouseUp, time: -1.75, row: 1)
+        try check(clip(a.id).start == 0 && clip(b.id).start == 2 && clip(c.id).start == 4, "Timeline zero clamps the whole group without compressing its time spacing")
+        editor.undo(); scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        let near = timeline.fragmentSnapTolerance / 2
+        send(.leftMouseDown, time: 1.5, row: 0); send(.leftMouseDragged, time: 1.5 + near, row: 1)
+        try check(clip(a.id).start == 1 && clip(b.id).start == 3 && clip(c.id).start == 5 && timeline.fragmentSnapTime == 1, "Cross-track snapping applies one shared time delta to the whole group")
+        try check(timeline.displayedClips(for: tracks[0]).isEmpty && Set(timeline.displayedClips(for: tracks[1]).map(\.id)) == [a.id, c.id] && timeline.displayedClips(for: tracks[2]).first?.id == b.id, "All selected waveforms preview on their destination tracks while preserving their row spacing")
+        send(.leftMouseUp, time: 1.5 + near, row: 1)
+        try check(Set(editor.project.tracks[1].clips.map(\.id)) == [a.id, c.id] && editor.project.tracks[2].clips.first?.id == b.id && editor.selection == selected && timeline.fragmentSnapTime == nil, "Drop transfers every selected fragment and retains the selection")
+        editor.undo(); try check(editor.project.tracks[0].clips.count == 2 && editor.project.tracks[1].clips.first?.id == b.id && editor.project.tracks[2].clips.isEmpty, "Undo restores both time positions and original tracks for the entire group")
+        send(.leftMouseDown, time: 3.25, row: 1); send(.leftMouseDragged, time: 3.25, row: 3); send(.leftMouseUp, time: 3.25, row: 3)
+        try check(Set(editor.project.tracks[2].clips.map(\.id)) == [a.id, c.id] && editor.project.tracks[3].clips.contains(where: { $0.id == b.id }) && editor.project.tracks[3].clips.contains(where: { $0.id == fixed.id }), "Group moves preserve row offsets at the bottom and retain destination audio")
+        editor.undo()
+        send(.leftMouseDown, time: 3.25, row: 1, shift: true); send(.leftMouseDragged, time: 4.25, row: 1, shift: true); send(.leftMouseUp, time: 4.25, row: 1, shift: true)
+        try check(!editor.selection.contains(b.id) && clip(a.id).start == 1 && clip(b.id).start == 3, "Shift-deselecting a fragment does not accidentally drag the remaining group")
+        editor.selection = selected
+        let beforeCopy = editor.undoStack.count
+        send(.leftMouseDown, time: 1.5, row: 0, command: true); send(.leftMouseDragged, time: 2.5, row: 1, command: true)
+        try check(clip(a.id).start == 1 && clip(b.id).start == 3 && clip(c.id).start == 5 && editor.project.tracks.flatMap(\.clips).count == 4 && timeline.displayedClips(for: tracks[1]).count == 3, "Command-drag previews copies while every original remains untouched")
+        send(.leftMouseUp, time: 2.5, row: 1, command: true)
+        let duplicates = editor.project.tracks.flatMap(\.clips).filter { editor.selection.contains($0.id) }
+        try check(duplicates.count == 3 && duplicates.map(\.start).sorted() == [2, 4, 6] && editor.selection.isDisjoint(with: selected) && editor.project.tracks.flatMap(\.clips).count == 7, "Command-drag commits fresh copies with the group's original time spacing")
+        try check(editor.project.tracks[1].clips.filter { editor.selection.contains($0.id) }.count == 2 && editor.project.tracks[2].clips.first?.start == 4 && editor.undoStack.count == beforeCopy + 1, "Command-drag copies preserve relative track rows in one Undo step")
+        editor.undo(); try check(editor.project.tracks.flatMap(\.clips).count == 4 && clip(a.id).start == 1, "Undo removes the copies without moving or removing originals")
+        editor.redo(); try check(editor.project.tracks.flatMap(\.clips).count == 7, "Redo restores Command-drag copies")
+        editor.undo()
+        editor.project = original; editor.selectedTrack = original.tracks[0].id; editor.selection = []; editor.dirty = false; refresh()
+    }
+}
+
+extension AppDelegate {
+    func verifyFragmentMenuUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        var lower = original.tracks[0].clips[0]; lower.start = 1; lower.duration = 3; lower.order = 1
+        var middle = lower; middle.id = UUID(); middle.order = 2
+        var upper = lower; upper.id = UUID(); upper.order = 3
+        var isolated = lower; isolated.id = UUID(); isolated.start = 7; isolated.duration = 1; isolated.order = 4
+        editor.project = Project(tracks: [Track(name: "Layers", clips: [lower, middle, upper, isolated])], nextOrder: 5)
+        editor.zoom = 70; editor.cursor = 6; refresh()
+        timeline.enclosingScrollView?.contentView.scroll(to: .zero)
+        func menu(time: Double, y: CGFloat) -> NSMenu? {
+            let point = NSPoint(x: timeline.header + time * editor.zoom, y: y)
+            let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            return timeline.menu(for: event)
+        }
+        func perform(_ item: NSMenuItem) { _ = NSApp.sendAction(item.action!, to: item.target, from: item) }
+        func order() -> [UUID] { editor.project.tracks[0].clips.sorted { $0.order < $1.order }.map(\.id) }
+        let bottom = menu(time: 2, y: timeline.ruler + 9)!
+        try check(bottom.items.map(\.title) == ["Move up", "Move down", "Delete"] && bottom.items[0].isEnabled && !bottom.items[1].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
+        let history = editor.undoStack.count
+        perform(bottom.items[0])
+        try check(order() == [middle.id, lower.id, upper.id, isolated.id] && editor.undoStack.count == history + 1, "Move up raises the context fragment exactly one overlapping level and leaves other relative ordering intact")
+        perform(bottom.items[0])
+        let top = menu(time: 2, y: timeline.ruler + 25)!
+        try check(!top.items[0].isEnabled && top.items[1].isEnabled && editor.selection == [lower.id], "Top layer disables Move up and enables Move down")
+        perform(top.items[1])
+        try check(order() == [middle.id, lower.id, upper.id, isolated.id], "Move down lowers the selected fragment exactly one overlapping level")
+        editor.undo(); try check(order() == [middle.id, upper.id, lower.id, isolated.id], "Undo restores the previous layer priority")
+        editor.redo()
+        let alone = menu(time: 7.5, y: timeline.ruler + 25)!
+        try check(!alone.items[0].isEnabled && !alone.items[1].isEnabled, "Both layer actions are disabled for an isolated fragment")
+        editor.selection.insert(upper.id)
+        perform(alone.items[2])
+        try check(editor.project.tracks[0].clips.count == 3 && !editor.project.tracks[0].clips.contains(where: { $0.id == isolated.id }) && editor.project.tracks[0].clips.contains(where: { $0.id == upper.id }), "Context Delete removes only its fragment even when another fragment is selected")
+        editor.undo(); try check(editor.project.tracks[0].clips.count == 4, "Context fragment deletion can be undone")
+        try check(menu(time: 6, y: timeline.ruler + 25) == nil, "Empty fragment space does not open the track menu")
+        editor.selection = [lower.id, upper.id]
+        let group = menu(time: 2, y: timeline.ruler + 25)!
+        try check(editor.selection == [lower.id, upper.id] && !group.items[0].isEnabled && group.items[1].isEnabled, "Right-clicking a selected fragment preserves the group and enables layer actions for the whole selection")
+        let groupHistory = editor.undoStack.count
+        perform(group.items[1])
+        try check(order() == [lower.id, upper.id, middle.id, isolated.id] && editor.selection == [lower.id, upper.id] && editor.undoStack.count == groupHistory + 1, "Group Move down moves selected layers together without swapping them and creates one Undo step")
+        editor.undo(); editor.redo(); editor.undo()
+        perform(group.items[2])
+        try check(Set(editor.project.tracks[0].clips.map(\.id)) == [middle.id, isolated.id], "Context Delete removes every selected fragment and preserves unselected audio")
+        editor.undo()
+        var secondLower = lower; secondLower.id = UUID(); secondLower.order = 10
+        var secondUpper = upper; secondUpper.id = UUID(); secondUpper.order = 11
+        editor.project.tracks.append(Track(name: "Other layers", clips: [secondLower, secondUpper])); refresh()
+        editor.selection = [lower.id, secondLower.id]
+        let across = menu(time: 2, y: timeline.ruler + 11)!
+        try check(editor.selection == [lower.id, secondLower.id] && across.items[0].isEnabled, "Context selection is retained across different tracks")
+        let batchHistory = editor.undoStack.count
+        perform(across.items[0])
+        try check(order() == [middle.id, upper.id, lower.id, isolated.id] && editor.project.tracks[1].clips.sorted(by: { $0.order < $1.order }).last?.id == secondLower.id && editor.undoStack.count == batchHistory + 1, "One menu action changes layers on every selected track with one Undo step")
+        editor.undo()
+        perform(across.items[2])
+        try check(!editor.project.tracks.flatMap(\.clips).contains(where: { $0.id == lower.id || $0.id == secondLower.id }) && editor.project.tracks[1].clips.first?.id == secondUpper.id, "Group context deletion applies across tracks")
+        editor.undo()
+        editor.selection = [lower.id, upper.id]
+        _ = menu(time: 7.5, y: timeline.ruler + 25)
+        try check(editor.selection == [isolated.id], "Right-clicking an unselected fragment selects only that fragment")
+        editor.project = original; editor.selectedTrack = original.tracks[0].id; editor.selection = []; editor.dirty = false; refresh()
+    }
+}
+
+extension AppDelegate {
+    func verifyFragmentClipboardUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        let pasteboard = NSPasteboard.general
+        let saved = (pasteboard.pasteboardItems ?? []).map { item in item.types.compactMap { type in item.data(forType: type).map { (type, $0) } } }
+        defer {
+            pasteboard.clearContents()
+            let restored = saved.map { values -> NSPasteboardItem in
+                let item = NSPasteboardItem(); for (type, data) in values { item.setData(data, forType: type) }; return item
+            }
+            pasteboard.writeObjects(restored)
+        }
+        window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        func key(_ text: String, code: UInt16) throws {
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: text, charactersIgnoringModifiers: text, isARepeat: false, keyCode: code)!
+            try check(NSApp.mainMenu!.performKeyEquivalent(with: event), "Command-\(text.uppercased()) is handled by the Edit menu")
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        try key("a", code: 0)
+        let ids = Set(original.tracks.flatMap(\.clips).map(\.id))
+        try check(editor.selection == ids, "Command-A selects every fragment")
+        try key("c", code: 8)
+        let data = pasteboard.data(forType: Editor.fragmentPasteboardType)!
+        let payload = try JSONDecoder().decode(FragmentClipboard.self, from: data)
+        try check(payload.items.count == ids.count, "Command-C writes the whole selected group to the system clipboard")
+        editor.cursor = 12; editor.selectedTrack = original.tracks[0].id
+        try key("v", code: 9)
+        let copies = editor.project.tracks.flatMap(\.clips).filter { editor.selection.contains($0.id) }
+        try check(copies.map(\.start).sorted() == [12, 13, 17] && editor.selection.isDisjoint(with: ids), "Command-V pastes at the cursor with the group's relative timing intact")
+        editor.undo()
+        timeline.renameTrack(original.tracks[0].id)
+        guard let input = timeline.nameField.currentEditor() as? NSTextView else { throw SounderError.message("No inline name editor") }
+        let text = input.string; let fragmentSelection = editor.selection
+        try key("a", code: 0); try key("c", code: 8)
+        try check(input.selectedRange().length == (text as NSString).length && pasteboard.string(forType: .string) == text && editor.selection == fragmentSelection, "Text editors retain native Command-A and Command-C behavior")
+        input.insertText("Temporary", replacementRange: input.selectedRange()); input.selectAll(nil)
+        try key("v", code: 9)
+        try check(input.string == text && editor.project.tracks.flatMap(\.clips).count == ids.count, "Command-V pastes text in name editors without creating audio fragments")
+        timeline.nameField.finish(commit: false); window.makeFirstResponder(timeline)
+        editor.project = original; editor.selectedTrack = original.tracks[0].id; editor.selection = []; editor.dirty = false; refresh()
+    }
+}

@@ -11,12 +11,12 @@ final class ImportPlacementDialog: NSObject {
         super.init()
         alert.messageText = "Import multiple files"
         let form = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 56))
-        for (index, button) in [single, separate].enumerated() {
+        for (index, button) in [separate, single].enumerated() {
             button.setButtonType(.radio); button.target = self; button.action = #selector(selectPlacement(_:))
             button.frame = NSRect(x: 0, y: index == 0 ? 32 : 0, width: 300, height: 24)
             form.addSubview(button)
         }
-        single.state = .on
+        separate.state = .on
         alert.accessoryView = form; alert.addButton(withTitle: "Import"); alert.addButton(withTitle: "Cancel")
     }
     @objc private func selectPlacement(_ sender: NSButton) {

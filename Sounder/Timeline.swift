@@ -92,10 +92,15 @@ final class Timeline: NSView {
     let ruler: CGFloat = 42
     var rows: [(Track, Int)] = []
     var dragClip: UUID?
+    private var pendingFragmentClick: UUID?
     var dragStart = NSPoint.zero
     var originalStart = 0.0
     var dragTrack: UUID?
     var dragDestination: UUID?
+    private var movingFragments: [(track: UUID, row: Int, clip: Clip)] = []
+    private var fragmentDestinations: [UUID: UUID] = [:]
+    private var copyingFragments = false
+    private var fragmentCopyPreviews: [UUID: Clip] = [:]
     private(set) var fragmentSnapTime: Double?
     var didCheckpoint = false
     private var fragmentResize: (original: Clip, leftEdge: Bool, sourceDuration: Double)?
@@ -156,7 +161,7 @@ final class Timeline: NSView {
         return NSRect(x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
     }
     func isTrackPoint(_ point: NSPoint) -> Bool { point.y >= ruler && !pinnedRulerRect.contains(point) }
-    var timelineDuration: Double { max(30, max(editor.duration, resizedFragment?.end ?? 0) + 8, editor.cursor + 5) }
+    var timelineDuration: Double { max(30, max(editor.duration, resizedFragment?.end ?? 0, fragmentCopyPreviews.values.map(\.end).max() ?? 0) + 8, editor.cursor + 5) }
     var viewportSize: NSSize { enclosingScrollView?.contentSize ?? NSSize(width: 1000, height: 600) }
     var minimumZoom: Double { max(1, viewportSize.width - header) / timelineDuration }
     var rulerStep: Double {
@@ -239,11 +244,12 @@ final class Timeline: NSView {
     }
     var fragmentSnapTolerance: Double { max(0, visibleFragmentRect.width) / editor.zoom * 0.01 }
     func snappedFragmentPosition(_ proposed: Double, clip: Clip, destination: UUID?) -> (start: Double, guide: Double?) {
-        let start = max(0, proposed)
+        let minimum = originalStart - (movingFragments.map { $0.clip.start }.min() ?? originalStart)
+        let start = max(minimum, proposed)
         guard let destination, destination != dragTrack else { return (start, nil) }
         // The original position is stable even as the live drag changes the model.
         var matches = [(start: originalStart, guide: originalStart)]
-        for target in editor.project.tracks.flatMap(\.clips) where target.id != clip.id {
+        for target in editor.project.tracks.flatMap(\.clips) where target.id != clip.id && !movingFragments.contains(where: { $0.clip.id == target.id }) {
             for edge in [target.start, target.end] {
                 matches.append((edge, edge))
                 matches.append((edge - clip.duration, edge))
@@ -251,35 +257,53 @@ final class Timeline: NSView {
         }
         var best: (start: Double, guide: Double)?
         var distance = fragmentSnapTolerance
-        for match in matches where match.start >= 0 {
+        for match in matches where match.start >= minimum {
             let difference = abs(match.start - start)
             if difference < distance { best = match; distance = difference }
         }
         return best.map { ($0.start, Optional($0.guide)) } ?? (start, nil)
     }
     private func updateFragmentMove(at point: NSPoint) {
-        guard let id = dragClip,
-              let i = editor.project.tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == id }) }),
-              let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == id }) else { return }
-        dragDestination = dropTrack(at: point)
+        guard let id = dragClip, let anchor = movingFragments.first(where: { $0.clip.id == id }),
+              let requested = dropTrack(at: point), let targetRow = rows.firstIndex(where: { $0.0.id == requested }),
+              let firstRow = movingFragments.map({ $0.row }).min(), let lastRow = movingFragments.map({ $0.row }).max() else { return }
+        let rowDelta = max(-firstRow, min(targetRow - anchor.row, rows.count - 1 - lastRow))
+        fragmentDestinations = Dictionary(uniqueKeysWithValues: movingFragments.map { ($0.clip.id, rows[$0.row + rowDelta].0.id) })
+        dragDestination = fragmentDestinations[id]
         let position = snappedFragmentPosition(originalStart + (point.x - dragStart.x) / editor.zoom,
-                                               clip: editor.project.tracks[i].clips[j], destination: dragDestination)
+                                               clip: anchor.clip, destination: dragDestination)
         fragmentSnapTime = position.guide
-        editor.project.tracks[i].clips[j].start = position.start
+        let delta = position.start - originalStart
+        for original in movingFragments {
+            if let i = editor.project.tracks.firstIndex(where: { $0.id == original.track }),
+               let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == original.clip.id }) {
+                if copyingFragments {
+                    var copy = fragmentCopyPreviews[original.clip.id] ?? original.clip
+                    if fragmentCopyPreviews[original.clip.id] == nil { copy.id = UUID() }
+                    copy.start = original.clip.start + delta; fragmentCopyPreviews[original.clip.id] = copy
+                } else { editor.project.tracks[i].clips[j].start = original.clip.start + delta }
+            }
+        }
         editor.update()
     }
     func displayedClips(for track: Track) -> [Clip] {
         var clips = track.clips
         if let resizedFragment, let index = clips.firstIndex(where: { $0.id == resizedFragment.id }) { clips[index] = resizedFragment }
-        if let id = dragClip, let source = dragTrack, let target = dragDestination, source != target,
-           let clip = editor.project.tracks.first(where: { $0.id == source })?.clips.first(where: { $0.id == id }) {
-            if track.id == source { clips.removeAll { $0.id == id } }
-            if track.id == target { clips.append(clip) }
+        if copyingFragments {
+            for original in movingFragments where fragmentDestinations[original.clip.id] == track.id {
+                if let copy = fragmentCopyPreviews[original.clip.id] { clips.append(copy) }
+            }
+        } else if !fragmentDestinations.isEmpty {
+            clips.removeAll { fragmentDestinations[$0.id].map { $0 != track.id } == true }
+            for source in editor.project.tracks where source.id != track.id {
+                clips.append(contentsOf: source.clips.filter { fragmentDestinations[$0.id] == track.id })
+            }
         }
         clips.sort { $0.order < $1.order }
-        // Keep the moving fragment visible above existing destination fragments.
-        if dragDestination != nil, let id = dragClip, let index = clips.firstIndex(where: { $0.id == id }) {
-            clips.append(clips.remove(at: index))
+        // Draw the whole moving selection above the destination's older fragments.
+        if dragDestination != nil {
+            let active = copyingFragments ? Set(fragmentCopyPreviews.values.map(\.id)) : Set(fragmentDestinations.keys)
+            clips = clips.filter { !active.contains($0.id) } + clips.filter { active.contains($0.id) }
         }
         return clips
     }
@@ -290,7 +314,7 @@ final class Timeline: NSView {
     }
     @discardableResult func cancelFragmentResize() -> Bool {
         guard fragmentResize != nil else { return false }
-        fragmentResize = nil; resizedFragment = nil; refresh(); return true
+        fragmentResize = nil; resizedFragment = nil; pendingFragmentClick = nil; refresh(); return true
     }
     private func updateFragmentResize(at point: NSPoint) {
         guard let resize = fragmentResize else { return }
@@ -567,6 +591,7 @@ final class Timeline: NSView {
     }
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        pendingFragmentClick = nil
         let point = convert(event.locationInWindow, from: nil)
         // A ruler press is only a seek once released without dragging.
         // Range selection and handle resizing never touch the transport.
@@ -622,17 +647,25 @@ final class Timeline: NSView {
                     do {
                         let duration = try editor.audio.sourceDuration(clip.source)
                         fragmentResize = (clip, edge == 0, duration); resizedFragment = clip
+                        if !event.modifierFlags.contains(.shift) { pendingFragmentClick = clip.id }
                         if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
                         editor.hint(.selectFragments, "Shift click to multi select"); editor.update()
                     } catch { editor.error(error) }
                     return
                 }
+                if !event.modifierFlags.contains(.shift) { pendingFragmentClick = clip.id }
                 if event.clickCount == 2 { editor.range = nil }
                 editor.seek(to: (p.x - header) / editor.zoom)
                 if event.modifierFlags.contains(.shift) { if editor.selection.contains(clip.id) { editor.selection.remove(clip.id) } else { editor.selection.insert(clip.id) } }
                 else if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
                 if editor.selection.contains(clip.id) { editor.hint(.selectFragments, "Shift click to multi select") }
-                if !editor.busy { dragClip = clip.id; originalStart = clip.start; dragTrack = track.id; dragDestination = nil; fragmentSnapTime = nil }
+                if !editor.busy && editor.selection.contains(clip.id) {
+                    dragClip = clip.id; originalStart = clip.start; dragTrack = track.id; dragDestination = nil; fragmentSnapTime = nil
+                    fragmentDestinations = [:]; fragmentCopyPreviews = [:]; copyingFragments = false
+                    movingFragments = rows.enumerated().flatMap { index, row in
+                        row.0.clips.filter { editor.selection.contains($0.id) }.map { (row.0.id, index, $0) }
+                    }
+                }
                 editor.update(); return
             }
         }
@@ -708,7 +741,11 @@ final class Timeline: NSView {
             previewTrackMove(at: p)
         }
         if dragClip != nil, hypot(p.x - dragStart.x, p.y - dragStart.y) > 2 || didCheckpoint {
-            if !didCheckpoint { editor.checkpoint(); didCheckpoint = true }
+            if !didCheckpoint {
+                copyingFragments = event.modifierFlags.contains(.command)
+                editor.checkpoint(); didCheckpoint = true
+            }
+            if copyingFragments { NSCursor.dragCopy.set() }
             updateFragmentMove(at: p)
         }
         if trackDrag != nil {
@@ -728,7 +765,9 @@ final class Timeline: NSView {
                     editor.checkpoint(); editor.project.tracks[i].clips[j] = clip
                 }
             }
-            fragmentResize = nil; resizedFragment = nil; editor.update(); return
+            if let clip = resizedFragment, clip.start == resize.original.start, clip.duration == resize.original.duration,
+               let id = pendingFragmentClick { editor.selection = [id] }
+            fragmentResize = nil; resizedFragment = nil; pendingFragmentClick = nil; editor.update(); return
         }
         if marqueeAnchor != nil {
             guard canSelectRange else { cancelMarqueeSelection(); return }
@@ -767,14 +806,37 @@ final class Timeline: NSView {
             refresh()
         }
         if dragClip != nil, didCheckpoint, !editor.busy { updateFragmentMove(at: p) }
-        if let id = dragClip, let source = dragTrack, let destination = dropTrack(at: p), destination != source {
-            if let i = editor.project.tracks.firstIndex(where: { $0.id == source }), let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == id }), let target = editor.project.tracks.firstIndex(where: { $0.id == destination }) {
-                if !didCheckpoint { editor.checkpoint() }
-                didCheckpoint = true
-                let clip = editor.project.tracks[i].clips.remove(at: j); editor.project.tracks[target].clips.append(clip); editor.selectedTrack = destination; editor.update()
+        if dragClip != nil, didCheckpoint, !editor.busy, copyingFragments {
+            var copies = Set<UUID>()
+            for original in movingFragments.sorted(by: { $0.clip.order < $1.clip.order }) {
+                if var copy = fragmentCopyPreviews[original.clip.id], let destination = fragmentDestinations[original.clip.id],
+                   let index = editor.project.tracks.firstIndex(where: { $0.id == destination }) {
+                    copy.order = editor.project.nextOrder; editor.project.nextOrder += 1
+                    editor.project.tracks[index].clips.append(copy); copies.insert(copy.id)
+                }
             }
+            editor.selection = copies; editor.selectedTrack = dragDestination ?? dragTrack; editor.update()
+        } else if dragClip != nil, didCheckpoint, !editor.busy {
+            var transfers: [(UUID, Clip)] = []
+            for i in editor.project.tracks.indices {
+                let source = editor.project.tracks[i].id
+                for clip in editor.project.tracks[i].clips {
+                    if let destination = fragmentDestinations[clip.id], destination != source { transfers.append((destination, clip)) }
+                }
+                editor.project.tracks[i].clips.removeAll { fragmentDestinations[$0.id].map { $0 != source } == true }
+            }
+            for (destination, clip) in transfers {
+                if let i = editor.project.tracks.firstIndex(where: { $0.id == destination }) { editor.project.tracks[i].clips.append(clip) }
+            }
+            editor.selectedTrack = dragDestination ?? dragTrack; editor.update()
         }
-        dragClip = nil; dragTrack = nil; dragDestination = nil; fragmentSnapTime = nil; trackDrag = nil; pendingTrackRename = nil; selectingRange = false
+        // Wait for mouse-up to distinguish a plain click from a group drag.
+        if !didCheckpoint, let id = pendingFragmentClick { editor.selection = [id]; editor.update() }
+        pendingFragmentClick = nil
+        if copyingFragments { NSCursor.arrow.set() }
+        copyingFragments = false; fragmentCopyPreviews = [:]
+        dragClip = nil; dragTrack = nil; dragDestination = nil; fragmentSnapTime = nil; movingFragments = []; fragmentDestinations = [:]
+        trackDrag = nil; pendingTrackRename = nil; selectingRange = false
         needsDisplay = true
         if let renameID { renameTrack(renameID) }
     }
@@ -823,10 +885,36 @@ final class Timeline: NSView {
             item.target = self; menu.addItem(item)
             return menu
         }
+        if p.x >= fragmentLeft {
+            let clips = rows[row].0.clips.sorted { $0.order < $1.order }
+            for (layer, clip) in clips.enumerated().reversed() {
+                let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
+                guard clipRect(clip, row: row, layer: overlaps).contains(p) else { continue }
+                editor.selectedTrack = rows[row].0.id
+                if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
+                editor.update()
+                let menu = NSMenu(); menu.autoenablesItems = false
+                for (title, action, enabled) in [
+                    ("Move up", #selector(moveFragmentUp(_:)), editor.canMoveFragmentLayers(editor.selection, up: true)),
+                    ("Move down", #selector(moveFragmentDown(_:)), editor.canMoveFragmentLayers(editor.selection, up: false)),
+                    ("Delete", #selector(deleteFragment(_:)), true)] {
+                    let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+                    item.target = self; item.representedObject = editor.selection; item.isEnabled = enabled; menu.addItem(item)
+                }
+                return menu
+            }
+            return nil
+        }
         editor.selectedTrack = rows[row].0.id; editor.update()
         let menu = NSMenu()
         for (title, action) in [("Track effects…", #selector(effects)), ("Add nested track", #selector(nest)), ("Move to root", #selector(unparent)), ("Delete track…", #selector(remove))] { let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item) }
         return menu
+    }
+    @objc func moveFragmentUp(_ sender: NSMenuItem) { if let ids = sender.representedObject as? Set<UUID> { editor.moveFragmentLayers(ids, up: true) } }
+    @objc func moveFragmentDown(_ sender: NSMenuItem) { if let ids = sender.representedObject as? Set<UUID> { editor.moveFragmentLayers(ids, up: false) } }
+    @objc func deleteFragment(_ sender: NSMenuItem) {
+        guard !editor.busy, let ids = sender.representedObject as? Set<UUID> else { return }
+        editor.selection = ids; editor.deleteClips()
     }
     @objc func effects() { if let id = editor.selectedTrack { EffectsWindow(editor: editor, trackID: id).run() } }
     @objc func addTrack() { editor.addTrack() }

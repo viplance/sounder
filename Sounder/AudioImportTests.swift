@@ -115,15 +115,15 @@ extension AppDelegate {
     func verifyImportPlacementUI() throws {
         for choice in [0, 1, 2] {
             let dialog = ImportPlacementDialog()
-            guard dialog.single.title == "One track", dialog.separate.title == "Separate tracks", dialog.placement == .singleTrack else { throw SounderError.message("Import placement must show two English options with a single-track default") }
+            guard dialog.single.title == "One track", dialog.separate.title == "Separate tracks", dialog.placement == .separateTracks, dialog.separate.frame.minY > dialog.single.frame.minY else { throw SounderError.message("Separate tracks must be first and selected by default") }
             let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
-                if choice == 1 { dialog.separate.performClick(nil) }
+                if choice == 1 { dialog.single.performClick(nil) }
                 dialog.alert.buttons[choice == 2 ? 1 : 0].performClick(nil)
             }
             RunLoop.main.add(timer, forMode: .common)
             let result = dialog.runModal()
-            guard choice == 0 ? result == .singleTrack : choice == 1 ? result == .separateTracks : result == nil else { throw SounderError.message("Import placement choice or cancellation failed") }
+            guard choice == 0 ? result == .separateTracks : choice == 1 ? result == .singleTrack : result == nil else { throw SounderError.message("Import placement choice or cancellation failed") }
         }
-        print("PASS: import placement dialog offers One track and Separate tracks, confirms either choice, and cancels without importing")
+        print("PASS: import placement dialog defaults to Separate tracks first, confirms either choice, and cancels without importing")
     }
 }

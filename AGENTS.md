@@ -52,7 +52,7 @@
 
 ## Audio import
 
-- After selecting multiple files, show an English placement dialog with One track and Separate tracks options and Import/Cancel. Single-track placement is sequential; separate-track placement starts at the captured active track, follows visible hierarchy order below it, and gives all fragments the same captured cursor time. Create missing root tracks with the corresponding imported fragment names (respecting track name limits). Keep existing tracks/fragments intact; commit successful files and any new tracks together as one Undo action. Single-file import does not show this dialog.
+- After selecting multiple files, show an English placement dialog with Separate tracks first and selected by default, followed by One track, and Import/Cancel. Single-track placement is sequential; separate-track placement starts at the captured active track, follows visible hierarchy order below it, and gives all fragments the same captured cursor time. Create missing root tracks with the corresponding imported fragment names (respecting track name limits). Keep existing tracks/fragments intact; commit successful files and any new tracks together as one Undo action. Single-file import does not show this dialog.
 
 - Show a nonmodal import window immediately after file selection, with each file's own progress and outcome. Keep copy, decoding, resampling and waveform preparation on a worker queue.
 - Publish prepared PCM and waveform data into the main-thread audio cache under the final copied source path before inserting fragments. Timeline drawing must not decode imported files again.
@@ -127,3 +127,17 @@
 ## Fragment alignment
 
 - While moving a fragment to another track, snap its start or end to other fragments' boundaries, and preserve its original time on near-vertical moves. Use the nearest match strictly within 1% of the visible fragment area's time span, excluding the pinned sidebar; derive the threshold again after zoom or viewport changes. Show a vertical dashed guide across all visible track rows while matched, clear it outside the threshold and on drop, and preserve source offsets/duration and single-step Undo.
+
+## Group fragment dragging
+
+- A plain click on a selected group member selects only that fragment on mouse-up. Preserve the group on mouse-down so an actual drag still moves it together. Shift-click toggles selection; selection-only clicks do not create Undo entries. Apply the same plain-click behavior to fragment edges when no resizing occurs.
+
+- Dragging the body of any selected fragment moves all selected fragments with one common time delta and preserves their time spacing, source offsets and durations. Clamp the whole group at timeline zero, never individual fragments. On cross-track moves, preserve relative visible row offsets and clamp the group to existing track bounds; preview every selected waveform on its destination. Snap the whole group rigidly, exclude its members from snap targets, retain selection after drop, and use one Undo step for all time/track changes. Shift-deselecting a fragment must not start a group move. Edge resizing still affects only the grabbed edge's fragment.
+
+## Fragment context menu
+
+- Right-clicking a selected fragment preserves the entire selection; right-clicking an unselected fragment selects it alone. Open Move up, Move down, Delete without seeking. Apply each action to the selection captured when opening the menu, across all tracks, in a single Undo step. Layer moves skip selected neighbors and process the leading edge first so stacked selected fragments do not swap or cancel each other. Enable a direction if any selected fragment can move past an unselected overlapping neighbor. Move up/down advances one overlapping layer on the same track, preserving all other fragments' relative order, timing and source bounds. Disable a direction when no overlapping neighbor exists there. Use the same order for waveform layering and audio overlap priority, support Undo/Redo, and keep layer changes silent. Delete removes the whole context selection and uses the existing red notification. Track menus belong to the sidebar, not empty fragment space.
+
+## Fragment clipboard and duplication
+
+- Command-A selects all fragments. Command-C writes an immutable group snapshot to the system pasteboard; Command-V creates fresh fragment IDs at the cursor, anchoring the earliest selected fragment there and preserving time spacing, relative visible track rows, source offsets, durations and overlap ordering. Use the active track as the first destination row and create missing root tracks as needed. Keep native text Select All/Copy/Paste in inline editors and other text fields. Paste is a single Undo action. Command held when a fragment drag begins creates live preview copies and leaves originals untouched; retain group spacing and snapping, select the copies after drop and undo duplication in one step.

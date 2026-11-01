@@ -286,6 +286,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--track-name-ui-test") { try verifyTrackNameUI() }
             if CommandLine.arguments.contains("--settings-ui-test") { try verifySettingsUI() }
             if CommandLine.arguments.contains("--notifications-ui-test") { try verifyNotificationInteractions(); finishNotificationUITest(audioURL: url); return }
+            if CommandLine.arguments.contains("--fragment-clipboard-ui-test") { try verifyFragmentClipboardUI() }
+            if CommandLine.arguments.contains("--fragment-menu-ui-test") { try verifyFragmentMenuUI() }
+            if CommandLine.arguments.contains("--group-fragment-drag-ui-test") { try verifyGroupFragmentDragUI() }
             if CommandLine.arguments.contains("--import-placement-ui-test") { try verifyImportPlacementUI() }
             if CommandLine.arguments.contains("--fragment-snap-ui-test") { try verifyFragmentSnapUI() }
             if CommandLine.arguments.contains("--fragment-resize-ui-test") { try verifyFragmentResizeUI() }
@@ -653,7 +656,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         menu("Sounder", [("About Sounder", #selector(about), ""), ("Quit Sounder", #selector(quit), "q")])
         menu("File", [("Rename Project…", #selector(renameProject), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Import Audio…", #selector(importAudio), "i"), ("Export…", #selector(exportAudio), "e")])
-        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Split at Playhead", #selector(split), "b"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
+        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v"), ("Split at Playhead", #selector(split), "b"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
         menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
         menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
         if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
@@ -667,6 +670,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func importAudio() { editor.importAudio() }
     @objc func exportAudio() { editor.export() }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if [#selector(selectAll(_:)), #selector(copy(_:)), #selector(paste(_:))].contains(menuItem.action) {
+            if (NSApp.keyWindow ?? window)?.firstResponder is NSTextView { return true }
+            guard NSApp.modalWindow == nil, NSApp.keyWindow == nil || NSApp.keyWindow === window else { return false }
+            if menuItem.action == #selector(selectAll(_:)) { return timeline.canSelectRange }
+            if menuItem.action == #selector(copy(_:)) { return !editor.selection.isEmpty }
+            return !editor.busy && NSPasteboard.general.data(forType: Editor.fragmentPasteboardType) != nil
+        }
         if menuItem.action == #selector(exportAudio) { return editor.canExport }
         if [#selector(zoomIn), #selector(zoomOut)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
@@ -677,6 +687,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 && !editor.requestingMic && !editor.isImporting
         }
         return true
+    }
+    @objc func selectAll(_ sender: Any?) {
+        if let input = (NSApp.keyWindow ?? window)?.firstResponder as? NSTextView { input.selectAll(sender) }
+        else if timeline.canSelectRange { editor.selectAllFragments() }
+    }
+    @objc func copy(_ sender: Any?) {
+        if let input = (NSApp.keyWindow ?? window)?.firstResponder as? NSTextView { input.copy(sender) }
+        else { editor.copyFragments() }
+    }
+    @objc func paste(_ sender: Any?) {
+        if let input = (NSApp.keyWindow ?? window)?.firstResponder as? NSTextView { input.paste(sender) }
+        else { editor.pasteFragments() }
     }
     @objc func seekToStart() { timeline.seekBoundary(end: false) }
     @objc func seekToEnd() { timeline.seekBoundary(end: true) }

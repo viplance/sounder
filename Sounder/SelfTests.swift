@@ -33,6 +33,44 @@ func runAudioTests() throws {
         let shortest = editable.resized(leftEdge: left, by: left ? 10 : -10, sourceDuration: 1)
         try check(abs(shortest.duration - 0.010) < 1e-9, "Both fragment edges enforce a 10 ms minimum (left: \(left))")
     }
+    let layerEditor = Editor(store: store)
+    layerEditor.project = Project(tracks: [track], nextOrder: 10)
+    let oldID = track.clips[0].id
+    layerEditor.moveFragmentLayer(oldID, up: true)
+    let layerMix = try store.render(layerEditor.project)
+    try check(layerMix[13_000] == 0.25 && layerMix[20_000] == 0, "Move up advances exactly one overlapping layer in both waveform order and rendered audio")
+    layerEditor.moveFragmentLayer(oldID, up: true)
+    let topMix = try store.render(layerEditor.project)
+    try check(topMix[20_000] == 0.25 && layerEditor.fragmentLayerNeighbor(oldID, up: true) == nil, "A fragment reaches the top after one action per overlapping layer")
+    layerEditor.moveFragmentLayer(oldID, up: false)
+    let downMix = try store.render(layerEditor.project)
+    try check(downMix == layerMix, "Move down restores the immediately lower audio priority")
+    layerEditor.undo(); try check(try store.render(layerEditor.project) == topMix, "Layer changes support Undo")
+    layerEditor.redo(); try check(try store.render(layerEditor.project) == layerMix, "Layer changes support Redo")
+    let clipboardEditor = Editor(store: store)
+    var copyA = track.clips[0]; copyA.start = 2; copyA.duration = 0.25; copyA.offset = 0.1
+    var copyB = copyA; copyB.id = UUID(); copyB.start = 4; copyB.order += 1
+    var copyC = copyA; copyC.id = UUID(); copyC.start = 6; copyC.order += 2
+    let copyRoot = Track(name: "Copy source", clips: [copyA, copyC])
+    let copyChild = Track(name: "Copy child", parent: copyRoot.id, clips: [copyB])
+    clipboardEditor.project = Project(tracks: [copyRoot, copyChild], nextOrder: 20)
+    clipboardEditor.selectAllFragments()
+    try check(clipboardEditor.selection == [copyA.id, copyB.id, copyC.id], "Select All selects fragments across the full hierarchy")
+    let pasteboard = NSPasteboard.withUniqueName()
+    defer { pasteboard.releaseGlobally() }
+    clipboardEditor.copyFragments(to: pasteboard)
+    clipboardEditor.cursor = 10; clipboardEditor.selectedTrack = copyChild.id
+    clipboardEditor.pasteFragments(from: pasteboard)
+    let pastedIDs = clipboardEditor.selection
+    let pasted = clipboardEditor.project.tracks.flatMap(\.clips).filter { pastedIDs.contains($0.id) }
+    try check(pasted.map(\.start).sorted() == [10, 12, 14] && pasted.allSatisfy { $0.offset == 0.1 && $0.duration == 0.25 }, "Paste anchors the earliest fragment at the cursor and preserves relative time and source bounds")
+    try check(pastedIDs.count == 3 && pastedIDs.isDisjoint(with: [copyA.id, copyB.id, copyC.id]) && clipboardEditor.project.tracks.count == 3, "Paste creates fresh fragment IDs and any missing destination tracks")
+    let copyRows = TrackHierarchy.orderedRows(clipboardEditor.project.tracks).map { $0.0 }
+    try check(copyRows[1].clips.filter { pastedIDs.contains($0.id) }.count == 2 && copyRows[2].clips.first?.start == 12, "Paste preserves relative track rows from the active track")
+    clipboardEditor.undo(); try check(clipboardEditor.project.tracks.count == 2 && clipboardEditor.project.tracks.flatMap(\.clips).count == 3, "One Undo removes the whole pasted group and created tracks")
+    clipboardEditor.redo(); try check(clipboardEditor.project.tracks.flatMap(\.clips).count == 6, "Redo restores the pasted group")
+    clipboardEditor.cursor = 20; clipboardEditor.pasteFragments(from: pasteboard)
+    try check(clipboardEditor.project.tracks.flatMap(\.clips).filter { clipboardEditor.selection.contains($0.id) }.map(\.start).sorted() == [20, 22, 24], "Repeated paste uses the immutable clipboard rather than the previous paste positions")
     var child = Track(name: "Child", parent: track.id); child.clips = [Clip(name: "child", source: old.path, start: 0, duration: 1, order: 4)]
     project.tracks.append(child)
     let nested = try store.render(project); try check(nested[100] == 0.5, "Nested tracks mix with parent")
