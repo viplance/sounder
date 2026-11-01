@@ -40,7 +40,7 @@ final class Editor: NSObject {
         return try encoder.encode(project)
     }
     var isShuttling: Bool { shuttleGesture != nil }
-    private(set) var trackMeters: [UUID: TrackLevelMeter] = [:]
+    private(set) var trackMeters: [UUID: StereoTrackLevelMeter] = [:]
     private let makeRecorder: (URL, ProjectAudioFormat) throws -> LiveRecorder
     private let makePlayback: (StreamingGraph, ProjectAudioFormat, Double) throws -> LivePlayback
     var pluginHosts: [UUID: SNPluginHost] = [:]
@@ -399,16 +399,16 @@ final class Editor: NSObject {
         self.recorder = recorder; startTimer(); update()
     }
     func showsTrackMeter(_ id: UUID) -> Bool { isPlaying || isRecording || (trackMeters[id]?.peak ?? 0) > 0 }
-    private func updateTrackMeters(_ peaks: [UUID: Float], at time: Double = ProcessInfo.processInfo.systemUptime) {
+    private func updateTrackMeters(_ peaks: [UUID: StereoLevels], at time: Double = ProcessInfo.processInfo.systemUptime) {
         let ids = Set(project.tracks.map(\.id))
         trackMeters = trackMeters.filter { ids.contains($0.key) }
         for id in ids {
-            var meter = trackMeters[id] ?? TrackLevelMeter()
-            meter.update(Double(peaks[id] ?? 0), at: time); trackMeters[id] = meter
+            var meter = trackMeters[id] ?? StereoTrackLevelMeter()
+            meter.update(peaks[id] ?? StereoLevels(), at: time); trackMeters[id] = meter
         }
     }
     private func stopTrackMeters() {
-        for id in Array(trackMeters.keys) { trackMeters[id]?.level = 0 }
+        for id in Array(trackMeters.keys) { trackMeters[id]?.clearLevels() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, !self.isPlaying, !self.isRecording else { return }
             self.updateTrackMeters([:]); self.changed?()
@@ -422,8 +422,12 @@ final class Editor: NSObject {
         recordingPartialChannelPeaks = update.partialChannelPeaks
         cursor = recordingStart + Double(update.frames) / recorder.format.sampleRate
         if let recordingTrack {
-            let peak = max(update.peaks.max() ?? 0, update.partialPeak ?? 0)
-            updateTrackMeters([recordingTrack: peak])
+            func channelPeak(_ channel: Int) -> Float {
+                guard !update.channelPeaks.isEmpty else { return 0 }
+                let index = min(channel, update.channelPeaks.count - 1)
+                return max(update.channelPeaks[index].max() ?? 0, update.partialChannelPeaks[index] ?? 0)
+            }
+            updateTrackMeters([recordingTrack: StereoLevels(left: channelPeak(0), right: channelPeak(1))])
         }
         if update.failure != nil { stop() }
     }

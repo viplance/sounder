@@ -643,12 +643,18 @@ func runTrackMeterTests() throws {
     try check(meter.fraction == 1 && TrackLevelMeter.decibels(meter.peak) > 0, "Overload fills the header without hiding positive clipping peaks")
     var mid = TrackLevelMeter(); mid.update(pow(10, -30 / 20), at: 0)
     try check(abs(mid.fraction - 0.5) < 1e-9, "Header meter fills on a -60 to 0 dB scale")
+    var stereo = StereoTrackLevelMeter()
+    stereo.update(StereoLevels(left: 0.9, right: 0.1), at: 0)
+    stereo.update(StereoLevels(left: 0.1, right: 0.6), at: 0.5)
+    try check(abs(stereo.left.peak - 0.9) < 1e-6 && abs(stereo.right.peak - 0.6) < 1e-6 && stereo.left.fraction != stereo.right.fraction, "Stereo levels and held peaks are independent per channel")
+    stereo.update(StereoLevels(left: 0, right: 0.2), at: 1.01)
+    try check(stereo.left.peak == 0 && abs(stereo.right.peak - 0.6) < 1e-6, "Each stereo peak expires relative to its own maximum timestamp")
     let id = UUID(), buffer = PlaybackMeterBuffer()
-    buffer.append(frame: 512, peaks: [id: 0.9]); buffer.append(frame: 1024, peaks: [id: 0.2])
+    buffer.append(frame: 512, peaks: [id: StereoLevels(left: 0.9, right: 0.1)]); buffer.append(frame: 1024, peaks: [id: StereoLevels(left: 0.2, right: 0.7)])
     try check(buffer.consume(through: 0).isEmpty && buffer.consume(through: 511).isEmpty, "Render-ahead meter snapshots are not displayed before their audio plays")
-    try check(buffer.consume(through: 512)[id] == 0.9 && buffer.consume(through: 512).isEmpty && buffer.consume(through: 1024)[id] == 0.2, "Meter publication follows played frames and drains each peak once")
-    buffer.append(frame: 1536, peaks: [id: 0.3]); buffer.append(frame: 2048, peaks: [id: 0.8])
-    try check(buffer.consume(through: 2048)[id] == 0.8, "UI polling preserves brief peaks across all audio blocks since the previous update")
+    try check(buffer.consume(through: 512)[id] == StereoLevels(left: 0.9, right: 0.1) && buffer.consume(through: 512).isEmpty && buffer.consume(through: 1024)[id] == StereoLevels(left: 0.2, right: 0.7), "Meter publication follows played frames and drains each peak once")
+    buffer.append(frame: 1536, peaks: [id: StereoLevels(left: 0.3, right: 0.9)]); buffer.append(frame: 2048, peaks: [id: StereoLevels(left: 0.8, right: 0.2)])
+    try check(buffer.consume(through: 2048)[id] == StereoLevels(left: 0.8, right: 0.9), "UI polling preserves brief peaks across all audio blocks since the previous update")
 }
 
 func runProjectStorageTests() throws {

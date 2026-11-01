@@ -18,23 +18,43 @@ struct TrackLevelMeter {
     }
 }
 
+// Independent output-channel peaks; mono output is shown equally in L/R.
+struct StereoLevels: Equatable {
+    var left: Float = 0
+    var right: Float = 0
+    mutating func merge(_ other: StereoLevels) {
+        left = max(left, other.left); right = max(right, other.right)
+    }
+}
+
+struct StereoTrackLevelMeter {
+    var left = TrackLevelMeter()
+    var right = TrackLevelMeter()
+    var peak: Double { max(left.peak, right.peak) }
+    var level: Double { max(left.level, right.level) }
+    mutating func update(_ levels: StereoLevels, at time: Double) {
+        left.update(Double(levels.left), at: time); right.update(Double(levels.right), at: time)
+    }
+    mutating func clearLevels() { left.level = 0; right.level = 0 }
+}
+
 // Small snapshots follow scheduled audio time, rather than exposing render-ahead
 // peaks early. The UI only takes a short lock, never waits on the audio worker.
 final class PlaybackMeterBuffer {
     private let lock = NSLock()
-    private var pending: [(frame: Int, peaks: [UUID: Float])] = []
-    func append(frame: Int, peaks: [UUID: Float]) {
+    private var pending: [(frame: Int, peaks: [UUID: StereoLevels])] = []
+    func append(frame: Int, peaks: [UUID: StereoLevels]) {
         lock.lock(); defer { lock.unlock() }
         pending.append((frame, peaks))
         if pending.count > 512 { pending.removeFirst(pending.count - 512) }
     }
     func clear() { lock.lock(); pending.removeAll(); lock.unlock() }
-    func consume(through frame: Int) -> [UUID: Float] {
+    func consume(through frame: Int) -> [UUID: StereoLevels] {
         lock.lock(); defer { lock.unlock() }
-        var result: [UUID: Float] = [:], count = 0
+        var result: [UUID: StereoLevels] = [:], count = 0
         for item in pending {
             guard item.frame <= frame else { break }
-            for (id, peak) in item.peaks { result[id] = max(result[id] ?? 0, peak) }
+            for (id, peak) in item.peaks { result[id, default: StereoLevels()].merge(peak) }
             count += 1
         }
         pending.removeFirst(count)
@@ -132,7 +152,7 @@ final class StreamingGraph {
         var muted: Bool
         var soloDry = true
         var soloBus = true
-        var peak: Float = 0
+        var peak = StereoLevels()
         var meterDelay: SampleDelay?
         let dry: [Float]
         let children: [Bus]
@@ -170,14 +190,19 @@ final class StreamingGraph {
             for effect in effects { input = try effect.process(input) }
             let output = muted || !soloBus ? [Float](repeating: 0, count: input.count) : input
             let metered = meterDelay?.apply(output) ?? output
-            peak = metered.reduce(Float(0)) { $1.isFinite ? max($0, abs($1)) : $0 }
+            peak = StereoLevels()
+            for frame in 0..<frames {
+                let l = metered[frame * channels], r = metered[frame * channels + (channels > 1 ? 1 : 0)]
+                if l.isFinite { peak.left = max(peak.left, abs(l)) }
+                if r.isFinite { peak.right = max(peak.right, abs(r)) }
+            }
             return output
         }
     }
     private var buses: [UUID: Bus] = [:]
     private let tracks: [Track]
     private let parents: [UUID: UUID]
-    private(set) var trackPeaks: [UUID: Float] = [:]
+    private(set) var trackPeaks: [UUID: StereoLevels] = [:]
     private let roots: [Bus]
     private let delays: [SampleDelay]
     let channels: Int
@@ -248,7 +273,7 @@ final class StreamingGraph {
                 if let node = buses[current], node.muted || !node.soloBus { audible = false; break }
                 ancestor = parents[current]
             }
-            trackPeaks[id] = audible ? bus.peak : 0
+            trackPeaks[id] = audible ? bus.peak : StereoLevels()
         }
         let first = position
         position += frames
@@ -651,7 +676,7 @@ final class LivePlayback {
             }
         }
     }
-    func consumeTrackPeaks(at time: Double) -> [UUID: Float] {
+    func consumeTrackPeaks(at time: Double) -> [UUID: StereoLevels] {
         meterBuffer.consume(through: Int(time * format.sampleRate))
     }
     func setMetronome(tempo: Double, enabled: Bool) {
@@ -692,13 +717,14 @@ func runStreamingGraphTests() throws {
     }
     let first = try graph.render(frames: 512)
     try check(abs(first[1000] - 0.35) < 0.000001 && abs(first[1001] - 0.175) < 0.000001, "Streaming graph applies child and parent effects once, with independent stereo and sibling tracks")
-    try check(abs((graph.trackPeaks[parent.id] ?? 0) - 0.15) < 1e-6 && abs((graph.trackPeaks[child.id] ?? 0) - 0.1) < 1e-6 && abs((graph.trackPeaks[sibling.id] ?? 0) - 0.2) < 1e-6, "Per-track meters measure post-effect stereo peaks including child-to-parent routing")
+    try check(abs((graph.trackPeaks[parent.id]?.left ?? 0) - 0.15) < 1e-6 && abs((graph.trackPeaks[child.id]?.left ?? 0) - 0.1) < 1e-6 && abs((graph.trackPeaks[sibling.id]?.left ?? 0) - 0.2) < 1e-6, "Per-track meters measure post-effect stereo peaks including child-to-parent routing")
+    try check(abs((graph.trackPeaks[parent.id]?.right ?? 0) - 0.075) < 1e-6 && abs((graph.trackPeaks[child.id]?.right ?? 0) - 0.05) < 1e-6 && abs((graph.trackPeaks[sibling.id]?.right ?? 0) - 0.1) < 1e-6, "Right-channel meters stay independent through child and parent effects")
     gain = 0.25
     let next = try graph.render(frames: 512)
     try check(abs(next[0] - 0.2625) < 0.000001, "Changing a live parameter changes the very next block without rebuilding the mix")
     graph.setMuted(true, trackID: parent.id)
     try check(abs(try graph.render(frames: 128)[0] - 0.2) < 0.000001, "Live parent mute silences its subtree while siblings keep playing")
-    try check(graph.trackPeaks[parent.id] == 0 && graph.trackPeaks[child.id] == 0 && graph.trackPeaks[sibling.id] == 0.2, "Parent mute suppresses both its own and descendant meters while sibling meters remain live")
+    try check(graph.trackPeaks[parent.id] == StereoLevels() && graph.trackPeaks[child.id] == StereoLevels() && graph.trackPeaks[sibling.id] == StereoLevels(left: 0.2, right: 0.1), "Parent mute suppresses both its own and descendant meters while sibling meters remain live")
     graph.setMuted(false, trackID: parent.id); graph.setMuted(true, trackID: child.id)
     try check(abs(try graph.render(frames: 128)[0] - 0.25) < 0.000001, "Live child mute preserves its parent and siblings")
     graph.setMuted(false, trackID: child.id)

@@ -484,6 +484,7 @@ extension AppDelegate {
         editor.seek(to: 0); editor.playPause()
         RunLoop.current.run(until: Date().addingTimeInterval(0.25)); editor.updateTransportPosition()
         try check(editor.isPlaying && zip(tracks, [0.1, 0.6, 0.95]).allSatisfy { abs((editor.trackMeters[$0.0.id]?.peak ?? 0) - $0.1) < 1e-5 }, "Header meters follow actual playback peaks for green, yellow and red levels")
+        try check(zip(tracks, [0.05, 0.3, 0.475]).allSatisfy { abs((editor.trackMeters[$0.0.id]?.right.peak ?? 0) - $0.1) < 1e-5 }, "Header meters preserve separate right-channel levels")
         for row in tracks.indices {
             try check(timeline.trackNameRect(row: row, depth: 0).maxX < timeline.fragmentLeft - 74, "Track name leaves room for its peak readout")
         }
@@ -501,7 +502,7 @@ extension AppDelegate {
         RunLoop.current.run(until: Date().addingTimeInterval(0.15))
         guard let playback = editor.player else { throw SounderError.message("Meter UI playback stopped unexpectedly") }
         let mutedPeak = playback.queue.sync { playback.graph.trackPeaks[tracks[1].id] }
-        try check(mutedPeak == 0, "Muted tracks report zero signal without restarting playback")
+        try check(mutedPeak == StereoLevels(), "Muted tracks report zero signal without restarting playback")
         editor.stop(); refresh()
         try check(editor.trackMeters.values.allSatisfy { $0.level == 0 }, "Stopping clears every header fill immediately")
         RunLoop.current.run(until: Date().addingTimeInterval(1.05))
@@ -513,6 +514,8 @@ extension AppDelegate {
         recorder.writer.append(captureTestBuffer(format: input, start: 0, frames: 12_000)); recorder.writer.waitForPendingWrites()
         editor.updateTransportPosition()
         try check(editor.isRecording && (editor.trackMeters[tracks[0].id]?.peak ?? 0) > 0.4, "Recording peak readout measures actual captured microphone-format PCM")
+        guard let recordingMeter = editor.trackMeters[tracks[0].id] else { throw SounderError.message("Missing stereo recording meter") }
+        try check(abs(recordingMeter.right.peak - recordingMeter.left.peak * 0.25) < 1e-5, "Recording meters preserve independent captured left and right peaks")
         snapshot("recording")
     }
 }

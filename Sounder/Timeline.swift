@@ -751,14 +751,20 @@ final class Timeline: NSView {
             let selected = editor.selectedTrack == track.id
             let trackDimmed = dimmed.contains(track.id)
             fill(NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight), selected ? NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.19, alpha: 1) : panelColor)
-            let meter = editor.trackMeters[track.id] ?? TrackLevelMeter()
+            let meter = editor.trackMeters[track.id] ?? StereoTrackLevelMeter()
             let recording = editor.isRecording && editor.recordingTrack == track.id
             let headerRect = NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight)
-            if (recording || editor.isPlaying) && meter.fraction > 0 {
-                fill(NSRect(x: headerRect.minX, y: y, width: header * meter.fraction, height: rowHeight), accent.withAlphaComponent(0.25))
+            if recording || editor.isPlaying {
+                let half = rowHeight / 2
+                for (channel, value) in [meter.left, meter.right].enumerated() where value.fraction > 0 {
+                    fill(NSRect(x: headerRect.minX, y: y + CGFloat(channel) * half, width: header * value.fraction, height: half - 0.5), accent.withAlphaComponent(0.25))
+                }
             }
             if editor.showsTrackMeter(track.id) {
-                label(meter.peakText, NSRect(x: fragmentLeft - 74, y: y + 12, width: 62, height: 16), size: 9, color: recording ? .systemRed : meterColor(meter.peak), weight: .medium, alignment: .right)
+                for (channel, value) in [meter.left, meter.right].enumerated() {
+                    let text = (channel == 0 ? "L " : "R ") + value.peakText
+                    label(text, NSRect(x: fragmentLeft - 78, y: y + 5 + CGFloat(channel) * 14, width: 66, height: 14), size: 9, color: recording ? .systemRed : meterColor(value.peak), weight: .medium, alignment: .right)
+                }
             }
             let color = trackColors[index % trackColors.count]
             fill(NSRect(x: pinnedHeaderX, y: y + 1, width: 3, height: rowHeight - 2), selected ? color.withAlphaComponent(trackDimmed ? 0.3 : 1) : .clear)
