@@ -430,7 +430,7 @@ final class Editor: NSObject {
         return meter
     }
     private func updateTrackMeters(_ peaks: [UUID: StereoLevels], at time: Double = ProcessInfo.processInfo.systemUptime) {
-        let ids = Set(project.tracks.map(\.id))
+        let ids = Set(project.tracks.map(\.id)).union([Project.masterID])
         trackMeters = trackMeters.filter { ids.contains($0.key) }
         for id in ids {
             var meter = trackMeters[id] ?? StereoTrackLevelMeter()
@@ -514,6 +514,24 @@ final class Editor: NSObject {
         pluginHosts[effect.id] = host
         return host
     }
+    func effectChain(for trackID: UUID) -> [PluginEffect]? {
+        trackID == Project.masterID ? project.masterEffects : project.tracks.first(where: { $0.id == trackID })?.effects
+    }
+    var canEditEffects: Bool { !isRecording && !isShuttling && !requestingMic && !isImporting && !isNormalizing }
+    func showEffects(for trackID: UUID) {
+        guard canEditEffects, effectChain(for: trackID) != nil else { return }
+        if trackID != Project.masterID { selectedTrack = trackID; update() }
+        EffectsWindow(editor: self, trackID: trackID).run()
+    }
+    func setEffectChain(_ effects: [PluginEffect], for trackID: UUID) {
+        if trackID == Project.masterID { project.masterEffects = effects }
+        else if let index = project.tracks.firstIndex(where: { $0.id == trackID }) { project.tracks[index].effects = effects }
+    }
+    func setEffectState(_ state: Data, effectID: UUID) {
+        if let index = project.masterEffects.firstIndex(where: { $0.id == effectID }) { project.masterEffects[index].state = state }
+        else if let track = project.tracks.firstIndex(where: { $0.effects.contains(where: { $0.id == effectID }) }),
+                let effect = project.tracks[track].effects.firstIndex(where: { $0.id == effectID }) { project.tracks[track].effects[effect].state = state }
+    }
     func flushPluginEdits() { for window in Array(pluginWindows.values) { window.captureChanges() } }
     func closePluginWindows(capture: Bool = true) { for window in Array(pluginWindows.values) { window.close(capture: capture) } }
     func toggleTempoMode() { checkpoint(); project.tempoMode.toggle(); update() }
@@ -544,6 +562,14 @@ final class Editor: NSObject {
     }
     var canAdjustTrackMix: Bool { !isShuttling && !requestingMic && !isImporting && !isNormalizing }
     @discardableResult func setTrackMix(_ id: UUID, volumeDB: Double? = nil, pan: Double? = nil, checkpoint shouldCheckpoint: Bool = true) -> Bool {
+        if id == Project.masterID {
+            guard canAdjustTrackMix, let volumeDB, volumeDB.isFinite else { return false }
+            let volume = max(-60, min(12, volumeDB))
+            guard volume != project.masterVolumeDB else { return false }
+            if shouldCheckpoint { checkpoint() } else { invalidateMixCache(); dirty = true }
+            project.masterVolumeDB = volume; player?.setTrackMix(project.masterTrack)
+            update(); return true
+        }
         guard canAdjustTrackMix, let i = project.tracks.firstIndex(where: { $0.id == id }) else { return false }
         var track = project.tracks[i]
         if let volumeDB, volumeDB.isFinite { track.volumeDB = max(-60, min(12, volumeDB)) }
@@ -574,7 +600,7 @@ final class Editor: NSObject {
         invalidateMixCache()
         let playing = isPlaying
         if player != nil || pausedPlayer != nil { stop() }
-        let ids = Set(project.tracks.flatMap(\.effects).map(\.id))
+        let ids = Set(project.allEffects.map(\.id))
         pluginHosts = pluginHosts.filter { ids.contains($0.key) }
         if playing { startPlayback(rememberStart: false) }
     }
@@ -645,7 +671,7 @@ final class Editor: NSObject {
     }
     private func playbackHosts() throws -> [UUID: SNPluginHost] {
         var hosts: [UUID: SNPluginHost] = [:]
-        for effect in project.tracks.flatMap(\.effects) where !effect.bypassed { hosts[effect.id] = try pluginHost(effect) }
+        for effect in project.allEffects where !effect.bypassed { hosts[effect.id] = try pluginHost(effect) }
         return hosts
     }
     private static func makeGraph(project: Project, store: AudioStore, hosts: [UUID: SNPluginHost], dryGraph: StreamingGraph? = nil, cancelled: () -> Bool = { false }) throws -> StreamingGraph {

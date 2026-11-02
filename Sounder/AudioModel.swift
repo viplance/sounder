@@ -286,7 +286,19 @@ extension ProjectAudioFormat {
     }
 }
 struct Project: Codable {
+    static let masterID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     var tracks: [Track] = [Track(name: "Audio 01")]
+    var masterVolumeDB = 0.0
+    var masterEffects: [PluginEffect] = []
+    var masterTrack: Track { Track(id: Self.masterID, name: "Master", effects: masterEffects, volumeDB: masterVolumeDB) }
+    var processingTracks: [Track] {
+        tracks.map { track in
+            var routed = track
+            if routed.parent == nil { routed.parent = Self.masterID }
+            return routed
+        } + [masterTrack]
+    }
+    var allEffects: [PluginEffect] { tracks.flatMap(\.effects) + masterEffects }
     var nextOrder = 1
     var name: String? = nil
     var audioFormat = ProjectAudioFormat()
@@ -304,10 +316,13 @@ struct Project: Codable {
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel }
+    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
+        masterVolumeDB = try values.decodeIfPresent(Double.self, forKey: .masterVolumeDB) ?? 0
+        masterEffects = try values.decodeIfPresent([PluginEffect].self, forKey: .masterEffects) ?? []
+        guard masterVolumeDB.isFinite, (-60...12).contains(masterVolumeDB) else { throw SounderError.message("Invalid master volume") }
         nextOrder = try values.decodeIfPresent(Int.self, forKey: .nextOrder) ?? 1
         name = try values.decodeIfPresent(String.self, forKey: .name)
         audioFormat = try values.decodeIfPresent(ProjectAudioFormat.self, forKey: .audioFormat) ?? ProjectAudioFormat(channels: 1, bitDepth: 32)
@@ -540,19 +555,22 @@ final class AudioStore {
                 for i in 0..<source.frameCount { destination.channels[channel][i] += source.channels[channel][i] }
             }
         }
-        let solo = TrackSoloRouting(tracks: project.tracks)
+        let processingTracks = project.processingTracks
+        let solo = TrackSoloRouting(tracks: processingTracks)
         var visited = Set<UUID>()
         func bus(_ track: Track) throws -> AudioSignal {
             guard visited.insert(track.id).inserted else { throw SounderError.message("Invalid track hierarchy") }
             guard !track.muted, solo.buses.contains(track.id) else { return silence(length) }
             var signal = solo.dry.contains(track.id) ? try raw(track) : silence(length)
-            for child in project.tracks where child.parent == track.id { sum(try bus(child), into: &signal) }
-            if let processEffects { signal = AudioSignal(channels: try signal.channels.map { try processEffects($0, track.effects) }) }
-            else { signal = try PluginProcessing.apply(signal, effects: track.effects, format: project.audioFormat) }
+            for child in processingTracks where child.parent == track.id { sum(try bus(child), into: &signal) }
+            if track.id != Project.masterID || !track.effects.isEmpty {
+                if let processEffects { signal = AudioSignal(channels: try signal.channels.map { try processEffects($0, track.effects) }) }
+                else { signal = try PluginProcessing.apply(signal, effects: track.effects, format: project.audioFormat) }
+            }
             return track.applyMix(to: signal)
         }
         var mix = silence(length)
-        for track in project.tracks where track.parent == nil { sum(try bus(track), into: &mix) }
+        for track in processingTracks where track.parent == nil { sum(try bus(track), into: &mix) }
         mix.channels = mix.channels.map { $0.map { $0.isFinite ? min(1, max(-1, $0)) : 0 } }
         if let range {
             let first = min(mix.frameCount, max(0, Int(range.lowerBound * sampleRate)))

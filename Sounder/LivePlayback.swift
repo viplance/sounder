@@ -229,8 +229,9 @@ final class StreamingGraph {
     let outputCache: ProcessedMixCache
     private(set) var position = 0
     init(project: Project, store: AudioStore, dryGraph: StreamingGraph? = nil, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
-        tracks = project.tracks
-        parents = Dictionary(uniqueKeysWithValues: project.tracks.compactMap { track in track.parent.map { (track.id, $0) } })
+        let processingTracks = project.processingTracks
+        tracks = processingTracks
+        parents = Dictionary(uniqueKeysWithValues: processingTracks.compactMap { track in track.parent.map { (track.id, $0) } })
         channels = project.audioFormat.channels
         outputCache = try ProcessedMixCache(channels: channels)
         let channelCount = channels
@@ -239,7 +240,8 @@ final class StreamingGraph {
         func bus(_ track: Track) throws -> Bus {
             guard visited.insert(track.id).inserted else { throw SounderError.message("Invalid track hierarchy") }
             let dry: [Float]
-            if let previous = dryGraph?.buses[track.id], previous.channels == channelCount {
+            if track.id == Project.masterID { dry = [] }
+            else if let previous = dryGraph?.buses[track.id], previous.channels == channelCount {
                 dry = previous.dry // Immutable PCM is shared; no full-project remix on release.
             } else {
                 let raw = try store.renderAudio(project, onlyTrack: track.id)
@@ -247,13 +249,13 @@ final class StreamingGraph {
                 for frame in 0..<raw.frameCount { for ch in 0..<channelCount { samples[frame * channelCount + ch] = raw.channels[ch][frame] } }
                 dry = samples
             }
-            let children = try project.tracks.filter { $0.parent == track.id }.map { try bus($0) }
+            let children = try processingTracks.filter { $0.parent == track.id }.map { try bus($0) }
             let effects = try track.effects.filter { !$0.bypassed }.map(makeEffect)
             let result = Bus(dry: dry, children: children, effects: effects, channels: channelCount, track: track, sampleRate: project.audioFormat.sampleRate)
             trackBuses[track.id] = result
             return result
         }
-        roots = try project.tracks.filter { $0.parent == nil }.map { try bus($0) }
+        roots = try processingTracks.filter { $0.parent == nil }.map { try bus($0) }
         buses = trackBuses
         latency = roots.map(\.latency).max() ?? 0
         for bus in buses.values { bus.meterDelay = SampleDelay(frames: max(0, latency - bus.latency), channels: channelCount) }
@@ -980,7 +982,8 @@ final class DryShuttleSource {
         var output = [Float](repeating: 0, count: range.count * channels)
         let ancestors = Dictionary(uniqueKeysWithValues: project.tracks.map { ($0.id, $0) })
         for track in tracks {
-            var gains = [Double](repeating: 1, count: channels), current: Track? = track
+            var gains = [Double](repeating: pow(10, project.masterVolumeDB / 20), count: channels), current: Track? = track
+            if project.masterVolumeDB <= -60 { gains = Array(repeating: 0, count: channels) }
             while let node = current {
                 for channel in 0..<channels { gains[channel] *= node.outputGain(channel: channel, channels: channels) }
                 current = node.parent.flatMap { ancestors[$0] }

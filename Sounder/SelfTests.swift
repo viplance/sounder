@@ -216,6 +216,7 @@ func runAudioTests() throws {
     try runTrackSoloTests()
     try runFragmentSettingsTests()
     try runTrackMixTests()
+    try runMasterMixTests()
     try runLoopPlaybackTests()
     try runLoopRecordingTests()
     try runFragmentFadeTests()
@@ -841,4 +842,72 @@ func runTrackMixTests() throws {
     let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!))
     try check(saved.tracks[1].volumeDB == -12 && saved.tracks[1].pan == 75, "Saving and reopening preserves track volume and Pan")
     _ = graph // Also exercise default graph construction without effects.
+}
+
+func runMasterMixTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderMaster-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory), source = store.freshURL()
+    let format = ProjectAudioFormat(bitDepth: 32)
+    store.configure(format)
+    try store.write(AudioSignal(channels: [Array(repeating: 0.2, count: 48_000), Array(repeating: 0.1, count: 48_000)]), to: source, bitDepth: 32)
+    let clip = Clip(name: "Source", source: source.path, start: 0, duration: 1, order: 1)
+    let a = Track(name: "A", clips: [clip]), b = Track(name: "B", clips: [clip])
+    let square = PluginEffect(name: "Square", path: "test", classID: "square")
+    let offset = PluginEffect(name: "Offset", path: "test", classID: "offset")
+    var project = Project(tracks: [a, b], masterVolumeDB: 20 * log10(0.5), masterEffects: [square, offset], audioFormat: format)
+    func process(_ samples: [Float], _ id: String) -> [Float] { samples.map { id == "square" ? $0 * $0 : $0 + 0.01 } }
+    store.processEffects = { samples, effects in effects.filter { !$0.bypassed }.reduce(samples) { process($0, $1.classID) } }
+    var creations = 0
+    let graph = try StreamingGraph(project: project, store: store) { effect in
+        creations += 1
+        return StreamingEffect(latency: 0, tail: 0) { process($0, effect.classID) }
+    }
+    let offline = try store.renderAudio(project)
+    try graph.seek(to: 2000); let live = try graph.render(frames: 512)
+    try check(abs(live[0] - 0.085) < 1e-6 && abs(live[1] - 0.025) < 1e-6,
+              "Master effects process the summed stereo mix in order, before master volume")
+    try check((0..<512).allSatisfy { frame in (0..<2).allSatisfy { abs(live[frame * 2 + $0] - offline.channels[$0][2000 + frame]) < 1e-7 } },
+              "Live and offline master processing match sample for sample")
+    try check(abs((graph.trackPeaks[Project.masterID]?.left ?? 0) - 0.085) < 1e-6 && abs((graph.trackPeaks[Project.masterID]?.right ?? 0) - 0.025) < 1e-6,
+              "Master stereo peaks measure after effects and volume without changing per-track meters")
+    let output = directory.appendingPathComponent("master.wav")
+    var settings = ExportSettings(projectFormat: format); settings.format = .wav
+    try AudioExporter.write(project: project, store: store, settings: settings, to: output)
+    let exported = try AudioStore.decode(output, sampleRate: 48_000)
+    try check(abs(exported.channels[0][2000] - live[0]) < 1e-6 && abs(exported.channels[1][2000] - live[1]) < 1e-6, "WAV export includes master effects and gain exactly once")
+    graph.setSolo([a.id]); let solo = try graph.render(frames: 512)
+    try check(abs(solo[0] - 0.025) < 1e-6, "Solo routing remains active through the master effects bus")
+    let count = creations
+    project.masterVolumeDB = -60; graph.setTrackMix(project.masterTrack)
+    let fade = try graph.render(frames: 512)
+    try check(fade[0] > 0 && fade.suffix(64).allSatisfy { $0 == 0 } && creations == count, "Master volume reaches silence with a 10 ms ramp without rebuilding effects")
+    var delayedProject = project
+    delayedProject.masterVolumeDB = 0; delayedProject.masterEffects = [PluginEffect(name: "Delay", path: "test", classID: "delay")]
+    let delayed = try StreamingGraph(project: delayedProject, store: store) { _ in
+        var pending = [Float](repeating: 0, count: 74)
+        return StreamingEffect(latency: 37, tail: 91) { samples in
+            let combined = pending + samples
+            pending = Array(combined.suffix(74))
+            return Array(combined.prefix(samples.count))
+        }
+    }
+    try delayed.seek(to: 2000); let compensated = try delayed.render(frames: 512)
+    try check(delayed.latency == 37 && delayed.totalFrames == 48_091 && abs(compensated[0] - 0.4) < 1e-7 && abs((delayed.trackPeaks[Project.masterID]?.left ?? 0) - 0.4) < 1e-7,
+              "Master plug-in latency, tail duration and compensated stereo meters remain aligned")
+    project.masterVolumeDB = -12; project.masterEffects[0].bypassed = true
+    let restored = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(project))
+    try check(restored.masterVolumeDB == -12 && restored.masterEffects.map(\.classID) == ["square", "offset"] && restored.masterEffects[0].bypassed, "Master gain, effect order and bypass survive project serialization")
+    let editor = Editor(store: store); editor.project = project
+    editor.setTrackMix(Project.masterID, volumeDB: -18); editor.undo()
+    try check(editor.project.masterVolumeDB == -12, "Master volume supports Undo")
+    editor.redo(); try check(editor.project.masterVolumeDB == -18, "Master volume supports Redo")
+    store.processEffects = nil; project.masterEffects = []
+    let dry = try DryShuttleSource(project: project, store: store).read(2000..<2010)
+    try check(abs(dry[0] - Float(0.4 * pow(10, -12.0 / 20))) < 1e-7, "Uncached dry shuttle honors master volume")
+    let raw = try store.renderAudio(project, onlyTrack: a.id)
+    try check(abs(raw.channels[0][2000] - 0.2) < 1e-7, "Fragment source rendering remains independent of master processing")
 }

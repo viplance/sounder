@@ -93,13 +93,12 @@ final class PluginEditorWindow: NSObject, NSWindowDelegate {
         if host.latency != lastLatency { lastLatency = host.latency; editor.effectsChanged() }
         guard parameters != lastParameters || revision != lastRevision else { return }
         editor.invalidateMixCache()
-        guard let track = editor.project.tracks.firstIndex(where: { $0.effects.contains(where: { $0.id == effectID }) }),
-              let effect = editor.project.tracks[track].effects.firstIndex(where: { $0.id == effectID }) else { return }
+        guard let effect = editor.project.allEffects.first(where: { $0.id == effectID }) else { return }
         do {
             let state = try host.saveState()
-            if state != editor.project.tracks[track].effects[effect].state {
+            if state != effect.state {
                 if !editor.dirty || Date().timeIntervalSince(lastChange) > 0.5 { editor.checkpoint() }
-                editor.project.tracks[track].effects[effect].state = state
+                editor.setEffectState(state, effectID: effectID)
                 lastChange = Date(); editor.update()
             }
             lastParameters = parameters; lastRevision = revision
@@ -123,17 +122,21 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     var installed: [URL] = []
     var snapshotMode = false
     var index: Int? { editor.project.tracks.firstIndex { $0.id == trackID } }
-    var effects: [PluginEffect] { index.map { editor.project.tracks[$0].effects } ?? [] }
+    var effects: [PluginEffect] {
+        get { editor.effectChain(for: trackID) ?? [] }
+        set { editor.setEffectChain(newValue, for: trackID) }
+    }
+    var exists: Bool { editor.effectChain(for: trackID) != nil }
     init(editor: Editor, trackID: UUID) { self.editor = editor; self.trackID = trackID }
     func run(snapshot: URL? = nil) {
-        guard let index else { return }
+        guard exists else { return }
         if let existing = editor.effectsWindows[trackID] { existing.window.makeKeyAndOrderFront(nil); return }
         snapshotMode = snapshot != nil
         editor.effectsWindows[trackID] = self
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 399), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "FX · " + editor.project.tracks[index].name; window.delegate = self; window.isReleasedWhenClosed = false
+        window.title = "FX · " + (trackID == Project.masterID ? "Master" : editor.project.tracks[index!].name); window.delegate = self; window.isReleasedWhenClosed = false
         let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
-        let heading = NSTextField(labelWithString: "Track effects"); heading.font = .systemFont(ofSize: 23, weight: .semibold); heading.frame = NSRect(x: 22, y: 354, width: 350, height: 35); root.addSubview(heading)
+        let heading = NSTextField(labelWithString: trackID == Project.masterID ? "Master effects" : "Track effects"); heading.font = .systemFont(ofSize: 23, weight: .semibold); heading.frame = NSRect(x: 22, y: 354, width: 350, height: 35); root.addSubview(heading)
         let scroll = NSScrollView(frame: NSRect(x: 22, y: 142, width: 716, height: 204)); scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("effect")); column.title = "Processing order · top to bottom"; column.width = 690; table.addTableColumn(column); table.rowHeight = 34; table.dataSource = self; table.delegate = self; table.target = self; table.doubleAction = #selector(configure); scroll.documentView = table; root.addSubview(scroll)
         let actions: [(String, Selector)] = [("Open editor…", #selector(configure)), ("Parameters…", #selector(parameters)), ("Bypass", #selector(bypass)), ("↑", #selector(up)), ("↓", #selector(down)), ("Remove", #selector(remove))]
@@ -169,11 +172,11 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     }
     @objc func scan() { installed = PluginProcessing.installed(); plugins.removeAllItems(); plugins.addItems(withTitles: installed.map { $0.deletingPathExtension().lastPathComponent + "  [" + $0.pathExtension.uppercased() + "]" }); if installed.isEmpty { plugins.addItem(withTitle: "No installed VST / VST3 effects found") } }
     func add(_ url: URL) {
-        guard let index else { return }
+        guard exists else { return }
         do {
             let host = try SNPluginHost(path: url.path, classID: "", state: nil, sampleRate: editor.project.audioFormat.sampleRate)
             let effect = PluginEffect(name: host.pluginName, path: url.path, classID: host.classID, state: try host.saveState())
-            editor.checkpoint(); editor.project.tracks[index].effects.append(effect); editor.effectsChanged(); reload(); editor.notifications.show("Effect added", style: .success); table.selectRowIndexes(IndexSet(integer: effects.count - 1), byExtendingSelection: false)
+            editor.checkpoint(); effects.append(effect); editor.effectsChanged(); reload(); editor.notifications.show("Effect added", style: .success); table.selectRowIndexes(IndexSet(integer: effects.count - 1), byExtendingSelection: false)
         } catch { editor.error(error); return }
         configure()
     }
@@ -184,7 +187,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         guard ["vst", "vst3"].contains(url.pathExtension.lowercased()) else { editor.error(SounderError.message("Choose a .vst or .vst3 plug-in bundle.")); return }; add(url)
     }
     func editPlugin(native: Bool) {
-        let row = table.selectedRow; guard effects.indices.contains(row), index != nil else { return }
+        let row = table.selectedRow; guard effects.indices.contains(row), exists else { return }
         let effect = effects[row]
         do {
             if let existing = editor.pluginWindows[effect.id] { existing.window.makeKeyAndOrderFront(nil); return }
@@ -194,9 +197,9 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     }
     @objc func configure() { editPlugin(native: true) }
     @objc func parameters() { editPlugin(native: false) }
-    @objc func bypass() { let row = table.selectedRow; guard effects.indices.contains(row), let index else { return }; editor.checkpoint(); editor.project.tracks[index].effects[row].bypassed.toggle(); editor.effectsChanged(); reload(); editor.notifications.show("Effect bypass updated", style: .success); table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
-    @objc func remove() { let row = table.selectedRow; guard effects.indices.contains(row), let index else { return }; editor.checkpoint(); let effectID = effects[row].id; editor.pluginWindows[effectID]?.close(); editor.project.tracks[index].effects.remove(at: row); editor.effectsChanged(); reload(); editor.notifications.show("Effect removed", style: .success) }
-    func move(_ delta: Int) { let row = table.selectedRow; guard effects.indices.contains(row), effects.indices.contains(row + delta), let index else { return }; editor.checkpoint(); editor.project.tracks[index].effects.swapAt(row, row + delta); editor.effectsChanged(); reload(); editor.notifications.show("Effect order updated", style: .success); table.selectRowIndexes(IndexSet(integer: row + delta), byExtendingSelection: false) }
+    @objc func bypass() { let row = table.selectedRow; guard effects.indices.contains(row), exists else { return }; editor.checkpoint(); effects[row].bypassed.toggle(); editor.effectsChanged(); reload(); editor.notifications.show("Effect bypass updated", style: .success); table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
+    @objc func remove() { let row = table.selectedRow; guard effects.indices.contains(row), exists else { return }; editor.checkpoint(); let effectID = effects[row].id; editor.pluginWindows[effectID]?.close(); effects.remove(at: row); editor.effectsChanged(); reload(); editor.notifications.show("Effect removed", style: .success) }
+    func move(_ delta: Int) { let row = table.selectedRow; guard effects.indices.contains(row), effects.indices.contains(row + delta), exists else { return }; editor.checkpoint(); effects.swapAt(row, row + delta); editor.effectsChanged(); reload(); editor.notifications.show("Effect order updated", style: .success); table.selectRowIndexes(IndexSet(integer: row + delta), byExtendingSelection: false) }
     @objc func up() { move(-1) }
     @objc func down() { move(1) }
     @objc func done() { window.orderOut(nil); editor.effectsWindows.removeValue(forKey: trackID); if snapshotMode { NSApp.stopModal() } }

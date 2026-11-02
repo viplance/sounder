@@ -1,5 +1,42 @@
 import AppKit
 
+final class MixerFXButton: PointerButton {
+    private weak var editor: Editor?
+    private var trackID: UUID?
+    private var hasEffects = false { didSet { if oldValue != hasEffects { needsDisplay = true } } }
+    private var effectColor = accent { didSet { if oldValue != effectColor { needsDisplay = true } } }
+    func configure(editor: Editor, track: Track, color: NSColor) {
+        if self.editor !== editor || trackID != track.id {
+            self.editor = editor; trackID = track.id
+            title = "FX"; font = .systemFont(ofSize: 10, weight: .semibold); isBordered = false
+            target = self; action = #selector(openEffects)
+        }
+        setAccessibilityLabel("\(track.name) effects")
+        if isEnabled != editor.canEditEffects { isEnabled = editor.canEditEffects }
+        hasEffects = !track.effects.isEmpty; effectColor = color
+    }
+    @objc private func openEffects() {
+        guard let editor, let trackID else { return }
+        editor.showEffects(for: trackID)
+    }
+    override var intrinsicContentSize: NSSize { NSSize(width: 46, height: 20) }
+    private static func drawFace(in rect: NSRect, hasEffects: Bool, color: NSColor, hovered: Bool) {
+        fill(rect, hasEffects ? color.withAlphaComponent(0.18) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+        if hovered {
+            fill(rect, NSColor.white.withAlphaComponent(0.10), radius: 5)
+            NSColor.white.withAlphaComponent(0.16).setStroke()
+            let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.4, dy: 0.4), xRadius: 5, yRadius: 5)
+            path.lineWidth = 0.7; path.stroke()
+        }
+        label("FX", NSRect(x: rect.minX, y: rect.minY + 3, width: rect.width, height: 15), size: 10,
+              color: hasEffects ? color : .secondaryLabelColor, weight: .semibold, alignment: .center)
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        Self.drawFace(in: bounds, hasEffects: hasEffects, color: effectColor,
+                      hovered: isEnabled && window?.isKeyWindow == true && isHovering)
+    }
+}
+
 final class TrackVolumeMeterCell: NSSliderCell {
     var levels = [0.0, 0.0]
     var recording = false
@@ -71,7 +108,6 @@ final class TrackMixerSlider: NSSlider {
     private var valuePanel: NSPanel?
     private let valueLabel = NSTextField(labelWithString: "")
     private var valueTrackingArea: NSTrackingArea?
-    private var hovering = false
     private var resignKeyObserver: NSObjectProtocol?
     var visibleValueText: String? { valuePanel?.isVisible == true ? valueLabel.stringValue : nil }
     var visibleValueFrame: NSRect? { valuePanel?.isVisible == true ? valuePanel?.frame : nil }
@@ -118,32 +154,35 @@ final class TrackMixerSlider: NSSlider {
         if let panel = valuePanel { panel.parent?.removeChildWindow(panel) }
     }
     func refreshValuePresentation() {
-        if isEnabled, !isHiddenOrHasHiddenAncestor, window?.isKeyWindow == true, hovering || trackingGesture { showValue() }
+        // Layout/tracking-area updates can deliver stale enter events without
+        // a matching exit. Always check this slider's actual current hit area.
+        if isEnabled, !isHiddenOrHasHiddenAncestor, window?.isKeyWindow == true, pointerIsInside || trackingGesture { showValue() }
         else { hideValue() }
     }
     private var pointerIsInside: Bool {
         guard let window, window.isKeyWindow, !isHiddenOrHasHiddenAncestor else { return false }
-        return visibleRect.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return bounds.contains(point) && visibleRect.contains(point)
     }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let valueTrackingArea { removeTrackingArea(valueTrackingArea) }
         let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect, .enabledDuringMouseDrag], owner: self)
         addTrackingArea(area); valueTrackingArea = area
-        hovering = pointerIsInside; refreshValuePresentation()
+        refreshValuePresentation()
     }
     override func mouseEntered(with event: NSEvent) {
-        hovering = true; refreshValuePresentation()
+        refreshValuePresentation()
     }
     override func mouseExited(with event: NSEvent) {
-        hovering = false; refreshValuePresentation()
+        refreshValuePresentation()
     }
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
         resignKeyObserver = window.map { window in
             NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
-                self?.hovering = false; self?.hideValue()
+                self?.hideValue()
             }
         }
     }
@@ -175,7 +214,46 @@ final class TrackMixerSlider: NSSlider {
                 doubleValue = 0
                 _ = sendAction(action, to: target)
             } else { super.mouseDown(with: event) }
-            hovering = pointerIsInside
+        }
+    }
+}
+
+/// Shared post-fader stereo meter, native volume control and peak readouts.
+final class MixerVolumeControl: NSView {
+    let slider = TrackMixerSlider(value: 0, minValue: -60, maxValue: 12, target: nil, action: nil)
+    private var meter = StereoTrackLevelMeter()
+    private var showsPeaks = false
+    override var isFlipped: Bool { true }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        let cell = TrackVolumeMeterCell(); cell.minValue = -60; cell.maxValue = 12; cell.doubleValue = 0
+        slider.cell = cell; slider.controlSize = .mini; slider.isContinuous = true
+        slider.valueText = { $0 <= -60 ? "−∞ dB" : String(format: "%+.1f dB", $0) }
+        addSubview(slider)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() {
+        super.layout()
+        slider.frame = NSRect(x: 0, y: bounds.midY - 9, width: max(24, bounds.width - 62), height: 18)
+    }
+    func configure(track: Track, meter: StereoTrackLevelMeter, active: Bool, recording: Bool, enabled: Bool, showsPeaks: Bool) {
+        self.meter = meter; self.showsPeaks = showsPeaks
+        if !slider.trackingGesture && slider.doubleValue != track.volumeDB { slider.doubleValue = track.volumeDB }
+        if slider.isEnabled != enabled { slider.isEnabled = enabled }
+        slider.setAccessibilityLabel("\(track.name) volume")
+        if let cell = slider.cell as? TrackVolumeMeterCell {
+            cell.recording = recording; cell.levels = active ? [meter.left.level, meter.right.level] : [0, 0]
+        }
+        slider.refreshValuePresentation(); slider.needsDisplay = true; needsDisplay = true
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        guard showsPeaks else { return }
+        for (channel, value) in [meter.left, meter.right].enumerated() {
+            let db = TrackLevelMeter.decibels(value.peak)
+            let color: NSColor = db >= -1 ? .systemRed : db >= -6 ? .systemYellow : accent
+            label((channel == 0 ? "L " : "R ") + value.peakText,
+                  NSRect(x: bounds.maxX - 56, y: bounds.midY - 11 + CGFloat(channel) * 11, width: 56, height: 11),
+                  size: 8, color: color, weight: .medium, alignment: .right)
         }
     }
 }
@@ -183,8 +261,10 @@ final class TrackMixerSlider: NSSlider {
 /// Native sliders keep keyboard and accessibility support. The clipped holder
 /// follows the pinned sidebar while the document scrolls underneath it.
 final class TrackMixerControls: NSView {
-    let volume = TrackMixerSlider(value: 0, minValue: -60, maxValue: 12, target: nil, action: nil)
+    let volumeControl = MixerVolumeControl(frame: .zero)
+    var volume: TrackMixerSlider { volumeControl.slider }
     let pan = TrackMixerSlider(value: 0, minValue: -90, maxValue: 90, target: nil, action: nil)
+    let fx = MixerFXButton(title: "FX", target: nil, action: nil)
     let trackID: UUID
     private weak var editor: Editor?
     override var isFlipped: Bool { true }
@@ -192,16 +272,10 @@ final class TrackMixerControls: NSView {
         trackID = track.id; self.editor = editor
         super.init(frame: .zero)
         wantsLayer = true; layer?.masksToBounds = true
-        let meterCell = TrackVolumeMeterCell()
-        meterCell.minValue = -60; meterCell.maxValue = 12; meterCell.doubleValue = track.volumeDB
-        volume.cell = meterCell
-        for slider in [volume, pan] {
-            slider.controlSize = .mini; slider.isContinuous = true; slider.target = self
-            slider.trackFillColor = accent
-            addSubview(slider)
-        }
+        addSubview(volumeControl); addSubview(pan); addSubview(fx)
+        pan.controlSize = .mini; pan.isContinuous = true; pan.target = self; pan.trackFillColor = accent
+        volume.target = self
         volume.action = #selector(changeVolume); pan.action = #selector(changePan)
-        volume.valueText = { $0 <= -60 ? "−∞ dB" : String(format: "%+.1f dB", $0) }
         pan.valueText = { $0 == 0 ? "Center" : String(format: "%@ %.0f°", $0 > 0 ? "Left" : "Right", abs($0)) }
         pan.isVertical = true
         if #available(macOS 26.0, *) { pan.neutralValue = 0 }
@@ -213,20 +287,18 @@ final class TrackMixerControls: NSView {
         let result = super.hitTest(point)
         return result === self ? nil : result
     }
-    func configure(_ track: Track) {
-        if !volume.trackingGesture { volume.doubleValue = track.volumeDB }
-        if !pan.trackingGesture { pan.doubleValue = -track.pan }
-        volume.isEnabled = editor?.canAdjustTrackMix == true; pan.isEnabled = volume.isEnabled
-        volume.setAccessibilityLabel("\(track.name) volume")
+    func configure(_ track: Track, color: NSColor = accent) {
+        if !pan.trackingGesture && pan.doubleValue != -track.pan { pan.doubleValue = -track.pan }
+        let enabled = editor?.canAdjustTrackMix == true
+        if pan.isEnabled != enabled { pan.isEnabled = enabled }
         pan.setAccessibilityLabel("\(track.name) Pan")
-        volume.toolTip = nil; pan.toolTip = nil
-        volume.refreshValuePresentation(); pan.refreshValuePresentation()
-        if let cell = volume.cell as? TrackVolumeMeterCell, let editor {
+        pan.refreshValuePresentation()
+        if let editor {
+            fx.configure(editor: editor, track: track, color: color)
             let meter = editor.displayedTrackMeter(track)
-            cell.recording = editor.isRecording && editor.recordingTrack == track.id
             let active = editor.isPlaying || editor.isRecording
-            cell.levels = active ? [meter.left.level, meter.right.level] : [0, 0]
-            volume.needsDisplay = true
+            volumeControl.configure(track: track, meter: meter, active: active, recording: editor.isRecording && editor.recordingTrack == track.id,
+                                    enabled: editor.canAdjustTrackMix, showsPeaks: editor.showsTrackMeter(track.id))
         }
     }
     private func change(_ slider: TrackMixerSlider, isPan: Bool) {
@@ -429,7 +501,7 @@ final class Timeline: NSView {
             let row = Int((point.y - ruler) / rowHeight)
             if rows.indices.contains(row) {
                 let (track, depth) = rows[row]
-                let rects = [trackMuteRect(row: row, depth: depth), trackSoloRect(row: row, depth: depth), trackFXRect(row: row, depth: depth)]
+                let rects = [trackMuteRect(row: row, depth: depth), trackSoloRect(row: row, depth: depth)]
                 if let index = rects.firstIndex(where: { $0.contains(point) }) { next = (track.id, index) }
             }
         }
@@ -470,9 +542,12 @@ final class Timeline: NSView {
             control.frame = rect
             let offset = y - rect.minY
             let first = trackMuteRect(row: row, depth: depth)
-            control.volume.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + 56, width: trackMeterReadoutRect(row: row, channel: 0).minX - 6 - first.minX, height: 18)
+            control.volumeControl.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + 54, width: trackMeterReadoutRect(row: row, channel: 0).maxX - first.minX, height: 22)
+            control.volumeControl.layoutSubtreeIfNeeded()
             control.pan.frame = NSRect(x: header - 24, y: offset + 4, width: 20, height: rowHeight - 8)
-            control.configure(track)
+            let fxRect = trackFXRect(row: row, depth: depth)
+            control.fx.frame = NSRect(x: fxRect.minX - pinnedHeaderX, y: offset + 34, width: fxRect.width, height: fxRect.height)
+            control.configure(track, color: trackColors[row % trackColors.count])
         }
     }
     deinit { if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) } }
@@ -843,10 +918,9 @@ final class Timeline: NSView {
             let depth = item.1
             for (rect, cursor) in [(trackNameHitRect(row: row, depth: depth), NSCursor.iBeam),
                                    (trackMuteRect(row: row, depth: depth), NSCursor.arrow),
-                                   (trackSoloRect(row: row, depth: depth), NSCursor.arrow),
-                                   (trackFXRect(row: row, depth: depth), NSCursor.arrow)] {
+                                   (trackSoloRect(row: row, depth: depth), NSCursor.arrow)] {
                 let visible = rect.intersection(visibleTrackRect)
-                if !visible.isEmpty && (!editor.busy || ((rect == trackFXRect(row: row, depth: depth) || rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
+                if !visible.isEmpty && (!editor.busy || ((rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
             }
         }
     }
@@ -1005,10 +1079,6 @@ final class Timeline: NSView {
         drawTrackHeaders(in: dirtyRect)
         drawRuler(in: dirtyRect)
     }
-    private func meterColor(_ amplitude: Double) -> NSColor {
-        let db = TrackLevelMeter.decibels(amplitude)
-        return db >= -1 ? .systemRed : db >= -6 ? .systemYellow : accent
-    }
     private func drawTrackHeaders(in dirtyRect: NSRect) {
         let dimmed = dimmedTrackIDs()
         let column = NSRect(x: pinnedHeaderX, y: ruler, width: header, height: max(0, bounds.height - ruler))
@@ -1020,13 +1090,6 @@ final class Timeline: NSView {
             let selected = editor.selectedTrack == track.id
             let trackDimmed = dimmed.contains(track.id)
             fill(NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight), selected ? NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.19, alpha: 1) : panelColor)
-            let meter = editor.displayedTrackMeter(track)
-            if editor.showsTrackMeter(track.id) {
-                for (channel, value) in [meter.left, meter.right].enumerated() {
-                    let text = (channel == 0 ? "L " : "R ") + value.peakText
-                    label(text, trackMeterReadoutRect(row: index, channel: channel), size: 8, color: meterColor(value.peak), weight: .medium, alignment: .right)
-                }
-            }
             let color = trackColors[index % trackColors.count]
             fill(NSRect(x: pinnedHeaderX, y: y + 1, width: 3, height: rowHeight - 2), selected ? color.withAlphaComponent(trackDimmed ? 0.3 : 1) : .clear)
             let editing = renamingTrack == track.id && nameField.isRenaming
@@ -1040,10 +1103,6 @@ final class Timeline: NSView {
             fill(soloRect, track.solo ? NSColor.systemBlue.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
             drawTrackControlHover(track.id, kind: 1, rect: soloRect)
             label("SOLO", NSRect(x: soloRect.minX, y: soloRect.minY + 3, width: soloRect.width, height: 15), size: 9, color: track.solo ? .systemBlue : .secondaryLabelColor, weight: .semibold, alignment: .center)
-            let fxRect = trackFXRect(row: index, depth: depth)
-            fill(fxRect, track.effects.isEmpty ? NSColor.white.withAlphaComponent(0.06) : color.withAlphaComponent(0.18), radius: 5)
-            drawTrackControlHover(track.id, kind: 2, rect: fxRect)
-            label("FX", NSRect(x: fxRect.minX, y: fxRect.minY + 3, width: fxRect.width, height: 15), size: 10, color: track.effects.isEmpty ? .secondaryLabelColor : color, weight: .semibold, alignment: .center)
             line(NSPoint(x: pinnedHeaderX, y: y + rowHeight), NSPoint(x: fragmentLeft, y: y + rowHeight), .white.withAlphaComponent(0.065))
         }
         NSGraphicsContext.restoreGraphicsState()
@@ -1133,8 +1192,7 @@ final class Timeline: NSView {
                 editor.toggleSolo(rows[row].0.id); return
             }
             if rows.indices.contains(row), trackFXRect(row: row, depth: rows[row].1).contains(point) {
-                editor.selectedTrack = rows[row].0.id; editor.update()
-                EffectsWindow(editor: editor, trackID: rows[row].0.id).run(); return
+                mixerControls[rows[row].0.id]?.fx.performClick(nil); return
             }
         }
         guard !editor.busy || (editor.isPlaying && point.x >= fragmentLeft) else { return }
@@ -1147,9 +1205,6 @@ final class Timeline: NSView {
         }
         let (track, depth) = rows[row]; editor.selectedTrack = track.id
         if p.x < fragmentLeft {
-            if trackFXRect(row: row, depth: depth).contains(p) {
-                EffectsWindow(editor: editor, trackID: track.id).run(); return
-            }
             if trackMuteRect(row: row, depth: depth).contains(p) {
                 editor.toggleMute(track.id)
             } else if trackSoloRect(row: row, depth: depth).contains(p) {
@@ -1500,7 +1555,7 @@ final class Timeline: NSView {
         guard !editor.busy, let ids = sender.representedObject as? Set<UUID> else { return }
         editor.selection = ids; editor.deleteClips()
     }
-    @objc func effects() { if let id = editor.selectedTrack { EffectsWindow(editor: editor, trackID: id).run() } }
+    @objc func effects() { if let id = editor.selectedTrack { editor.showEffects(for: id) } }
     @objc func addTrack() { editor.addTrack() }
     @objc func nest() { editor.addTrack(nested: true) }
     @objc func unparent() { if let id = editor.selectedTrack { editor.reparent(id, to: nil) } }

@@ -942,8 +942,16 @@ extension AppDelegate {
         let point = NSPoint(x: buttonRect.midX, y: buttonRect.midY)
         timeline.mouseExited(with: event(.mouseExited, point: point, view: timeline)); let baseline = pixels(timeline)
         timeline.mouseMoved(with: event(.mouseMoved, point: point, view: timeline))
-        try check(pixels(timeline) != baseline, "Drawn track MUTE/SOLO/FX controls also provide hover feedback")
+        try check(pixels(timeline) != baseline, "Drawn track MUTE/SOLO controls also provide hover feedback")
         timeline.mouseExited(with: event(.mouseExited, point: point, view: timeline))
+        let trackFX = timeline.mixerControls[timeline.rows[0].0.id]!.fx
+        for fx in [trackFX, masterFXButton!] {
+            let point = NSPoint(x: fx.bounds.midX, y: fx.bounds.midY)
+            fx.mouseExited(with: event(.mouseExited, point: point, view: fx)); let normal = pixels(fx)
+            fx.mouseEntered(with: event(.mouseEntered, point: point, view: fx))
+            try check(fx.interactionCursor == .arrow && pixels(fx) != normal, "Track and Master FX share the same native component and hover behavior")
+            fx.mouseExited(with: event(.mouseExited, point: point, view: fx))
+        }
         try check((bpmButton as? PointerButton)?.interactionCursor == .iBeam, "Editable BPM retains its text cursor")
         refresh()
     }
@@ -1029,10 +1037,29 @@ extension AppDelegate {
         refresh()
         let first = timeline.rows[0].0.id
         guard let controls = timeline.mixerControls[first] else { throw SounderError.message("Track sliders were not installed") }
+        guard controls.fx.target === controls.fx, masterFXButton.target === masterFXButton,
+              timeline.hitTest(controls.fx.convert(NSPoint(x: controls.fx.bounds.midX, y: controls.fx.bounds.midY), to: timeline.superview)) === controls.fx else { throw SounderError.message("Track FX must use the same self-contained native button as Master, including hit testing") }
+        controls.fx.performClick(nil)
+        guard let rack = editor.effectsWindows[first], editor.selectedTrack == first else { throw SounderError.message("Shared track FX button did not open its own effect chain") }
+        rack.done(); window.makeKeyAndOrderFront(nil)
+        masterFXButton.performClick(nil)
+        guard let masterRack = editor.effectsWindows[Project.masterID], editor.selectedTrack == first else { throw SounderError.message("Shared master FX button changed track selection or opened the wrong chain") }
+        masterRack.done(); window.makeKeyAndOrderFront(nil)
+        print("PASS: Track and Master FX use the identical native button, self-contained actions and correct independent effect chains")
+        let originalPointer = CGEvent(source: nil)?.location
+        defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
+        func movePointer(to slider: TrackMixerSlider? = nil) {
+            let point = slider.map { $0.convert(NSPoint(x: $0.bounds.midX, y: $0.bounds.midY), to: nil) } ?? NSPoint(x: window.frame.width - 40, y: 20)
+            let screen = window.convertToScreen(NSRect(origin: point, size: .zero)).origin
+            CGWarpMouseCursorPosition(CGPoint(x: screen.x, y: (NSScreen.screens.first?.frame.maxY ?? 0) - screen.y))
+        }
+        movePointer()
         for (row, item) in timeline.rows.enumerated() {
             guard let view = timeline.mixerControls[item.0.id], !view.isHidden else { continue }
             let volume = view.volume.convert(view.volume.bounds, to: timeline), pan = view.pan.convert(view.pan.bounds, to: timeline)
+            let fx = view.fx.convert(view.fx.bounds, to: timeline)
             guard volume.minY >= timeline.trackFXRect(row: row, depth: item.1).maxY,
+                  fx == timeline.trackFXRect(row: row, depth: item.1),
                   volume.maxX < pan.minX, pan.maxX < timeline.fragmentLeft,
                   abs(pan.height - (timeline.rowHeight - 8)) < 0.01, view.pan.isVertical,
                   timeline.trackNameRect(row: row, depth: item.1).maxX < pan.minX else { throw SounderError.message("Track sliders overlap buttons, leave the sidebar or have the wrong orientation") }
@@ -1089,22 +1116,39 @@ extension AppDelegate {
             func hoverEvent(_ type: NSEvent.EventType) -> NSEvent {
                 NSEvent.enterExitEvent(with: type, location: control.convert(NSPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
             }
-            control.mouseEntered(with: hoverEvent(.mouseEntered))
+            movePointer(to: control); control.mouseEntered(with: hoverEvent(.mouseEntered))
             guard control.visibleValueText == control.valueText?(control.doubleValue), let hoverFrame = control.visibleValueFrame, control.toolTip == nil else { throw SounderError.message("Slider hover must show its value synchronously without a native delayed tooltip") }
             var sameReadout = false
             control.withTrackingGesture {
                 sameReadout = control.visibleValueFrame == hoverFrame
-                control.mouseExited(with: hoverEvent(.mouseExited))
+                movePointer(); control.mouseExited(with: hoverEvent(.mouseExited))
                 sameReadout = sameReadout && control.visibleValueFrame == hoverFrame
             }
             guard sameReadout, control.visibleValueText == nil else { throw SounderError.message("Hover and dragging must use the same readout, retain it when dragging outside and hide after release outside") }
-            control.mouseEntered(with: hoverEvent(.mouseEntered))
-            control.mouseExited(with: hoverEvent(.mouseExited))
+            movePointer(to: control); control.mouseEntered(with: hoverEvent(.mouseEntered))
+            movePointer(); control.mouseExited(with: hoverEvent(.mouseExited))
             guard control.visibleValueText == nil else { throw SounderError.message("Hover readout did not disappear immediately when leaving the slider") }
-            control.isEnabled = false; control.mouseEntered(with: hoverEvent(.mouseEntered))
+            control.isEnabled = false; movePointer(to: control); control.mouseEntered(with: hoverEvent(.mouseEntered))
             guard control.visibleValueText == nil else { throw SounderError.message("Disabled slider must not show a hover readout") }
-            control.mouseExited(with: hoverEvent(.mouseExited)); control.isEnabled = true
+            movePointer(); control.mouseExited(with: hoverEvent(.mouseExited)); control.isEnabled = true
         }
+        func entered(_ control: TrackMixerSlider) -> NSEvent {
+            NSEvent.enterExitEvent(with: .mouseEntered, location: control.convert(NSPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
+        }
+        movePointer(to: controls.pan); controls.pan.mouseEntered(with: entered(controls.pan))
+        guard controls.pan.visibleValueText != nil else { throw SounderError.message("Pan hover did not appear under the actual pointer") }
+        // Deliberately omit Pan mouseExited, then deliver a stale Pan enter
+        // after moving to Volume, as can happen during tracking-area rebuilds.
+        movePointer(to: controls.volume); controls.volume.mouseEntered(with: entered(controls.volume))
+        controls.pan.mouseEntered(with: entered(controls.pan))
+        controls.configure(editor.project.tracks[0])
+        guard controls.volume.visibleValueText != nil, controls.pan.visibleValueText == nil else { throw SounderError.message("A stale Pan hover appeared while the pointer was over Volume") }
+        movePointer(to: masterVolumeControl.slider); masterVolumeControl.slider.mouseEntered(with: entered(masterVolumeControl.slider))
+        controls.volume.refreshValuePresentation(); controls.pan.refreshValuePresentation()
+        guard masterVolumeControl.slider.visibleValueText != nil, controls.volume.visibleValueText == nil, controls.pan.visibleValueText == nil else { throw SounderError.message("Master, Volume and Pan hover readouts are not independent") }
+        movePointer(); masterVolumeControl.slider.refreshValuePresentation()
+        controls.volume.refreshValuePresentation(); controls.pan.refreshValuePresentation()
+        print("PASS: Actual pointer movement keeps Volume, Pan and Master hovers independent even with a missing exit and a stale enter event")
         print("PASS: Both sliders show values immediately on hover at the exact drag-readout position, preserve them during dragging and hide on exit; disabled sliders have no hover")
         if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             let volume = controls.volume
@@ -1132,7 +1176,10 @@ extension AppDelegate {
             let middle = try thumbX()
             RunLoop.current.run(until: Date().addingTimeInterval(0.15))
             let end = try thumbX()
-            guard abs(immediate - start) < 4, middle > immediate + 3, end > middle + 3,
+            // AppKit may spend longer than the requested run-loop slice on
+            // native window/layout work. It is valid to have reached the end
+            // by the middle snapshot; still reject an initial jump or reversal.
+            guard abs(immediate - start) < 4, middle > immediate + 3, end >= middle - 0.5,
                   editor.project.tracks[0].volumeDB > 0, editor.undoStack.count == history + 1 else { throw SounderError.message("Rail click must animate the rendered volume thumb through intermediate positions and create one Undo action: \(start), \(immediate), \(middle), \(end)") }
             print("PASS: Clicking the volume rail animates the actual thumb smoothly to its destination with one Undo action")
         }
@@ -1181,5 +1228,84 @@ extension AppDelegate {
         }
         clipView.scroll(to: .zero); refresh()
         print("PASS: Native track sliders fit under MUTE/SOLO/FX, Pan is vertical, controls remain pinned and clipped, live changes retain transport, and dragging is one Undo")
+    }
+}
+
+extension AppDelegate {
+    func verifyMasterMixerUI() throws {
+        let original = editor.project, oldSize = window.contentView!.frame.size
+        defer {
+            editor.stop(); editor.closePluginWindows(capture: false)
+            for rack in Array(editor.effectsWindows.values) { rack.done() }
+            editor.project = original; editor.undoStack = []; editor.redoStack = []; editor.dirty = false
+            window.setContentSize(oldSize); refresh()
+        }
+        editor.stop(); editor.project.masterVolumeDB = 0; editor.project.masterEffects = []; refresh()
+        for width in [1280.0, 1000.0] {
+            window.setContentSize(NSSize(width: width, height: oldSize.height))
+            window.contentView?.superview?.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            let master = masterVolumeControl.convert(masterVolumeControl.bounds, to: nil)
+            let fx = masterFXButton.convert(masterFXButton.bounds, to: nil)
+            let group = masterGroup.convert(masterGroup.bounds, to: nil)
+            let heading = masterLabel.convert(masterLabel.bounds, to: nil)
+            guard masterVolumeControl.window === window, !masterVolumeControl.isHiddenOrHasHiddenAncestor,
+                  abs(group.midX - window.frame.width / 2) < 2, heading.maxX < fx.minX, fx.maxX < master.minX,
+                  masterFXButton.title == "FX", masterFXButton.font?.pointSize == 10,
+                  abs(fx.width - 46) < 0.5, abs(fx.height - 20) < 0.5,
+                  masterVolumeControl.slider.cell is TrackVolumeMeterCell else { throw SounderError.message("Master group must stay centered in MASTER → FX → volume order, using the track FX dimensions/font: \(group), \(fx)") }
+            let name = editor.project.name
+            editor.project.name = String(repeating: "W", count: 100); refresh()
+            window.contentView?.superview?.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            let centered = masterGroup.convert(masterGroup.bounds, to: nil)
+            guard !masterVolumeControl.isHiddenOrHasHiddenAncestor, !masterFXButton.isHiddenOrHasHiddenAncestor,
+                  abs(centered.midX - window.frame.width / 2) < 2 else { throw SounderError.message("A long project name displaced or hid the master controls") }
+            editor.project.name = name; refresh()
+        }
+        window.setContentSize(oldSize); refresh(); editor.cursor = 2; editor.playPause()
+        guard let player = editor.player else { throw SounderError.message("Master mixer playback did not start") }
+        let engine = player.engine, node = player.node, graph = player.snapshotGraph
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15)); editor.updateTransportPosition()
+        guard let meter = masterVolumeControl.slider.cell as? TrackVolumeMeterCell, meter.levels[0] > 0, meter.levels[1] > 0 else { throw SounderError.message("Master meter must show actual stereo output") }
+        let history = editor.undoStack.count
+        masterVolumeControl.slider.withTrackingGesture {
+            for value in [-3.0, -12, -24] {
+                masterVolumeControl.slider.doubleValue = value
+                _ = masterVolumeControl.slider.sendAction(masterVolumeControl.slider.action, to: masterVolumeControl.slider.target)
+            }
+        }
+        guard editor.project.masterVolumeDB == -24, editor.undoStack.count == history + 1,
+              editor.player === player, player.engine === engine, player.node === node, player.snapshotGraph === graph else { throw SounderError.message("Master volume must change live without restarting audio, with one Undo action") }
+        editor.stop(); editor.undo()
+        guard editor.project.masterVolumeDB == 0 else { throw SounderError.message("Master volume Undo failed") }
+        masterFXButton.performClick(nil)
+        guard let rack = editor.effectsWindows[Project.masterID], rack.window.title == "FX · Master" else { throw SounderError.message("MASTER FX did not open the shared effects window") }
+        masterFXButton.performClick(nil)
+        guard editor.effectsWindows[Project.masterID] === rack else { throw SounderError.message("MASTER FX opened a duplicate effects window") }
+        if let index = CommandLine.arguments.firstIndex(of: "--master-plugin-ui-test"), index + 1 < CommandLine.arguments.count {
+            rack.add(URL(fileURLWithPath: CommandLine.arguments[index + 1]))
+            guard let effect = editor.project.masterEffects.first, let plugin = editor.pluginWindows[effect.id] else { throw SounderError.message("Adding a master plug-in must open its editor immediately") }
+            if let parameter = plugin.host.parameters().first, let value = parameter["value"] as? NSNumber, let index = parameter["index"] as? NSNumber {
+                plugin.host.setParameter(index.intValue, value: value.doubleValue > 0.5 ? value.doubleValue - 0.1 : value.doubleValue + 0.1)
+                plugin.captureChanges()
+            }
+            let state = try plugin.host.saveState()
+            guard editor.project.masterEffects[0].state == state else { throw SounderError.message("Master plugin editor did not retain live parameter state") }
+            let saved = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(editor.project))
+            guard saved.masterEffects[0].state == state else { throw SounderError.message("Project does not preserve master plug-in parameters") }
+            editor.cursor = 2; editor.playPause()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15)); editor.updateTransportPosition()
+            guard editor.isPlaying, (editor.trackMeters[Project.masterID]?.level ?? 0) > 0 else { throw SounderError.message("Real master plug-in did not process live project output") }
+            editor.stop()
+            plugin.close(); rack.table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            rack.bypass()
+            guard editor.project.masterEffects[0].bypassed else { throw SounderError.message("Master effect bypass did not apply") }
+            rack.remove()
+            guard editor.project.masterEffects.isEmpty else { throw SounderError.message("Removing master effect did not apply") }
+            print("PASS: Real master plug-in opens its editor immediately; parameter state persists, bypass and removal work through the shared effects window")
+        }
+        rack.done(); window.makeKeyAndOrderFront(nil)
+        print("PASS: Centered MASTER → FX → volume uses the track FX size/font at normal/minimum widths, live gain retains transport and one-step Undo, and effects window is reused")
     }
 }

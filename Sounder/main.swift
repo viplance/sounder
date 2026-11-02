@@ -47,7 +47,7 @@ final class NumericInputFormatter: Formatter {
     }
 }
 
-final class PointerButton: NSButton {
+class PointerButton: NSButton {
     private var pointerTracking: NSTrackingArea?
     private(set) var isHovering = false
     var contentPadding = NSSize.zero { didSet { invalidateIntrinsicContentSize() } }
@@ -135,6 +135,7 @@ final class ProjectNameView: NSView {
     let field: InlineNameField
     private let dirtyMark = NSTextField(labelWithString: "  •")
     private var nameWidth: NSLayoutConstraint!
+    var maximumWidth: CGFloat = 640
     init(label: ProjectNameLabel, field: InlineNameField) {
         self.label = label; self.field = field
         super.init(frame: .zero)
@@ -155,7 +156,7 @@ final class ProjectNameView: NSView {
         let display = NSTextField(labelWithString: label.stringValue)
         display.font = label.font
         let width = field.isRenaming ? editingWidth + (showsDirtyMark ? dirtyMark.intrinsicContentSize.width : 0) : display.intrinsicContentSize.width + 4
-        return NSSize(width: min(640, max(4, width)), height: display.intrinsicContentSize.height)
+        return NSSize(width: min(maximumWidth, max(4, width)), height: display.intrinsicContentSize.height)
     }
     func updateSize() { nameWidth.constant = intrinsicContentSize.width; invalidateIntrinsicContentSize(); needsLayout = true }
     override func setFrameSize(_ newSize: NSSize) {
@@ -405,8 +406,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var exportButton: NSButton!
     var editButtons: [NSButton] = []
     var fragmentMuteButton: NSButton!
+    let masterVolumeControl = MixerVolumeControl(frame: .zero)
+    var masterFXButton: MixerFXButton!
+    let masterLabel = NSTextField(labelWithString: "MASTER")
+    var masterGroup: NSStackView!
     private var titlebarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
-    private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("quality"), .flexibleSpace, NSToolbarItem.Identifier("open"), NSToolbarItem.Identifier("save"), NSToolbarItem.Identifier("export")]
+    private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("quality"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("open"), NSToolbarItem.Identifier("save"), NSToolbarItem.Identifier("export")]
     var closingConfirmed = false
     var dialogAutomation: ((NSAlert) -> Void)?
     var fragmentDialogAutomation: ((FragmentSettingsDialog) -> Void)?
@@ -503,9 +508,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let export = PointerButton(title: "Export", target: self, action: #selector(exportAudio)); export.bezelStyle = .rounded
         export.widthAnchor.constraint(equalToConstant: export.intrinsicContentSize.width + 16).isActive = true
         exportButton = export
+        masterVolumeControl.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        masterVolumeControl.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        masterVolumeControl.slider.target = self; masterVolumeControl.slider.action = #selector(changeMasterVolume(_:))
+        masterFXButton = MixerFXButton(title: "FX", target: nil, action: nil)
+        masterFXButton.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        masterFXButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        masterLabel.font = .systemFont(ofSize: 10, weight: .semibold); masterLabel.textColor = .secondaryLabelColor
+        masterGroup = NSStackView(views: [masterLabel, masterFXButton, masterVolumeControl])
+        masterGroup.orientation = .horizontal; masterGroup.alignment = .centerY; masterGroup.spacing = 10
+        masterGroup.widthAnchor.constraint(equalToConstant: masterLabel.intrinsicContentSize.width + 46 + 200 + 20).isActive = true
+        masterGroup.heightAnchor.constraint(equalToConstant: 26).isActive = true
         let controls: [(String, String, NSView)] = [
             ("project", "Project name", projectNameView),
             ("quality", "Project audio settings", qualityButton),
+            ("master", "Master", masterGroup),
             ("open", "Open project", button("Open project", "folder", #selector(openProject))),
             ("save", "Save project", button("Save project", "square.and.arrow.down", #selector(saveProject))),
             ("export", "Export", export)
@@ -515,13 +532,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.label = label; item.toolTip = label; item.view = view
             // Custom toolbar views still receive the system glass bezel unless explicitly opted out.
-            if id == "project" { item.isBordered = false }
-            if ["open", "save", "export", "quality"].contains(id) { item.autovalidates = false }
+            if ["project", "master", "masterFX"].contains(id) { item.isBordered = false }
+            if ["open", "save", "export", "quality", "master", "masterFX"].contains(id) { item.autovalidates = false }
             item.visibilityPriority = .high
             titlebarItems[identifier] = item
         }
         let toolbar = NSToolbar(identifier: "Sounder.ProjectToolbar")
         toolbar.delegate = self; toolbar.displayMode = .iconOnly; toolbar.allowsUserCustomization = false
+        toolbar.centeredItemIdentifiers = [NSToolbarItem.Identifier("master")]
         window.toolbarStyle = .unifiedCompact; window.toolbar = toolbar
     }
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { titlebarOrder }
@@ -564,6 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--fragment-settings-ui-test") { try verifyFragmentSettingsUI() }
             if CommandLine.arguments.contains("--numeric-input-ui-test") { try verifyNumericInputUI() }
             if CommandLine.arguments.contains("--track-mix-ui-test") { try verifyTrackMixUI() }
+            if CommandLine.arguments.contains("--master-mix-ui-test") { try verifyMasterMixerUI() }
             if CommandLine.arguments.contains("--choice-alert-ui-test") { try verifyChoiceAlertsUI() }
             if CommandLine.arguments.contains("--loop-ui-test") { try verifyLoopUI() }
             if CommandLine.arguments.contains("--loop-recording-ui-test") { try verifyLoopRecordingUI() }
@@ -854,6 +873,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                                end: { [weak self] in self?.projectLabel.isHidden = false; self?.projectNameView.updateSize() })
     }
     @objc func toggleTempo() { editor.toggleTempoMode() }
+    @objc func changeMasterVolume(_ sender: TrackMixerSlider) {
+        let value = (sender.doubleValue * 10).rounded() / 10
+        if editor.setTrackMix(Project.masterID, volumeDB: value, checkpoint: !sender.trackingGesture || !sender.checkpointed) { sender.checkpointed = true }
+    }
     @objc func toggleLoop() { editor.toggleLoop() }
     @objc func toggleMetronome() { editor.toggleMetronome() }
     @objc func editTempo() {
@@ -929,8 +952,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             (item?.view as? NSControl)?.isEnabled = !editor.busy
         }
         exportButton.isEnabled = editor.canExport
+        masterVolumeControl.configure(track: editor.project.masterTrack, meter: editor.displayedTrackMeter(editor.project.masterTrack),
+                                      active: editor.isPlaying || editor.isRecording, recording: false, enabled: editor.canAdjustTrackMix, showsPeaks: true)
+        masterFXButton.configure(editor: editor, track: editor.project.masterTrack, color: accent)
         titlebarItems[NSToolbarItem.Identifier("export")]?.isEnabled = editor.canExport
         projectLabel.stringValue = editor.projectName + (editor.dirty ? "  •" : "")
+        updateProjectNameWidth()
         projectNameView.updateSize()
         projectLabel.isEnabled = !editor.busy; qualityButton.isEnabled = !editor.busy
         titlebarItems[NSToolbarItem.Identifier("quality")]?.isEnabled = !editor.busy
@@ -941,7 +968,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.title = editor.projectName + " — Sounder"
         window.isDocumentEdited = editor.dirty
     }
-    func windowDidResize(_ notification: Notification) { timeline?.refresh() }
+    private func updateProjectNameWidth() {
+        guard let projectNameView, let qualityButton else { return }
+        // Keep long names scrollable inside the left titlebar group so the
+        // centered master control and project file actions stay visible.
+        let masterHalfWidth = (masterGroup?.fittingSize.width ?? 310) / 2
+        projectNameView.maximumWidth = max(60, min(640, window.frame.width / 2 - masterHalfWidth - qualityButton.intrinsicContentSize.width - 140))
+        projectNameView.updateSize()
+    }
+    func windowDidResize(_ notification: Notification) { updateProjectNameWidth(); timeline?.refresh() }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if editor.isImporting { editor.importer?.cancel(); return false }
         if editor.isRecording { editor.stop() }
@@ -1108,7 +1143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func trim() { editor.trim() }
     @objc func join() { editor.join() }
     @objc func deleteClips() { editor.deleteClips() }
-    @objc func effects() { guard !editor.isRecording, !editor.requestingMic, !editor.isImporting, let id = editor.selectedTrack else { return }; EffectsWindow(editor: editor, trackID: id).run() }
+    @objc func effects() { if let id = editor.selectedTrack { editor.showEffects(for: id) } }
     @objc func addTrack() { editor.addTrack() }
     @objc func nest() { editor.addTrack(nested: true) }
     @objc func removeTrack() { editor.removeTrack() }
