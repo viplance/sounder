@@ -220,6 +220,7 @@ func runAudioTests() throws {
     try runNormalizationTests()
     try runExportTests()
     try runLiveRecordingTests()
+    try runOverdubTests()
     try runResamplingTests()
     try runNotificationTests()
     try runAudioImportTests()

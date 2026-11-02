@@ -312,6 +312,7 @@ final class LivePlayback {
     private var outputFrames = 0
     private var shuttleRenderer: ShuttlePlayback?
     private var renderingNormal = true
+    private var recordingPlayback = false
     private var metronomeFadeStart = 0
     private let returnQueue = DispatchQueue(label: "Sounder.return-to-play", qos: .userInitiated)
     private let returnLock = NSLock()
@@ -354,7 +355,7 @@ final class LivePlayback {
         if let segment = transportMotions.last(where: { $0.frame <= lastKnownFrame }) {
             return segment.motion.position(at: Double(lastKnownFrame - segment.frame) / format.sampleRate)
         }
-        return Double(min(graph.totalFrames, firstFrame + lastKnownFrame)) / format.sampleRate
+        return Double(recordingPlayback ? firstFrame + lastKnownFrame : min(graph.totalFrames, firstFrame + lastKnownFrame)) / format.sampleRate
     }
     var currentSpeed: Double {
         _ = currentTime
@@ -369,7 +370,40 @@ final class LivePlayback {
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!)
     }
-    func startPlayback() throws {
+    // Capture may outlast existing material. Keep output and its metronome
+    // clock running through silence, without changing the saved project length.
+    func prepareForRecording() throws {
+        try queue.sync {
+            transportLock.lock(); recordingPlayback = true; transportLock.unlock()
+            // The final buffer can have drained while its completion is still
+            // waiting on the main queue. Record takes ownership of transport.
+            if !running && engine.isRunning && node.isPlaying { running = true }
+            let end = Double(Int.max / 4) / format.sampleRate
+            if let renderer = shuttleRenderer {
+                let source = DryShuttleSource(project: renderer.source.project, store: renderer.source.store, processed: graph.outputCache, latency: graph.latency, frameCount: Int.max / 4, liveGraph: graph)
+                renderer.replaceSource(source); renderer.retarget(1, end: end)
+                transportLock.lock(); transportMotions.append((outputFrames, renderer.motion)); transportLock.unlock()
+            } else if !transportMotions.isEmpty {
+                let motion = ShuttleMotion(start: Double(nextFrame) / format.sampleRate, direction: 1, end: end, initialSpeed: 1, target: 1)
+                transportLock.lock(); transportMotions.append((outputFrames, motion)); transportLock.unlock()
+            }
+            if running {
+                let pcm = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
+                while scheduled < max(3, Int(ceil(format.sampleRate / 48_000 * 3))) { try enqueue(format: pcm) }
+            }
+        }
+    }
+    func cancelRecordingPreparation() {
+        queue.sync {
+            transportLock.lock(); recordingPlayback = false; transportLock.unlock()
+            if let renderer = shuttleRenderer {
+                let source = DryShuttleSource(project: renderer.source.project, store: renderer.source.store, processed: graph.outputCache, latency: graph.latency, frameCount: graph.totalFrames, liveGraph: graph)
+                renderer.replaceSource(source); renderer.retarget(1, end: Double(graph.totalFrames) / format.sampleRate)
+                transportLock.lock(); transportMotions.append((outputFrames, renderer.motion)); transportLock.unlock()
+            }
+        }
+    }
+    func startPlayback(playImmediately: Bool = true) throws {
         let pcmFormat = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
         // Warm effects from project zero and discard compensated latency when seeking.
         try queue.sync {
@@ -379,8 +413,10 @@ final class LivePlayback {
             let buffers = max(3, Int(ceil(format.sampleRate / 48_000 * 3)))
             for _ in 0..<buffers { try enqueue(format: pcmFormat) }
         }
-        engine.prepare(); try engine.start(); node.play()
+        engine.prepare(); try engine.start()
+        if playImmediately { node.play() }
     }
+    func beginPreparedPlayback() { node.play() }
     // Only the player pauses. Keep the engine, decoded PCM and live processors
     // ready, and finish the short fade at its audible completion, not consumption.
     func pause() throws {
@@ -481,7 +517,7 @@ final class LivePlayback {
                 let fadePending = self.seekFadeFrame == 0 && !self.seekFade.isEmpty
                 let previousFade = self.seekFade
                 let previousFadeFrame = self.seekFadeFrame
-                let count = min(Int(self.format.sampleRate * 0.010), max(0, self.graph.totalFrames - self.nextFrame))
+                let count = self.recordingPlayback ? Int(self.format.sampleRate * 0.010) : min(Int(self.format.sampleRate * 0.010), max(0, self.graph.totalFrames - self.nextFrame))
                 let oldPosition: Double
                 if fadePending {
                     // No target samples have been queued yet: keep the audible
@@ -521,7 +557,7 @@ final class LivePlayback {
                 try self.graph.seek(to: target)
                 self.shuttleRenderer = nil; self.renderingNormal = true; self.nextFrame = target
                 self.meterBuffer.clear()
-                let motion = ShuttleMotion(start: Double(target) / self.format.sampleRate, direction: 1, end: Double(self.graph.totalFrames) / self.format.sampleRate, initialSpeed: 1, target: 1)
+                let motion = ShuttleMotion(start: Double(target) / self.format.sampleRate, direction: 1, end: Double(self.recordingPlayback ? Int.max / 4 : self.graph.totalFrames) / self.format.sampleRate, initialSpeed: 1, target: 1)
                 self.transportLock.lock()
                 self.transportMotions.append((self.outputFrames, motion))
                 if self.seekRequest?.id == id { self.seekRequest?.outputFrame = self.outputFrames }
@@ -630,7 +666,7 @@ final class LivePlayback {
             schedule(buffer, last: renderer.reachedEnd, format: pcmFormat, pauseFinal: pauseFinal)
             return
         }
-        let frames = min(requestedFrames, graph.totalFrames - nextFrame)
+        let frames = recordingPlayback ? requestedFrames : min(requestedFrames, graph.totalFrames - nextFrame)
         guard frames > 0 else {
             if scheduled == 0 { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(nil) } }
             return
@@ -655,7 +691,7 @@ final class LivePlayback {
         meterBuffer.append(frame: nextFrame + frames, peaks: graph.trackPeaks)
         nextFrame += frames; outputFrames += frames; scheduled += 1
         let pauseFinal = advanceTransportFade(frames: frames)
-        schedule(buffer, last: nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal)
+        schedule(buffer, last: !recordingPlayback && nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal)
     }
     private func schedule(_ buffer: AVAudioPCMBuffer, last: Bool, format pcmFormat: AVAudioFormat, pauseFinal: Bool = false) {
         let generation = streamGeneration
@@ -984,9 +1020,9 @@ final class ShuttlePlayback {
     }
     // Worker-only: re-anchor at the next unscheduled sample, preserving phase
     // and signed velocity across key release or a change of direction.
-    func retarget(_ target: Double, revision: Int? = nil) {
+    func retarget(_ target: Double, revision: Int? = nil, end: Double? = nil) {
         let direction = target == 0 ? (renderedSpeed < 0 ? -1.0 : 1.0) : (target < 0 ? -1.0 : 1.0)
-        let next = ShuttleMotion(start: renderedPosition, direction: direction, end: motion.end, initialSpeed: renderedSpeed, target: target)
+        let next = ShuttleMotion(start: renderedPosition, direction: direction, end: end ?? motion.end, initialSpeed: renderedSpeed, target: target)
         motion = next; motionStartFrame = outputFrame; terminal = false
         motionLock.lock()
         if let revision { activeRevision = revision } else { requestedRevision += 1; activeRevision = requestedRevision }

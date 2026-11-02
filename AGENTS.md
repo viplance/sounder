@@ -39,6 +39,8 @@
 
 ## Live recording
 
+- Record remains available during ordinary playback (toolbar, Transport menu and R); disable it only during capture, shuttle, microphone permission/setup, import or normalization. Punch in on the active track without stopping/rebuilding the current playback engine or node. From stopped, prepare the backing mix before opening capture and start its prepared node once capture is ready, at the selected cursor. Continue the backing transport through silence beyond existing fragments until capture is stopped. Mix the metronome once on the backing output, never into the microphone file. Show other tracks' playback meters alongside the recording track's input meter. Space/Stop finalize capture and stop both transports; Enter discards the current take and seeks the same backing engine to the recording start before starting its replacement. Preserve backing playback after capture setup failure and restore normal end-of-project behavior.
+
 - During recording, Space finalizes and retains the take and returns the cursor to its recording start. Enter (including keypad Enter) discards the current unsaved take and its file, then immediately starts a fresh take on the same track at the same recording start. Discarded takes must not consume take numbers or create Undo entries; keep earlier fragments intact.
 
 - Draw the recording waveform incrementally from actual incoming PCM buffers before Stop. Do not substitute metering values or generated waveforms in production.

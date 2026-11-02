@@ -807,7 +807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         tempoButton.isEnabled = !editor.isImporting && !editor.requestingMic
         bpmButton.isEnabled = tempoButton.isEnabled; metronomeButton.isEnabled = tempoButton.isEnabled
         playButton.image = NSImage(systemSymbolName: editor.isPlaying ? "pause.fill" : "play.fill", accessibilityDescription: "Play / pause")
-        playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isImporting; recordButton.isEnabled = !editor.busy
+        playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isImporting; recordButton.isEnabled = editor.canRecord
         editButtons.forEach { $0.isEnabled = !editor.busy }
         for name in ["open", "save"] {
             let item = titlebarItems[NSToolbarItem.Identifier(name)]
@@ -931,6 +931,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if menuItem.action == #selector(exportAudio) { return editor.canExport }
         if [#selector(zoomIn), #selector(zoomOut)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
+        }
+        if menuItem.action == #selector(record) {
+            return editor.canRecord && NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
         }
         if [#selector(restartPlayback), #selector(play), #selector(seekBackward), #selector(seekForward), #selector(seekToStart), #selector(seekToEnd), #selector(stop), #selector(record), #selector(rewind)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)

@@ -63,6 +63,7 @@ final class Editor: NSObject {
     var requestingMic = false
     var isRecording: Bool { recorder != nil }
     var isPlaying: Bool { player?.isPlaying == true || shuttle?.isPlaying == true }
+    var canRecord: Bool { !isRecording && !isShuttling && !requestingMic && !isImporting && !isNormalizing }
     var busy: Bool { isRecording || isPlaying || isShuttling || requestingMic || isImporting || isNormalizing }
     var canExport: Bool { !busy && duration > 0 }
     var duration: Double { project.tracks.flatMap(\.clips).map(\.end).max() ?? 0 }
@@ -347,28 +348,39 @@ final class Editor: NSObject {
         selection = Set(clips.map(\.id)); update("Imported \(clips.count) fragment(s)")
     }
     func record() {
-        guard !busy else { return }
-        if player != nil || pausedPlayer != nil { stop() }
+        guard canRecord else { return }
         requestingMic = true; update()
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             DispatchQueue.main.async {
                 guard let self else { return }; self.requestingMic = false
                 guard granted else { self.error(SounderError.message("Allow Sounder to use the microphone in System Settings → Privacy & Security → Microphone.")); return }
                 do {
-                    if self.selectedIndex == nil { self.addTrack() }
+                    if self.selectedIndex == nil {
+                        self.checkpoint()
+                        let track = Track(name: "Audio " + String(format: "%02d", self.project.tracks.count + 1))
+                        self.project.tracks.append(track); self.selectedTrack = track.id
+                    }
                     try self.startRecording()
                 } catch { self.error(error) }
             }
         }
     }
-    private func startRecording() throws {
-        let url = audio.freshURL()
+    func startRecording(at position: Double? = nil) throws {
+        let url = audio.freshURL(), wasPlaying = isPlaying
         do {
+            // Prepare the backing mix before opening capture, keeping a running
+            // transport intact when Record is pressed during Play.
+            if let player { try player.prepareForRecording() }
+            else { startPlayback(forRecording: true) }
+            guard let player else { throw SounderError.message("Cannot start recording playback") }
             let recorder = try makeRecorder(url, project.audioFormat)
-            recorder.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled, start: cursor)
+            recorder.metronome.configure(bpm: project.tempo, enabled: false, start: cursor)
             try recorder.start()
+            if !wasPlaying { player.beginPreparedPlayback() }
+            cursor = position ?? (wasPlaying ? player.currentTime : player.start)
             activateRecording(recorder)
         } catch {
+            if wasPlaying { player?.cancelRecordingPreparation() } else { stopPlayback() }
             try? FileManager.default.removeItem(at: url)
             throw error
         }
@@ -381,18 +393,19 @@ final class Editor: NSObject {
     private func restartRecording() {
         guard let recorder else { return }
         let start = recordingStart, track = recordingTrack, url = recordingURL
-        stopPlayback() // Invalidate the transport timer before replacing capture.
+        timer?.invalidate(); timer = nil
         _ = recorder.stop(); self.recorder = nil
         clearRecordingState()
         cursor = start; selectedTrack = track
         do {
             if let url { try FileManager.default.removeItem(at: url) }
-            try startRecording()
-        } catch { self.error(error) }
+            player?.seek(to: start)
+            try startRecording(at: start)
+        } catch { stopPlayback(); self.error(error) }
         update()
     }
     func activateRecording(_ recorder: LiveRecorder) {
-        recorder.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled, start: cursor)
+        recorder.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled && player == nil, start: cursor)
         recordingPeaks = []; recordingPartialPeak = nil
         recordingChannelPeaks = Array(repeating: [], count: recorder.format.channels); recordingPartialChannelPeaks = Array(repeating: nil, count: recorder.format.channels)
         recordingURL = recorder.url; recordingTrack = selectedTrack; recordingStart = cursor
@@ -427,7 +440,9 @@ final class Editor: NSObject {
                 let index = min(channel, update.channelPeaks.count - 1)
                 return max(update.channelPeaks[index].max() ?? 0, update.partialChannelPeaks[index] ?? 0)
             }
-            updateTrackMeters([recordingTrack: StereoLevels(left: channelPeak(0), right: channelPeak(1))])
+            var peaks = player.map { $0.consumeTrackPeaks(at: $0.currentTime) } ?? [:]
+            peaks[recordingTrack] = StereoLevels(left: channelPeak(0), right: channelPeak(1))
+            updateTrackMeters(peaks)
         }
         if update.failure != nil { stop() }
     }
@@ -471,7 +486,7 @@ final class Editor: NSObject {
     }
     private func updateMetronome() {
         player?.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
-        recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled)
+        recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled && player == nil)
     }
     func toggleMute(_ trackID: UUID) {
         guard !isRecording, !isShuttling, !requestingMic, !isImporting,
@@ -653,11 +668,11 @@ final class Editor: NSObject {
         timer?.invalidate(); timer = nil; shuttleGesture = nil; shuttleReleasing = false
         if resume && gesture.resume { startPlayback() } else { update() }
     }
-    private func startPlayback(rememberStart: Bool = true) {
+    private func startPlayback(rememberStart: Bool = true, forRecording: Bool = false) {
         do {
-            guard duration > 0 else { return }
+            guard duration > 0 || forRecording else { return }
             flushPluginEdits()
-            if let playback = pausedPlayer, pausedMixKey == (try mixCacheKey()) {
+            if !forRecording, let playback = pausedPlayer, pausedMixKey == (try mixCacheKey()) {
                 let position = pausedCursorIsCurrent ? playback.pausePosition : max(0, cursor)
                 guard position < Double(playback.graph.totalFrames) / audio.sampleRate else { update(); return }
                 pausedPlayer = nil; pausedMixKey = nil; followsPausedCursor = false
@@ -674,11 +689,16 @@ final class Editor: NSObject {
             discardPausedPlayback()
             let graph = try playbackGraph()
             let start = max(0, cursor)
-            guard start < Double(graph.totalFrames) / audio.sampleRate else { update(); return }
+            guard forRecording || start < Double(graph.totalFrames) / audio.sampleRate else { update(); return }
             cursor = start
             let playback = try makePlayback(graph, project.audioFormat, start)
             playback.finished = { [weak self, weak playback] failure in
                 guard let self, let playback, self.player === playback else { return }
+                if self.isRecording {
+                    guard let failure else { return } // An older natural-end callback cannot stop a new take.
+                    self.stop(); self.error(failure)
+                    return
+                }
                 if self.shuttleReleasing {
                     self.stopPlayback(at: failure == nil ? (self.lastPlaybackStart ?? playback.start) : playback.currentTime)
                     self.shuttleGesture = nil; self.shuttleReleasing = false; self.update()
@@ -698,7 +718,8 @@ final class Editor: NSObject {
             player = playback
             mixCache = (try mixCacheKey(), graph)
             playback.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
-            try playback.startPlayback()
+            if forRecording { try playback.prepareForRecording() }
+            try playback.startPlayback(playImmediately: !forRecording)
             cursor = playback.start
             if rememberStart { lastPlaybackStart = playback.start }
             startTimer(); update()

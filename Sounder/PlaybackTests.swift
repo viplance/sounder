@@ -483,6 +483,9 @@ extension AppDelegate {
         editor.project = Project(tracks: tracks); editor.selection = []; editor.selectedTrack = tracks[0].id
         editor.seek(to: 0); editor.playPause()
         RunLoop.current.run(until: Date().addingTimeInterval(0.25)); editor.updateTransportPosition()
+        try check(recordButton.isEnabled && editor.canRecord, "Record icon remains enabled during playback")
+        let recordMenu = NSApp.mainMenu!.items.compactMap { $0.submenu }.flatMap { $0.items }.first { $0.action == #selector(record) }!
+        try check(validateMenuItem(recordMenu), "Record menu and R shortcut remain available during playback")
         try check(editor.isPlaying && zip(tracks, [0.1, 0.6, 0.95]).allSatisfy { abs((editor.trackMeters[$0.0.id]?.peak ?? 0) - $0.1) < 1e-5 }, "Header meters follow actual playback peaks for green, yellow and red levels")
         try check(zip(tracks, [0.05, 0.3, 0.475]).allSatisfy { abs((editor.trackMeters[$0.0.id]?.right.peak ?? 0) - $0.1) < 1e-5 }, "Header meters preserve separate right-channel levels")
         for row in tracks.indices {
@@ -513,6 +516,7 @@ extension AppDelegate {
         files.append(recorder.url); try recorder.start(); editor.activateRecording(recorder)
         recorder.writer.append(captureTestBuffer(format: input, start: 0, frames: 12_000)); recorder.writer.waitForPendingWrites()
         editor.updateTransportPosition()
+        try check(!recordButton.isEnabled && !editor.canRecord, "Record icon disables after capture has started")
         try check(editor.isRecording && (editor.trackMeters[tracks[0].id]?.peak ?? 0) > 0.4, "Recording peak readout measures actual captured microphone-format PCM")
         guard let recordingMeter = editor.trackMeters[tracks[0].id] else { throw SounderError.message("Missing stereo recording meter") }
         try check(abs(recordingMeter.right.peak - recordingMeter.left.peak * 0.25) < 1e-5, "Recording meters preserve independent captured left and right peaks")

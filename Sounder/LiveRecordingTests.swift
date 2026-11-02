@@ -135,3 +135,91 @@ func runMicrophoneSmokeTest() throws {
     guard live.frames > 0, !live.peaks.isEmpty, file.length >= live.frames else { throw SounderError.message("Microphone capture produced no live PCM waveform") }
     print("PASS: actual microphone tap published \(live.peaks.count) live peaks before Stop; saved \(file.length) frames")
 }
+
+func runOverdubTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SounderOverdub-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = try AudioStore(directory: dir)
+    let format = ProjectAudioFormat(bitDepth: 32)
+    let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+    let bedURL = store.freshURL()
+    try store.write(AudioSignal(channels: [Array(repeating: 0.2, count: 12_000), Array(repeating: -0.05, count: 12_000)]), to: bedURL)
+    let bed = Track(name: "Backing", clips: [Clip(name: "Backing", source: bedURL.path, start: 0, duration: 0.25, order: 1)])
+    let target = Track(name: "Voice")
+    func makeEditor() -> Editor {
+        let editor = Editor(store: store, makeRecorder: { url, format in
+            try LiveRecorder(url: url, format: format, inputFormat: pcm)
+        }, makePlayback: { graph, format, start in
+            let playback = LivePlayback(graph: graph, format: format, start: start)
+            try playback.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+            return playback
+        })
+        editor.project = Project(tracks: [bed, target], audioFormat: format, metronomeEnabled: true)
+        editor.selectedTrack = target.id
+        return editor
+    }
+    let editor = makeEditor()
+    let reference = try store.renderAudio(editor.project, onlyTrack: bed.id)
+    editor.playPause()
+    guard let live = editor.player else { throw SounderError.message("Backing playback failed") }
+    let engine = live.engine, node = live.node
+    let output = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+    var frame = 0
+    func render() throws {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.002)); live.queue.sync {}
+        guard try engine.renderOffline(512, to: output) == .success else { throw SounderError.message("Cannot render overdub playback") }
+    }
+    for _ in 0..<21 { try render(); frame += 512 }
+    try check(editor.canRecord, "Record remains available during ordinary playback")
+    try editor.startRecording()
+    let startedAt = editor.recordingStart
+    try check(editor.isRecording && editor.isPlaying && editor.player === live && live.engine === engine && live.node === node,
+              "Punch-in retains the same running playback engine and node")
+    try check(abs(startedAt - Double(frame) / 48_000) <= 512 / 48_000, "Punch-in records from the current playback position")
+    let mic = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+    mic.frameLength = 512
+    for ch in 0..<2 { for i in 0..<512 { mic.floatChannelData![ch][i] = 0 } }
+    var error = 0.0, sawBackingMeter = false
+    for _ in 0..<40 {
+        editor.recorder!.writer.append(mic); editor.recorder!.writer.waitForPendingWrites()
+        try render()
+        for i in 0..<512 { for ch in 0..<2 {
+            let index = frame + i
+            let bedSample = index < reference.frameCount ? reference.channels[ch][index] : 0
+            let click = MetronomeClick.sample(frame: Int64(index), sampleRate: 48_000, bpm: 120)
+            error = max(error, abs(Double(output.floatChannelData![ch][i] - min(1, max(-1, bedSample + click)))))
+        } }
+        frame += 512
+        editor.updateTransportPosition()
+        sawBackingMeter = sawBackingMeter || (editor.trackMeters[bed.id]?.left.peak ?? 0) > 0.1
+    }
+    try check(error < 1e-6 && sawBackingMeter, "Overdub preserves both backing channels, meters and exactly one frame-aligned metronome (error: \(error))")
+    try check(editor.isRecording && editor.isPlaying && live.currentTime > 0.5 && editor.cursor > 0.5,
+              "Recording and its transport continue beyond the end of existing fragments")
+    let captureURL = editor.recordingURL!
+    editor.playPause()
+    let captured = try store.load(captureURL.path)
+    try check(!editor.isRecording && !editor.isPlaying && editor.cursor == startedAt && captured.frameCount == 40 * 512,
+              "Space finalizes an overdub and returns to the punch-in position")
+    try check(captured.channels.allSatisfy { $0.allSatisfy { $0 == 0 } }, "Backing tracks and metronome never enter the recorded microphone file")
+    try check(editor.project.tracks[0].clips.count == 1 && editor.project.tracks[1].clips.count == 1 && editor.project.tracks[1].clips[0].start == startedAt,
+              "Overdub preserves backing fragments and commits a separate take on the active track")
+    let stopped = makeEditor()
+    try stopped.startRecording()
+    guard let restartedBacking = stopped.player else { throw SounderError.message("Record from stopped did not start backing playback") }
+    try check(stopped.isRecording && stopped.isPlaying && stopped.recordingStart == 0, "Record from stopped starts the existing backing mix at the selected cursor")
+    let oldCapture = stopped.recordingURL!
+    stopped.recorder!.writer.append(mic); stopped.recorder!.writer.waitForPendingWrites()
+    stopped.restartFromLastStart()
+    try check(stopped.isRecording && stopped.player === restartedBacking && !FileManager.default.fileExists(atPath: oldCapture.path),
+              "Enter restarts the take and backing position without rebuilding the playback engine")
+    stopped.recorder!.writer.append(mic); stopped.recorder!.writer.waitForPendingWrites(); stopped.stop()
+    // There may be no backing material at all, or recording may start beyond it.
+    let empty = makeEditor(); empty.project.tracks[0].clips = []; empty.cursor = 3
+    try empty.startRecording()
+    try check(empty.isRecording && empty.isPlaying && empty.recordingStart == 3, "Empty projects and positions beyond the mix end still support recording")
+    empty.recorder!.writer.append(mic); empty.recorder!.writer.waitForPendingWrites(); empty.stop()
+}
