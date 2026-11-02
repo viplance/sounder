@@ -770,7 +770,12 @@ func runShuttleAudioTests() throws {
     try check(motion.speed(at: 0) == 0 && motion.speed(at: 0.5) == -1 && motion.speed(at: 1) == -4 && motion.speed(at: 20) == -8, "Paused shuttle starts at zero speed and accelerates continuously to a bounded 8x")
     try check(abs((motion.position(at: 1.001) - motion.position(at: 0.999)) / 0.002 - motion.speed(at: 1)) < 0.00001 && motion.position(at: 100) == 0, "Cursor motion integrates audible speed and clamps exactly at timeline boundaries")
     let brake = ShuttleMotion(start: 100, direction: -1, end: 200, initialSpeed: 1)
-    try check(brake.speed(at: 0) == 1 && brake.speed(at: 0.5) == 0 && brake.speed(at: 0.6) < 0 && brake.position(at: 0.5) > 100, "Rewind from Play brakes through zero before reversing, without changing the initial position or velocity")
+    try check(brake.speed(at: 0) == 1 && brake.speed(at: 0.25) == 0 && brake.speed(at: 0.35) < 0 && brake.position(at: 0.25) > 100, "Rewind from Play brakes through zero in 0.25 seconds before reversing, without changing the initial position or velocity")
+    try check(brake.speed(at: 0.75) == -1 && brake.speed(at: 1.25) == -4, "After braking, held rewind retains its original acceleration")
+    for time in [0.125, 0.2499, 0.25, 0.2501, 0.75, 1.8] {
+        let derivative = (brake.distance(at: time + 0.000001) - brake.distance(at: time - 0.000001)) / 0.000002
+        try check(abs(derivative - brake.speed(at: time)) < 0.00001, "Braking and reverse cursor distance match audible velocity at \(time)")
+    }
     let accelerate = ShuttleMotion(start: 100, direction: 1, end: 200, initialSpeed: 1)
     try check(accelerate.position(at: 0) == 100 && accelerate.speed(at: 0) == 1 && accelerate.speed(at: 0.1) > 1, "Forward shuttle starts at the existing speed immediately and smoothly accelerates")
     var calls = 0
@@ -842,7 +847,7 @@ extension AppDelegate {
         _ = handleShuttleShortcut(key(.keyDown, 123))
         try check(editor.player === originalPlayer && originalPlayer.isPlaying && originalPlayer.isShuttling && abs(editor.cursor - positionAtPress) < 0.03, "Rewind keeps the current engine/node playing and does not jump the cursor")
         try check(originalPlayer.shuttleUsesProcessedCache, "Rewind reuses processed audio from the preceding playback")
-        RunLoop.current.run(until: Date().addingTimeInterval(0.25)); editor.updateTransportPosition()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.12)); editor.updateTransportPosition()
         try check(editor.cursor > positionAtPress && centered(), "Rewind initially continues forward while braking, like an analog tape")
         RunLoop.current.run(until: Date().addingTimeInterval(0.55)); editor.updateTransportPosition()
         let first = editor.cursor
