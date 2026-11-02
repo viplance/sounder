@@ -904,3 +904,72 @@ extension AppDelegate {
         refresh()
     }
 }
+
+extension AppDelegate {
+    func verifyNumericInputUI() throws {
+        let clip = editor.project.tracks[0].clips[0]
+        let fragment = FragmentSettingsDialog(clip: clip, store: editor.audio, peak: 0.5)
+        let normalize = NormalizeDialog(level: -1), tempo = TempoDialog(bpm: 120)
+        let export = ExportOptionsController(settings: editor.project.defaultExportSettings)
+        let fields: [(NSTextField, String)] = [
+            (fragment.volume, "-6.25"), (fragment.pan, "+30,5"),
+            (fragment.fadeIn, "12.5"), (fragment.fadeOut, "0,75"),
+            (normalize.field, "-1,5"), (tempo.field, "125.5"),
+            (export.metadataFields[6], "2026"), (export.metadataFields[7], "3/12"), (export.metadataFields[8], "1/2")
+        ]
+        let alert = CompactSettingsAlert(); alert.messageText = "Numeric input"
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: fields.count * 32))
+        for (index, pair) in fields.enumerated() {
+            pair.0.removeFromSuperview(); pair.0.frame = NSRect(x: 0, y: index * 32, width: 280, height: 24); form.addSubview(pair.0)
+        }
+        alert.accessoryView = form; alert.addButton(withTitle: "Close")
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        var failure: String?
+        let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
+            do {
+                func check(_ condition: Bool, _ message: String) throws {
+                    guard condition else { throw SounderError.message(message) }
+                }
+                for (field, valid) in fields {
+                    alert.window.makeFirstResponder(field)
+                    guard let input = field.currentEditor() as? NSTextView else { throw SounderError.message("Numeric field did not start editing") }
+                    input.selectAll(nil); input.insertText(valid, replacementRange: input.selectedRange())
+                    try check(input.string == valid, "A numeric field rejected a valid decimal, sign or track number: \(valid)")
+                    input.setSelectedRange(NSRange(location: 1, length: 0))
+                    input.insertText("я", replacementRange: input.selectedRange())
+                    try check(input.string == valid, "A numeric field accepted a letter inserted in the middle")
+                    pasteboard.clearContents(); pasteboard.setString("12abc🎵", forType: .string)
+                    input.selectAll(nil); _ = input.readSelection(from: pasteboard, type: .string)
+                    try check(input.string == valid, "Pasting invalid text changed the numeric value")
+                    pasteboard.clearContents(); pasteboard.setString(valid, forType: .string)
+                    input.selectAll(nil); _ = input.readSelection(from: pasteboard, type: .string)
+                    try check(input.string == valid, "Pasting a valid number failed")
+                    input.selectAll(nil); input.deleteBackward(nil)
+                    try check(input.string.isEmpty, "Numeric fields must allow clearing and replacing the value")
+                    input.insertText(valid, replacementRange: input.selectedRange())
+                }
+                alert.window.makeFirstResponder(fragment.fadeIn)
+                let input = fragment.fadeIn.currentEditor() as! NSTextView
+                for invalid in ["-10", "+10", "1.2.3", "1,2.3", "NaN", "1e3", "1 000", "١٢"] {
+                    input.selectAll(nil); input.insertText(invalid, replacementRange: input.selectedRange())
+                    try check(input.string == "12.5", "Fade accepted an invalid unsigned decimal: \(invalid)")
+                }
+                alert.window.makeFirstResponder(fragment.volume)
+                let signed = fragment.volume.currentEditor() as! NSTextView
+                signed.selectAll(nil); signed.insertText("-", replacementRange: signed.selectedRange())
+                try check(signed.string == "-", "Typing a leading minus was blocked")
+                signed.insertText("3,5", replacementRange: signed.selectedRange())
+                try check(signed.string == "-3,5", "Typing a negative decimal step by step failed")
+                alert.window.makeFirstResponder(fragment.fadeOut)
+                fragment.fadeOut.stringValue = String(format: "%g", 0.0000001)
+                try check(!fragment.fadeOut.stringValue.contains("e"), "Small fade duration was displayed using blocked exponent syntax")
+            } catch { failure = error.localizedDescription }
+            NSApp.stopModal(withCode: .alertFirstButtonReturn)
+        }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        _ = alert.runModal()
+        if let failure { throw SounderError.message(failure) }
+        print("PASS: Actual numeric fields reject letters, malformed numbers and invalid pasted text; decimals, signs, editing, clearing and valid pastes work")
+    }
+}

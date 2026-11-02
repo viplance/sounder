@@ -23,7 +23,8 @@ final class TempoDialog: NSObject {
     private var estimator = TapTempo()
     private let now: () -> Double
     init(bpm: Double, now: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
-        self.now = now; field = NSTextField(string: String(format: "%g", bpm))
+        self.now = now; field = NSTextField(string: NumericInputFormatter.text(bpm))
+        field.formatter = NumericInputFormatter(.unsignedDecimal)
         super.init()
         alert.messageText = "Tempo"
         alert.minimumWidth = 340 / 1.5; alert.minimumButtonWidth = 80; alert.buttonSpacing = 8

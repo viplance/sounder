@@ -122,6 +122,8 @@ In **Export audio**, click **Metadata** at the left of the footer to reveal fiel
 
 If a time range is selected on the timeline, **Export audio** shows a **Selected range** checkbox at the bottom. Enable it to export just that interval in WAV, MP3 or OGG; leave it unchecked to export the whole project. Selected empty space is exported as silence, and effects retain the history preceding the selected start.
 
+Numeric fields reject letters and invalid pasted values as you type. Volume, Pan and Normalize accept a leading sign; decimals accept a dot or comma. Fade durations and BPM accept nonnegative values. Metadata year accepts digits, and track/disc numbers also accept the `3/12` form. Existing limits are checked when saving the dialog.
+
 Select fragments and press **N** (physical key, also Russian **т**) or choose **Normalize…** from FRAGMENTS, the Fragments system menu or the fragment context menu. Enter the desired maximum peak level in dBFS (for example -1, -2 or -3) and click **Process**. Each fragment is normalized independently, with linked stereo gain, without changing original files. The waveform, playback and export reflect the gain. Undo/Redo is supported, and the last processed level and fragment gain are saved with the project.
 
 Use **Mute / Unmute** in FRAGMENTS, the Fragments system menu or a fragment's context menu to toggle the selected fragments across tracks. Muted fragments are dimmed and excluded from playback and export; underlying unmuted fragments remain audible. A mixed selection is muted together; an entirely muted selection is unmuted together. The state supports Undo/Redo and is saved with the project and copied fragments. Track mute is independent.

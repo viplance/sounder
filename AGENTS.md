@@ -23,6 +23,10 @@
 - Track rename hit areas and I-beam regions cover only the rendered name text, not the rest of the header or the nesting arrow. Edit project and track names inline at the label position, without a popup, field background, border or automatic select-all. Activation must preserve text geometry and neighboring positions; grow the editor with the typed text, capped at its existing layout boundary. Limit project and track names to 100 Swift Characters (including spaces; do not split emoji). Scroll overflowing inline text horizontally to keep the insertion point and latest typed character visible after layout. Enter commits a nonempty trimmed name, Escape cancels, and leaving the field commits a valid name (an empty field retains the previous name). Keep transport shortcuts inactive while typing.
 - Project and track rename targets use the I-beam text cursor. Track MUTE and FX controls use the standard arrow cursor. Refresh timeline cursor regions when tracks, layout, or editing availability change.
 
+## Numeric fields
+
+- Use the shared NumericInputFormatter for app-owned numeric inputs. Reject invalid edits and pasted strings before they enter the field: ASCII digits, at most one decimal dot/comma, and an optional leading minus/plus only for signed fields (Volume, Pan, Normalize). Fade durations and BPM are unsigned decimals. Metadata Year accepts digits; track/disc numbers also allow one slash for number/total. Keep clearing, selection replacement, caret editing and intermediate signs/decimal separators usable. Preserve range validation on Save and native text shortcuts. Display small programmatic numbers without exponent notation. Names and descriptive metadata remain unrestricted text.
+
 ## Project audio format
 
 - Tracks inherit the project's sample rate, Mono/Stereo mode, and recording/export bit depth. Do not show per-track fragment counts or format captions.

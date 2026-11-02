@@ -1,6 +1,52 @@
 import AppKit
 import AVFoundation
 
+/// Reject invalid edits before they enter the shared AppKit field editor.
+/// Keep the text representation so intermediate signs and decimal separators
+/// remain editable; each dialog still validates its numeric range on Save.
+final class NumericInputFormatter: Formatter {
+    enum Kind { case unsignedDecimal, signedDecimal, integer, trackNumber }
+    let kind: Kind
+    init(_ kind: Kind) { self.kind = kind; super.init() }
+    required init?(coder: NSCoder) { return nil }
+    private func accepts(_ text: String) -> Bool {
+        var separator = false
+        for (index, scalar) in text.unicodeScalars.enumerated() {
+            if (48...57).contains(scalar.value) { continue }
+            if kind == .signedDecimal && index == 0 && (scalar == "-" || scalar == "+") { continue }
+            if !separator && ((kind == .trackNumber && scalar == "/") ||
+                ((kind == .signedDecimal || kind == .unsignedDecimal) && (scalar == "." || scalar == ","))) {
+                separator = true; continue
+            }
+            return false
+        }
+        return true
+    }
+    override func isPartialStringValid(_ partialString: String, newEditingString newString: AutoreleasingUnsafeMutablePointer<NSString?>?, errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?) -> Bool {
+        accepts(partialString)
+    }
+    override func string(for obj: Any?) -> String? {
+        guard let obj else { return "" }
+        if let text = obj as? String {
+            // Programmatic %g values can use exponents for tiny fade durations.
+            if text.lowercased().contains("e"), let number = Double(text), number.isFinite { return Self.text(number) }
+            return text
+        }
+        if let number = obj as? NSNumber { return Self.text(number.doubleValue) }
+        return nil
+    }
+    override func getObjectValue(_ obj: AutoreleasingUnsafeMutablePointer<AnyObject?>?, for string: String, errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?) -> Bool {
+        guard accepts(string) else { return false }
+        obj?.pointee = string as NSString; return true
+    }
+    static func text(_ value: Double) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = false; formatter.maximumFractionDigits = 16
+        return formatter.string(from: NSNumber(value: value)) ?? "0"
+    }
+}
+
 final class PointerButton: NSButton {
     private var pointerTracking: NSTrackingArea?
     private(set) var isHovering = false
@@ -189,7 +235,8 @@ final class NormalizeDialog {
     let alert = CompactSettingsAlert()
     let field: NSTextField
     init(level: Double) {
-        field = NSTextField(string: String(format: "%g", level))
+        field = NSTextField(string: NumericInputFormatter.text(level))
+        field.formatter = NumericInputFormatter(.signedDecimal)
         alert.messageText = "Normalize"
         let form = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 28))
         let label = NSTextField(labelWithString: "Maximum level")
@@ -221,6 +268,8 @@ final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
     init(clip: Clip, store: AudioStore, peak: Double? = nil) {
         self.clip = clip; self.store = store; self.peak = peak
         super.init()
+        volume.formatter = NumericInputFormatter(.signedDecimal); pan.formatter = NumericInputFormatter(.signedDecimal)
+        fadeIn.formatter = NumericInputFormatter(.unsignedDecimal); fadeOut.formatter = NumericInputFormatter(.unsignedDecimal)
         alert.messageText = "Edit fragment"
         let form = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 190))
         for (title, y) in [("Volume", CGFloat(156)), ("Pan", 112), ("Fade in", 56), ("Fade out", 12)] {
@@ -465,6 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--track-solo-ui-test") { try verifyTrackSoloUI() }
             if CommandLine.arguments.contains("--tempo-snapping-ui-test") { try verifyTempoSnappingUI() }
             if CommandLine.arguments.contains("--fragment-settings-ui-test") { try verifyFragmentSettingsUI() }
+            if CommandLine.arguments.contains("--numeric-input-ui-test") { try verifyNumericInputUI() }
             if CommandLine.arguments.contains("--fragment-mute-ui-test") { try verifyFragmentMuteUI() }
             if CommandLine.arguments.contains("--normalize-ui-test") { try verifyNormalizationUI() }
             if CommandLine.arguments.contains("--stop-return-ui-test") { try verifyStopReturnUI() }

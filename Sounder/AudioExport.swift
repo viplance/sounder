@@ -103,6 +103,8 @@ final class ExportOptionsController: NSObject {
             label.font = .systemFont(ofSize: 11); label.textColor = .secondaryLabelColor
             label.frame = NSRect(x: x, y: y + 28, width: 280, height: 16)
             let input = NSTextField(string: metadata[keyPath: field.key])
+            if field.tag == "DATE" { input.formatter = NumericInputFormatter(.integer) }
+            if field.tag == "TRACKNUMBER" || field.tag == "DISCNUMBER" { input.formatter = NumericInputFormatter(.trackNumber) }
             input.frame = NSRect(x: x, y: y, width: 280, height: 24)
             input.setAccessibilityLabel(field.label)
             metadataPanel.addSubview(label); metadataPanel.addSubview(input); metadataFields.append(input)
