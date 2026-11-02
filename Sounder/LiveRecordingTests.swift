@@ -223,3 +223,184 @@ func runOverdubTests() throws {
     try check(empty.isRecording && empty.isPlaying && empty.recordingStart == 3, "Empty projects and positions beyond the mix end still support recording")
     empty.recorder!.writer.append(mic); empty.recorder!.writer.waitForPendingWrites(); empty.stop()
 }
+
+func runLoopRecordingTests() throws {
+    func check(_ condition: Bool, _ message: String) throws {
+        guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let fm = FileManager.default
+    let directory = fm.temporaryDirectory.appendingPathComponent("SounderLoopRecording-" + UUID().uuidString)
+    defer { try? fm.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+    for format in [ProjectAudioFormat(bitDepth: 32), ProjectAudioFormat(sampleRate: 44_100, channels: 1, bitDepth: 16)] {
+        store.configure(format)
+        let url = store.freshURL(), referenceURL = store.freshURL()
+        let loop = try RecordingWriter(url: url, format: format, inputFormat: input)
+        try loop.configureLoop(0.25..<1.25, start: 0)
+        let reference = try RecordingWriter(url: referenceURL, format: format, inputFormat: input)
+        var preview: [[Float]] = Array(repeating: [], count: format.channels)
+        func merge(_ update: RecordingUpdate) {
+            guard let state = update.loop else { return }
+            let count = (state.frameCount + 127) / 128
+            if state.resetWaveform { preview = Array(repeating: Array(repeating: 0, count: count), count: format.channels) }
+            for channel in preview.indices where preview[channel].count < count {
+                preview[channel].append(contentsOf: repeatElement(0, count: count - preview[channel].count))
+            }
+            for (index, peaks) in state.peakPatches where index < count { for channel in peaks.indices { preview[channel][index] = peaks[channel] } }
+        }
+        try check(!fm.fileExists(atPath: url.path), "Loop capture does not create a WAV when configured")
+        var frame = 0
+        while frame < 144_000 {
+            let size = min(777, 144_000 - frame)
+            let buffer = captureTestBuffer(format: input, start: frame, frames: size)
+            loop.append(buffer); reference.append(buffer); frame += size
+            loop.waitForPendingWrites(); reference.waitForPendingWrites()
+            let update = loop.consumeUpdate(); if let failure = update.failure { throw failure }; merge(update)
+        }
+        try check(!fm.fileExists(atPath: url.path) && loop.isLoopRecording, "All loop passes remain in memory until Stop")
+        try check(loop.retainedLoopFrames <= Int(format.sampleRate * 1.25) + 8192, "Loop memory retains the lead-in and one period, without accumulating passes")
+        if let failure = reference.finish() { throw failure }
+        if let failure = loop.finish() { throw failure }
+        merge(loop.consumeUpdate())
+        let linear = try AudioStore.decode(referenceURL, sampleRate: format.sampleRate)
+        let saved = try AudioStore.decode(url, sampleRate: format.sampleRate)
+        let lower = Int((format.sampleRate * 0.25).rounded()), upper = Int((format.sampleRate * 1.25).rounded())
+        var expected = Array(repeating: Array(repeating: Float(0), count: upper), count: format.channels), position = 0
+        var previousPass = expected, wrapped = false
+        let fade = Int((format.sampleRate * 0.01).rounded())
+        for i in 0..<linear.frameCount {
+            let gain: Float = wrapped ? Float(min(1, Double(position - lower) / Double(fade - 1))) : 1
+            for channel in expected.indices {
+                expected[channel][position] = expected[channel][position] * (1 - gain) + linear.channels[channel][i] * gain
+            }
+            position += 1
+            if position == upper { position = lower; wrapped = true; previousPass = expected }
+        }
+        if wrapped, position > lower {
+            let first = max(lower, position - fade)
+            for frame in first..<position {
+                let gain = Float(position - 1 - frame) / Float(max(1, position - first - 1))
+                for channel in expected.indices { expected[channel][frame] = expected[channel][frame] * gain + previousPass[channel][frame] * (1 - gain) }
+            }
+        }
+        let error = zip(saved.channels, expected).map { zip($0, $1).map { abs($0 - $1) }.max() ?? 0 }.max() ?? 0
+        try check(saved.frameCount == upper && error < (format.bitDepth == 16 ? 0.00006 : 0.000001), "Stop preserves the original lead-in and merges the latest loop with 10 ms crossfades at both seams (\(format.label))")
+        try check(zip(saved.channels, linear.channels).allSatisfy { zip($0.prefix(lower), $1.prefix(lower)).allSatisfy { abs($0 - $1) < 0.000001 } }, "Repeated loops leave every sample before the loop unchanged")
+        let file = try AVAudioFile(forReading: url)
+        try check(file.fileFormat.streamDescription.pointee.mBitsPerChannel == format.bitDepth && Int(file.fileFormat.channelCount) == format.channels, "Final loop WAV uses the project's channel count and bit depth")
+        let peaks = AudioData(channels: expected).channelPeaks
+        let peakError = zip(peaks, preview).map { zip($0, $1).map { abs($0 - $1) }.max() ?? 0 }.max() ?? 0
+        try check(zip(peaks, preview).allSatisfy { $0.count == $1.count } && peakError < 0.00004, "Incremental overwritten waveforms match the final stereo/mono PCM")
+        let bytes = try Data(contentsOf: url)
+        _ = loop.finish(); loop.append(captureTestBuffer(format: input, start: 0, frames: 128)); loop.waitForPendingWrites()
+        try check(try Data(contentsOf: url) == bytes, "Repeated Stop and late input cannot append another pass to the final WAV")
+    }
+    let format = ProjectAudioFormat(bitDepth: 32)
+    store.configure(format)
+    for (origin, count) in [(0.05, 2400), (0.4, 960)] {
+        let url = store.freshURL()
+        let writer = try RecordingWriter(url: url, format: format, inputFormat: input)
+        try writer.configureLoop(0.1..<0.3, start: origin)
+        writer.append(captureTestBuffer(format: input, start: 10_000, frames: count)); writer.waitForPendingWrites()
+        let state = writer.consumeUpdate().loop!
+        try check(!fm.fileExists(atPath: url.path) && state.startFrame == Int((origin * 48_000).rounded()) && state.frameCount == count,
+                  "Loop capture at \(origin) retains its actual first-pass interval in RAM without relocating")
+        if let failure = writer.finish() { throw failure }
+        try check(try AVAudioFile(forReading: url).length == AVAudioFramePosition(count), "Stopping before a first wrap writes only the captured interval")
+    }
+    let bedURL = store.freshURL()
+    try store.write(AudioSignal(channels: [Array(repeating: 0.2, count: 96_000), Array(repeating: 0.1, count: 96_000)]), to: bedURL, bitDepth: 32)
+    let bed = Track(name: "Backing", clips: [Clip(name: "Bed", source: bedURL.path, start: 0, duration: 2, order: 1)])
+    let mic = Track(name: "Mic")
+    func editor() -> Editor {
+        let result = Editor(store: store, makeRecorder: { url, format in try LiveRecorder(url: url, format: format, inputFormat: input) }, makePlayback: { graph, format, start in
+            let live = LivePlayback(graph: graph, format: format, start: start)
+            try live.engine.enableManualRenderingMode(.offline, format: AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!, maximumFrameCount: 512)
+            return live
+        })
+        result.project = Project(tracks: [bed, mic], audioFormat: format, loopEnabled: true)
+        result.selectedTrack = mic.id; result.range = 0.1...0.3; return result
+    }
+    let session = editor()
+    try session.startRecording()
+    let capture = session.recorder!, backing = session.player!, engine = backing.engine, node = backing.node
+    let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+    let rendered = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+    var bedPeak: Float = 0
+    for n in 0..<94 {
+        capture.writer.append(captureTestBuffer(format: input, start: n * 512, frames: 512))
+        capture.writer.waitForPendingWrites()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.001)); backing.queue.sync {}
+        guard try backing.engine.renderOffline(512, to: rendered) == .success else { throw SounderError.message("Cannot render cyclic backing") }
+        for i in 0..<512 { bedPeak = max(bedPeak, abs(rendered.floatChannelData![0][i])) }
+        session.updateRecordingWaveform()
+    }
+    try check(session.isRecording && session.player === backing && backing.engine === engine && backing.node === node && bedPeak > 0.19 && (0.1..<0.3).contains(backing.currentTime), "Loop recording keeps the same backing engine playing and cycling")
+    try check(session.recordingStart == 0 && session.recordingEnd == 0.3 && (0.1..<0.3).contains(session.cursor) && !session.recordingPeaks.isEmpty, "Live recording cursor wraps while the original lead-in and retained period stay visible")
+    try check(!fm.fileExists(atPath: capture.url.path) && session.project.tracks[1].clips.isEmpty && session.project.tracks[1].nextTakeNumber == 1 && session.undoStack.isEmpty, "Repeated recording passes create no files, fragments, Undo entries or take numbers")
+    session.playPause()
+    let clip = session.project.tracks[1].clips[0]
+    try check(!session.isRecording && session.cursor == 0 && clip.start == 0 && abs(clip.duration - 0.3) < 1e-9 && clip.name == "Mic 1" && session.undoStack.count == 1, "Space commits one final loop fragment including its lead-in and returns to the original recording start")
+    try check(fm.fileExists(atPath: clip.source), "Only stopping loop capture creates its final audio file")
+    session.cursor = 0
+    try session.startRecording()
+    let discarded = session.recorder!, playback = session.player!, history = session.undoStack.count
+    discarded.writer.append(captureTestBuffer(format: input, start: 0, frames: 24_000)); discarded.writer.waitForPendingWrites()
+    session.updateRecordingWaveform(); session.restartFromLastStart()
+    try check(session.isRecording && session.player === playback && session.recorder !== discarded && !fm.fileExists(atPath: discarded.url.path) && session.undoStack.count == history, "Enter discards loop memory and restarts from the original position without writing a take")
+    session.recorder!.writer.append(captureTestBuffer(format: input, start: 0, frames: 24_000)); session.recorder!.writer.waitForPendingWrites()
+    session.stopAndReturnToStart()
+    try check(session.project.tracks[1].clips.count == 2 && session.project.tracks[1].nextTakeNumber == 3, "Only finalized loop recordings consume take numbers")
+    let empty = editor(); empty.project.tracks[0].clips = []
+    try empty.startRecording()
+    try check(empty.recorder!.writer.isLoopRecording, "An empty project can record a selected Loop period")
+    empty.recorder!.writer.append(captureTestBuffer(format: input, start: 0, frames: 24_000)); empty.recorder!.writer.waitForPendingWrites()
+    empty.stop()
+    try check(empty.project.tracks[1].clips.count == 1, "Selected-period loop capture commits correctly without pre-existing music")
+}
+
+extension AppDelegate {
+    func verifyLoopRecordingUI() throws {
+        let original = editor.project, originalRange = editor.range, originalSelection = editor.selectedTrack
+        let format = AVAudioFormat(standardFormatWithSampleRate: editor.audio.sampleRate, channels: 2)!
+        let recorder = try LiveRecorder(url: editor.audio.freshURL(), format: editor.project.audioFormat, inputFormat: format)
+        defer {
+            editor.stop(); editor.project = original; editor.range = originalRange; editor.selectedTrack = originalSelection
+            editor.cursor = 0; editor.undoStack = []; editor.redoStack = []; editor.dirty = false
+            try? FileManager.default.removeItem(at: recorder.url); refresh()
+        }
+        editor.project.loopEnabled = true; editor.range = 0.5...0.7; editor.cursor = 0
+        try recorder.configureLoop(0.5..<0.7, start: 0); try recorder.start(); editor.activateRecording(recorder)
+        func signal(frames: Int, amplitude: Float) -> AVAudioPCMBuffer {
+            let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))!
+            input.frameLength = AVAudioFrameCount(frames)
+            for frame in 0..<frames {
+                let sample = Float(sin(Double(frame) * 2 * .pi * 330 / format.sampleRate)) * amplitude
+                input.floatChannelData![0][frame] = sample; input.floatChannelData![1][frame] = -sample * 0.5
+            }
+            return input
+        }
+        recorder.writer.append(signal(frames: Int(format.sampleRate * 0.7), amplitude: 0.6))
+        recorder.writer.waitForPendingWrites(); editor.updateRecordingWaveform()
+        recorder.writer.append(signal(frames: Int(format.sampleRate * 0.06), amplitude: 0.08))
+        recorder.writer.waitForPendingWrites(); editor.updateRecordingWaveform(); refresh()
+        guard editor.isRecording, abs(editor.recordingStart) < 1e-8, abs(editor.recordingEnd - 0.7) < 1e-8,
+              abs(editor.cursor - 0.56) < 0.002, !FileManager.default.fileExists(atPath: recorder.url.path) else { throw SounderError.message("Loop recording preview or memory-only capture is incorrect") }
+        let middle = Int(0.52 * format.sampleRate / 128)..<Int(0.54 * format.sampleRate / 128)
+        guard editor.recordingChannelPeaks[0][middle].max() ?? 0 < 0.081,
+              editor.recordingChannelPeaks[0].prefix(10).max() ?? 0 > 0.59,
+              editor.recordingChannelPeaks[0].suffix(10).max() ?? 0 > 0.59 else { throw SounderError.message("Loop preview did not replace its prefix while preserving the old tail") }
+        if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count, let view = window.contentView,
+           let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.effectiveAppearance.performAsCurrentDrawingAppearance { view.cacheDisplay(in: view.bounds, to: bitmap) }
+            let url = URL(fileURLWithPath: CommandLine.arguments[i + 1]).deletingPathExtension().appendingPathExtension("loop-recording.png")
+            try bitmap.representation(using: .png, properties: [:])?.write(to: url)
+        }
+        let count = editor.project.tracks.flatMap(\.clips).count
+        editor.playPause()
+        guard !editor.isRecording, editor.project.tracks.flatMap(\.clips).count == count + 1,
+              editor.cursor == 0, FileManager.default.fileExists(atPath: recorder.url.path) else { throw SounderError.message("Space did not commit exactly one loop fragment") }
+        print("PASS: Loop recording displays the full period with its overwritten prefix and retained tail, creates no file while active, and Space commits one fragment")
+    }
+}

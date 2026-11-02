@@ -332,6 +332,9 @@ final class LivePlayback {
     private var shuttleRenderer: ShuttlePlayback?
     private var renderingNormal = true
     private var recordingPlayback = false
+    private var loopFrames: Range<Int>?
+    private var loopArmed = false
+    private var loopHasWrapped = false
     private var metronomeFadeStart = 0
     private let returnQueue = DispatchQueue(label: "Sounder.return-to-play", qos: .userInitiated)
     private let returnLock = NSLock()
@@ -371,7 +374,9 @@ final class LivePlayback {
         }
         // Output time stays monotonic; source time may reverse smoothly.
         transportLock.lock(); defer { transportLock.unlock() }
-        if let segment = transportMotions.last(where: { $0.frame <= lastKnownFrame }) {
+        if let index = transportMotions.lastIndex(where: { $0.frame <= lastKnownFrame }) {
+            let segment = transportMotions[index]
+            if index > 0 { transportMotions.removeFirst(index) }
             return segment.motion.position(at: Double(lastKnownFrame - segment.frame) / format.sampleRate)
         }
         return Double(recordingPlayback ? firstFrame + lastKnownFrame : min(graph.totalFrames, firstFrame + lastKnownFrame)) / format.sampleRate
@@ -426,6 +431,7 @@ final class LivePlayback {
         let pcmFormat = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
         // Warm effects from project zero and discard compensated latency when seeking.
         try queue.sync {
+            resetLoopPosition(nextFrame)
             let skip = nextFrame + graph.latency
             while graph.position < skip { _ = try graph.render(frames: min(512, skip - graph.position)) }
             running = true
@@ -445,7 +451,7 @@ final class LivePlayback {
             if pausing { return }
             pausing = true; pauseComplete = false
             let position = shuttleRenderer.map { Int(($0.renderedPosition * format.sampleRate).rounded()) } ?? nextFrame
-            pauseFadeFrames = min(Int(format.sampleRate * 0.010), max(0, graph.totalFrames - position))
+            pauseFadeFrames = loopArmed && loopFrames != nil && !recordingPlayback ? Int(format.sampleRate * 0.010) : min(Int(format.sampleRate * 0.010), max(0, graph.totalFrames - position))
             pauseFadeFrame = 0
             pausePosition = Double(position + pauseFadeFrames) / format.sampleRate
             guard running else { try finishPause(); return }
@@ -485,6 +491,7 @@ final class LivePlayback {
         streamGeneration += 1; scheduled = 0; pausing = false; pauseComplete = false
         if shuttleRenderer != nil || graph.position != frame + graph.latency { try graph.seek(to: frame) }
         shuttleRenderer = nil; renderingNormal = true; nextFrame = frame
+        resetLoopPosition(frame)
         seekFade = []; seekFadeFrame = 0; resumeFadeFrame = 0; meterBuffer.clear()
         let motion = ShuttleMotion(start: Double(frame) / format.sampleRate, direction: 1, end: Double(graph.totalFrames) / format.sampleRate, initialSpeed: 1, target: 1)
         transportLock.lock(); transportMotions.append((outputFrames, motion)); seekRequest = nil; transportLock.unlock()
@@ -501,6 +508,7 @@ final class LivePlayback {
         if shuttleRenderer != nil || graph.position != frame + graph.latency { try graph.seek(to: frame) }
         shuttleRenderer = nil; renderingNormal = true
         nextFrame = frame; outputFrames = 0
+        resetLoopPosition(frame)
         transportLock.lock()
         firstFrame = frame; lastKnownFrame = 0; transportMotions = []; seekRequest = nil
         transportLock.unlock()
@@ -575,6 +583,7 @@ final class LivePlayback {
                 self.seekFadeFrame = 0
                 try self.graph.seek(to: target)
                 self.shuttleRenderer = nil; self.renderingNormal = true; self.nextFrame = target
+                self.resetLoopPosition(target)
                 self.meterBuffer.clear()
                 let motion = ShuttleMotion(start: Double(target) / self.format.sampleRate, direction: 1, end: Double(self.recordingPlayback ? Int.max / 4 : self.graph.totalFrames) / self.format.sampleRate, initialSpeed: 1, target: 1)
                 self.transportLock.lock()
@@ -662,6 +671,16 @@ final class LivePlayback {
         guard running else { return }
         let requestedFrames = pausing ? min(512, pauseFadeFrames - pauseFadeFrame) : 512
         guard requestedFrames > 0 else { return }
+        if let renderer = shuttleRenderer, renderingNormal, !isShuttling, loopFrames != nil, renderer.sourceTransitionComplete {
+            nextFrame = max(0, Int((renderer.renderedPosition * format.sampleRate).rounded()))
+            seekFade = []; seekFadeFrame = 0
+            if let loopFrames, loopFrames.contains(nextFrame),
+               let continuation = try renderer.render(frames: min(Int(format.sampleRate * 0.010), loopFrames.upperBound - nextFrame)) {
+                seekFade = (0..<Int(continuation.frameLength)).flatMap { i in (0..<format.channels).map { continuation.floatChannelData![$0][i] } }
+            }
+            try graph.seek(to: nextFrame)
+            shuttleRenderer = nil; resetLoopPosition(nextFrame); appendLoopPosition(nextFrame)
+        }
         if let renderer = shuttleRenderer {
             guard let buffer = try renderer.render(frames: requestedFrames) else {
                 if scheduled == 0 { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(nil) } }
@@ -678,39 +697,66 @@ final class LivePlayback {
                         buffer.floatChannelData![ch][i] = format.bitDepth == 32 ? value : min(scale - 1, (value * scale).rounded()) / scale
                     }
                 }
-                meterBuffer.append(frame: Int(renderer.renderedPosition * format.sampleRate), peaks: graph.trackPeaks)
+                meterBuffer.append(frame: outputFrames + Int(buffer.frameLength), peaks: graph.trackPeaks)
             }
             outputFrames += Int(buffer.frameLength); scheduled += 1
             let pauseFinal = advanceTransportFade(frames: Int(buffer.frameLength))
             schedule(buffer, last: renderer.reachedEnd, format: pcmFormat, pauseFinal: pauseFinal)
             return
         }
-        let frames = recordingPlayback ? requestedFrames : min(requestedFrames, graph.totalFrames - nextFrame)
+        let loop = !isShuttling && loopArmed ? loopFrames : nil
+        let frames = recordingPlayback || loop != nil ? requestedFrames : min(requestedFrames, graph.totalFrames - nextFrame)
         guard frames > 0 else {
             if scheduled == 0 { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(nil) } }
             return
         }
-        let samples = try graph.render(frames: frames)
+        if loop != nil { appendLoopPosition(nextFrame) }
+        var samples: [Float] = [], positions: [Int] = []
+        var loopGains = [Float](repeating: 1, count: frames)
+        samples.reserveCapacity(frames * format.channels); positions.reserveCapacity(frames)
+        while positions.count < frames {
+            if let loop, nextFrame >= loop.upperBound {
+                try graph.seek(to: loop.lowerBound)
+                nextFrame = loop.lowerBound; loopHasWrapped = true; seekFade = []; seekFadeFrame = 0
+                appendLoopPosition(nextFrame, at: outputFrames + positions.count)
+            }
+            let count = min(frames - positions.count, loop.map { $0.upperBound - nextFrame } ?? frames)
+            samples.append(contentsOf: try graph.render(frames: count))
+            if let loop {
+                let fade = Double(max(1, min(Int(format.sampleRate * 0.010), loop.count / 2)))
+                for i in 0..<count {
+                    // The first pass may begin before the selected period. Do
+                    // not silence that lead-in or dip on entering its left edge.
+                    let outgoing = Double(loop.upperBound - 1 - nextFrame - i) / fade
+                    let incoming = loopHasWrapped ? Double(nextFrame + i - loop.lowerBound) / fade : 1
+                    loopGains[positions.count + i] = Float(min(1, max(0, min(incoming, outgoing))))
+                }
+            }
+            positions.append(contentsOf: nextFrame..<(nextFrame + count))
+            meterBuffer.append(frame: outputFrames + positions.count, peaks: graph.trackPeaks)
+            nextFrame += count
+        }
         let buffer = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(frames))!
         buffer.frameLength = AVAudioFrameCount(frames)
         let scale: Float = format.bitDepth == 16 ? 32768 : 8388608
         for frame in 0..<frames { for channel in 0..<format.channels {
-            let click = metronomeEnabled ? MetronomeClick.sample(frame: Int64(nextFrame + frame), sampleRate: format.sampleRate, bpm: tempo) : 0
+            let click = metronomeEnabled ? MetronomeClick.sample(frame: Int64(positions[frame]), sampleRate: format.sampleRate, bpm: tempo) : 0
             var value = samples[frame * format.channels + channel] + click
             let fadeFrame = seekFadeFrame + frame
             if fadeFrame < seekFade.count / format.channels {
                 let blend = Float(fadeFrame) / Float(max(1, seekFade.count / format.channels - 1))
                 value = seekFade[fadeFrame * format.channels + channel] * (1 - blend) + value * blend
             }
-            value = min(1, max(-1, value * transportGain(at: frame)))
+            let gain = transportGain(at: frame) * loopGains[frame]
+            value = min(1, max(-1, value * gain))
             buffer.floatChannelData![channel][frame] = format.bitDepth == 32 ? value : min(scale - 1, (value * scale).rounded()) / scale
         } }
         seekFadeFrame += frames
         if seekFadeFrame >= seekFade.count / format.channels { seekFade = [] }
-        meterBuffer.append(frame: nextFrame + frames, peaks: graph.trackPeaks)
-        nextFrame += frames; outputFrames += frames; scheduled += 1
+        outputFrames += frames; scheduled += 1
+        if pausing, loop != nil { pausePosition = Double(nextFrame) / format.sampleRate }
         let pauseFinal = advanceTransportFade(frames: frames)
-        schedule(buffer, last: !recordingPlayback && nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal)
+        schedule(buffer, last: !recordingPlayback && loop == nil && nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal)
     }
     private func schedule(_ buffer: AVAudioPCMBuffer, last: Bool, format pcmFormat: AVAudioFormat, pauseFinal: Bool = false) {
         let generation = streamGeneration
@@ -732,7 +778,39 @@ final class LivePlayback {
         }
     }
     func consumeTrackPeaks(at time: Double) -> [UUID: StereoLevels] {
-        meterBuffer.consume(through: Int(time * format.sampleRate))
+        _ = currentTime
+        return meterBuffer.consume(through: lastKnownFrame)
+    }
+    private func resetLoopPosition(_ frame: Int) {
+        loopArmed = loopFrames.map { frame <= $0.upperBound } ?? false
+        loopHasWrapped = loopFrames.map { frame == $0.lowerBound } ?? false
+    }
+    private func appendLoopPosition(_ frame: Int, at outputFrame: Int? = nil) {
+        let motion = ShuttleMotion(start: Double(frame) / format.sampleRate, direction: 1, end: Double(Int.max / 4) / format.sampleRate, initialSpeed: 1, target: 1)
+        transportLock.lock(); transportMotions.append((outputFrame ?? outputFrames, motion)); transportLock.unlock()
+    }
+    func setLoop(_ range: Range<Double>?) {
+        let frames: Range<Int>? = range.flatMap {
+            guard $0.lowerBound.isFinite, $0.upperBound.isFinite, $0.lowerBound >= 0,
+                  $0.upperBound * format.sampleRate < Double(Int.max / 4) else { return nil }
+            let first = Int(($0.lowerBound * format.sampleRate).rounded()), last = Int(($0.upperBound * format.sampleRate).rounded())
+            return last > first ? first..<last : nil
+        }
+        queue.async {
+            self.loopFrames = frames
+            self.resetLoopPosition(self.nextFrame)
+            // Top up a near-end queue immediately when Loop is enabled live.
+            if frames != nil, self.running, !self.isPaused, self.engine.isRunning {
+                let pcm = AVAudioFormat(standardFormatWithSampleRate: self.format.sampleRate, channels: AVAudioChannelCount(self.format.channels))!
+                do {
+                    while self.scheduled < max(3, Int(ceil(self.format.sampleRate / 48_000 * 3))) {
+                        let before = self.scheduled
+                        try self.enqueue(format: pcm)
+                        if self.scheduled == before { break }
+                    }
+                } catch { self.running = false; DispatchQueue.main.async { self.finished?(error) } }
+            }
+        }
     }
     func setMetronome(tempo: Double, enabled: Bool) {
         queue.async { self.tempo = tempo; self.metronomeEnabled = enabled }
@@ -951,6 +1029,7 @@ final class ShuttlePlayback {
     var renderedPosition: Double { motion.position(at: Double(outputFrame - motionStartFrame) / format.sampleRate) }
     var renderedSpeed: Double { motion.speed(at: Double(outputFrame - motionStartFrame) / format.sampleRate) }
     var hasSettled: Bool { motion.settled(at: Double(outputFrame - motionStartFrame) / format.sampleRate) }
+    var sourceTransitionComplete: Bool { hasSettled && outputFrame - sourceChangeFrame >= Int(format.sampleRate * 0.010) }
     var reachedEnd: Bool { terminal || motion.reachedBoundary(at: Double(outputFrame - motionStartFrame) / format.sampleRate) }
     var finished: ((Error?) -> Void)?
     private let cancellation = NSLock()

@@ -9,7 +9,7 @@ final class Editor: NSObject {
     var selection = Set<UUID>()
     var cursor = 0.0
     private(set) var lastPlaybackStart: Double?
-    var range: ClosedRange<Double>?
+    var range: ClosedRange<Double>? { didSet { updateLoop() } }
     var zoom = 70.0
     var changed: (() -> Void)?
     let notifications: ToastCenter
@@ -54,6 +54,8 @@ final class Editor: NSObject {
     var recordingURL: URL?
     var recordingTrack: UUID?
     var recordingStart = 0.0
+    var recordingEnd = 0.0
+    private var recordingOrigin = 0.0
     private var pendingRecordedSources = Set<String>()
     private var recordedSourceCleanup: [String: String] = [:]
     var timer: Timer?
@@ -374,10 +376,12 @@ final class Editor: NSObject {
             else { startPlayback(forRecording: true) }
             guard let player else { throw SounderError.message("Cannot start recording playback") }
             let recorder = try makeRecorder(url, project.audioFormat)
-            recorder.metronome.configure(bpm: project.tempo, enabled: false, start: cursor)
+            let origin = position ?? (wasPlaying ? player.currentTime : player.start)
+            if let loopRange { try recorder.configureLoop(loopRange, start: origin) }
+            recorder.metronome.configure(bpm: project.tempo, enabled: false, start: origin)
             try recorder.start()
             if !wasPlaying { player.beginPreparedPlayback() }
-            cursor = position ?? (wasPlaying ? player.currentTime : player.start)
+            cursor = recorder.writer.isLoopRecording ? origin : (position ?? (wasPlaying ? player.currentTime : player.start))
             activateRecording(recorder)
         } catch {
             if wasPlaying { player?.cancelRecordingPreparation() } else { stopPlayback() }
@@ -386,19 +390,19 @@ final class Editor: NSObject {
         }
     }
     private func clearRecordingState() {
-        recordingURL = nil; recordingTrack = nil
+        recordingURL = nil; recordingTrack = nil; recordingEnd = 0
         recordingPeaks = []; recordingPartialPeak = nil
         recordingChannelPeaks = []; recordingPartialChannelPeaks = []
     }
     private func restartRecording() {
         guard let recorder else { return }
-        let start = recordingStart, track = recordingTrack, url = recordingURL
+        let start = recordingOrigin, track = recordingTrack, url = recordingURL
         timer?.invalidate(); timer = nil
-        _ = recorder.stop(); self.recorder = nil
+        _ = recorder.stop(save: false); self.recorder = nil
         clearRecordingState()
         cursor = start; selectedTrack = track
         do {
-            if let url { try FileManager.default.removeItem(at: url) }
+            if let url, FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
             player?.seek(to: start)
             try startRecording(at: start)
         } catch { stopPlayback(); self.error(error) }
@@ -409,6 +413,7 @@ final class Editor: NSObject {
         recordingPeaks = []; recordingPartialPeak = nil
         recordingChannelPeaks = Array(repeating: [], count: recorder.format.channels); recordingPartialChannelPeaks = Array(repeating: nil, count: recorder.format.channels)
         recordingURL = recorder.url; recordingTrack = selectedTrack; recordingStart = cursor
+        recordingOrigin = cursor; recordingEnd = cursor
         self.recorder = recorder; startTimer(); update()
     }
     func showsTrackMeter(_ id: UUID) -> Bool { isPlaying || isRecording || (trackMeters[id]?.peak ?? 0) > 0 }
@@ -427,15 +432,38 @@ final class Editor: NSObject {
             self.updateTrackMeters([:]); self.changed?()
         }
     }
-    func updateRecordingWaveform() {
+    func updateRecordingWaveform(handleFailure: Bool = true) {
         guard let recorder else { return }
         let update = recorder.writer.consumeUpdate()
-        recordingPeaks.append(contentsOf: update.peaks); recordingPartialPeak = update.partialPeak
-        for channel in update.channelPeaks.indices { recordingChannelPeaks[channel].append(contentsOf: update.channelPeaks[channel]) }
-        recordingPartialChannelPeaks = update.partialChannelPeaks
-        cursor = recordingStart + Double(update.frames) / recorder.format.sampleRate
+        if let loop = update.loop {
+            let count = (loop.frameCount + 127) / 128
+            if loop.resetWaveform {
+                recordingChannelPeaks = Array(repeating: Array(repeating: 0, count: count), count: recorder.format.channels)
+                recordingPeaks = Array(repeating: 0, count: count)
+            } else if recordingPeaks.count < count {
+                recordingPeaks.append(contentsOf: repeatElement(0, count: count - recordingPeaks.count))
+                for channel in recordingChannelPeaks.indices {
+                    recordingChannelPeaks[channel].append(contentsOf: repeatElement(0, count: count - recordingChannelPeaks[channel].count))
+                }
+            }
+            for (index, peaks) in loop.peakPatches where index < count {
+                for channel in peaks.indices { recordingChannelPeaks[channel][index] = peaks[channel] }
+                recordingPeaks[index] = peaks.max() ?? 0
+            }
+            recordingPartialPeak = nil; recordingPartialChannelPeaks = Array(repeating: nil, count: recorder.format.channels)
+            recordingStart = Double(loop.startFrame) / recorder.format.sampleRate
+            recordingEnd = Double(loop.startFrame + loop.frameCount) / recorder.format.sampleRate
+            cursor = Double(loop.cursorFrame) / recorder.format.sampleRate
+        } else {
+            recordingPeaks.append(contentsOf: update.peaks); recordingPartialPeak = update.partialPeak
+            for channel in update.channelPeaks.indices { recordingChannelPeaks[channel].append(contentsOf: update.channelPeaks[channel]) }
+            recordingPartialChannelPeaks = update.partialChannelPeaks
+            cursor = recordingStart + Double(update.frames) / recorder.format.sampleRate
+            recordingEnd = cursor
+        }
         if let recordingTrack {
             func channelPeak(_ channel: Int) -> Float {
+                if update.loop != nil { return update.partialChannelPeaks[min(channel, update.partialChannelPeaks.count - 1)] ?? 0 }
                 guard !update.channelPeaks.isEmpty else { return 0 }
                 let index = min(channel, update.channelPeaks.count - 1)
                 return max(update.channelPeaks[index].max() ?? 0, update.partialChannelPeaks[index] ?? 0)
@@ -444,7 +472,7 @@ final class Editor: NSObject {
             peaks[recordingTrack] = StereoLevels(left: channelPeak(0), right: channelPeak(1))
             updateTrackMeters(peaks)
         }
-        if update.failure != nil { stop() }
+        if handleFailure, update.failure != nil { stop() }
     }
     func updateTransportPosition() {
         if recorder != nil { updateRecordingWaveform() }
@@ -481,6 +509,20 @@ final class Editor: NSObject {
         guard bpm.isFinite, (20...300).contains(bpm), bpm != project.tempo else { return }
         checkpoint(); project.tempo = bpm; updateMetronome(); update("Tempo updated")
     }
+    var loopRange: Range<Double>? {
+        guard project.loopEnabled else { return nil }
+        if let range, range.lowerBound.isFinite, range.upperBound.isFinite,
+           range.lowerBound >= 0, (range.upperBound - range.lowerBound) * audio.sampleRate >= 1 {
+            return range.lowerBound..<range.upperBound
+        }
+        return duration > 0 ? 0..<duration : nil
+    }
+    var canToggleLoop: Bool { !isRecording && !isShuttling && !requestingMic && !isImporting && !isNormalizing }
+    func toggleLoop() {
+        guard canToggleLoop else { return }
+        checkpoint(); project.loopEnabled.toggle(); updateLoop(); update()
+    }
+    private func updateLoop() { player?.setLoop(loopRange) }
     func toggleMetronome() {
         checkpoint(); project.metronomeEnabled.toggle(); updateMetronome(); update()
     }
@@ -539,7 +581,7 @@ final class Editor: NSObject {
         guard !isRecording, !requestingMic, !isImporting, position.isFinite else { return }
         let target = max(0, position)
         if !isShuttling, let playback = player, playback.isPlaying {
-            guard target < Double(playback.graph.totalFrames) / audio.sampleRate else {
+            guard loopRange.map({ target <= $0.upperBound }) == true || target < Double(playback.graph.totalFrames) / audio.sampleRate else {
                 stopPlayback(at: target); update(); return
             }
             playback.seek(to: target)
@@ -560,7 +602,7 @@ final class Editor: NSObject {
     func playPause() {
         if isShuttling { endShuttle(resume: false); return }
         if isRecording {
-            let start = recordingStart
+            let start = recordingOrigin
             stop(); cursor = start; update(); return
         }
         guard !requestingMic, !isImporting else { return }
@@ -686,10 +728,11 @@ final class Editor: NSObject {
             flushPluginEdits()
             if !forRecording, let playback = pausedPlayer, pausedMixKey == (try mixCacheKey()) {
                 let position = pausedCursorIsCurrent ? playback.pausePosition : max(0, cursor)
-                guard position < Double(playback.graph.totalFrames) / audio.sampleRate else { update(); return }
+                guard loopRange.map({ position <= $0.upperBound }) == true || position < Double(playback.graph.totalFrames) / audio.sampleRate else { update(); return }
                 pausedPlayer = nil; pausedMixKey = nil; followsPausedCursor = false
                 player = playback
                 playback.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
+                playback.setLoop(loopRange)
                 try playback.resume(to: position)
                 playback.didResume = { [weak self, weak playback] in
                     guard let self, let playback, self.player === playback else { return }
@@ -701,7 +744,7 @@ final class Editor: NSObject {
             discardPausedPlayback()
             let graph = try playbackGraph()
             let start = max(0, cursor)
-            guard forRecording || start < Double(graph.totalFrames) / audio.sampleRate else { update(); return }
+            guard forRecording || loopRange.map({ start <= $0.upperBound }) == true || start < Double(graph.totalFrames) / audio.sampleRate else { update(); return }
             cursor = start
             let playback = try makePlayback(graph, project.audioFormat, start)
             playback.finished = { [weak self, weak playback] failure in
@@ -730,6 +773,7 @@ final class Editor: NSObject {
             player = playback
             mixCache = (try mixCacheKey(), graph)
             playback.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
+            playback.setLoop(loopRange)
             if forRecording { try playback.prepareForRecording() }
             try playback.startPlayback(playImmediately: !forRecording)
             cursor = playback.start
@@ -738,14 +782,15 @@ final class Editor: NSObject {
         } catch { player?.stop(); player = nil; self.error(error) }
     }
     func stopAndReturnToStart() {
-        let start = isRecording ? recordingStart : (lastPlaybackStart ?? 0)
+        let start = isRecording ? recordingOrigin : (lastPlaybackStart ?? 0)
         stop(); cursor = start; update()
     }
     func stop() {
         endShuttle(resume: false)
         stopPlayback()
         if let recorder {
-            let failure = recorder.stop(); self.recorder = nil
+            let failure = recorder.stop()
+            updateRecordingWaveform(handleFailure: false); self.recorder = nil
             do {
                 if let url = recordingURL, let index = project.tracks.firstIndex(where: { $0.id == recordingTrack }) {
                     let data = try audio.load(url.path)

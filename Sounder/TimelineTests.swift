@@ -1044,13 +1044,30 @@ extension AppDelegate {
         // Several continuous slider actions within the same tracking gesture
         // must create one history entry, independently of device event timing.
         let slider = controls.volume, beforeDrag = editor.undoStack.count
+        let keyWindow = NSApp.keyWindow
+        var liveValuesCorrect = true
         slider.withTrackingGesture {
             for value in [-12.0, -18, -24] {
                 slider.doubleValue = value
                 _ = slider.sendAction(slider.action, to: slider.target)
+                liveValuesCorrect = liveValuesCorrect && slider.visibleValueText == String(format: "%+.1f dB", value) && NSApp.keyWindow === keyWindow
             }
         }
+        guard liveValuesCorrect, slider.visibleValueText == nil else { throw SounderError.message("Volume readout must update immediately during dragging, preserve focus and disappear on release") }
         guard editor.undoStack.count == beforeDrag + 1, editor.project.tracks[0].volumeDB == -24 else { throw SounderError.message("One slider drag must create exactly one Undo entry") }
+        var readoutPositions: [CGFloat] = []
+        controls.pan.withTrackingGesture {
+            for (value, text) in [(45.0, "Left 45°"), (0, "Center"), (-60, "Right 60°")] {
+                controls.pan.doubleValue = value
+                _ = controls.pan.sendAction(controls.pan.action, to: controls.pan.target)
+                liveValuesCorrect = liveValuesCorrect && controls.pan.visibleValueText == text && NSApp.keyWindow === keyWindow
+                if let frame = controls.pan.visibleValueFrame { readoutPositions.append(frame.midY) }
+            }
+        }
+        guard liveValuesCorrect, controls.pan.visibleValueText == nil else { throw SounderError.message("Pan readout must update its direction and angle immediately and disappear on release") }
+        guard readoutPositions.count == 3, readoutPositions[0] > readoutPositions[1], readoutPositions[1] > readoutPositions[2] else { throw SounderError.message("Pan readout must follow the thumb upward for Left and downward for Right in screen coordinates") }
+        print("PASS: Pan value readout moves alongside the thumb in the same vertical direction")
+        print("PASS: Volume and Pan show their current values synchronously throughout dragging, without taking keyboard focus, and hide the readout on release")
         for control in [controls.pan, controls.volume] {
             let before = editor.undoStack.count
             let event = NSEvent.mouseEvent(with: .leftMouseDown, location: control.convert(NSPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 2, pressure: 1)!

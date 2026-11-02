@@ -3,9 +3,65 @@ import AppKit
 final class TrackMixerSlider: NSSlider {
     private(set) var trackingGesture = false
     var checkpointed = false
+    var valueText: ((Double) -> String)?
+    private var valuePanel: NSPanel?
+    private let valueLabel = NSTextField(labelWithString: "")
+    var visibleValueText: String? { valuePanel?.isVisible == true ? valueLabel.stringValue : nil }
+    var visibleValueFrame: NSRect? { valuePanel?.isVisible == true ? valuePanel?.frame : nil }
+    private func showValue() {
+        guard let window, let valueText else { return }
+        if valuePanel == nil {
+            let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.isReleasedWhenClosed = false; panel.isOpaque = false; panel.backgroundColor = .clear
+            panel.hasShadow = true; panel.ignoresMouseEvents = true; panel.hidesOnDeactivate = true
+            panel.level = .popUpMenu; panel.collectionBehavior = [.transient, .ignoresCycle]
+            let content = NSView(); content.wantsLayer = true
+            content.layer?.backgroundColor = panelColor.cgColor; content.layer?.cornerRadius = 7
+            content.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor; content.layer?.borderWidth = 1
+            valueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            valueLabel.textColor = .labelColor; valueLabel.alignment = .center
+            content.addSubview(valueLabel); panel.contentView = content; valuePanel = panel
+        }
+        guard let panel = valuePanel else { return }
+        valueLabel.stringValue = valueText(doubleValue); valueLabel.sizeToFit()
+        let size = NSSize(width: max(50, valueLabel.frame.width + 18), height: 27)
+        let rect = window.convertToScreen(convert(bounds, to: nil))
+        let fraction = max(0, min(1, (doubleValue - minValue) / (maxValue - minValue)))
+        var origin: NSPoint
+        if isVertical {
+            // The rectangle is already in screen coordinates, where Y grows
+            // upward regardless of the slider view's flipped coordinate system.
+            let y = rect.minY + 7 + (rect.height - 14) * fraction
+            origin = NSPoint(x: rect.minX - size.width - 6, y: y - size.height / 2)
+        } else {
+            origin = NSPoint(x: rect.minX + 7 + (rect.width - 14) * fraction - size.width / 2, y: rect.maxY + 5)
+        }
+        if let screen = window.screen?.visibleFrame {
+            origin.x = max(screen.minX + 5, min(screen.maxX - size.width - 5, origin.x))
+            origin.y = max(screen.minY + 5, min(screen.maxY - size.height - 5, origin.y))
+        }
+        panel.setFrame(NSRect(origin: origin, size: size), display: false)
+        valueLabel.frame = NSRect(x: 9, y: (size.height - valueLabel.frame.height) / 2, width: size.width - 18, height: valueLabel.frame.height)
+        if panel.parent !== window { panel.parent?.removeChildWindow(panel); window.addChildWindow(panel, ordered: .above) }
+        panel.orderFront(nil); panel.displayIfNeeded()
+    }
+    private func hideValue() {
+        valuePanel?.orderOut(nil)
+        if let panel = valuePanel { panel.parent?.removeChildWindow(panel) }
+    }
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { hideValue() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+    override func sendAction(_ action: Selector?, to target: Any?) -> Bool {
+        let sent = super.sendAction(action, to: target)
+        if trackingGesture { showValue() }
+        return sent
+    }
     func withTrackingGesture(_ action: () -> Void) {
         trackingGesture = true; checkpointed = false
-        defer { trackingGesture = false; checkpointed = false }
+        showValue()
+        defer { hideValue(); trackingGesture = false; checkpointed = false }
         action()
     }
     override func mouseDown(with event: NSEvent) {
@@ -39,6 +95,8 @@ final class TrackMixerControls: NSView {
             addSubview(slider)
         }
         volume.action = #selector(changeVolume); pan.action = #selector(changePan)
+        volume.valueText = { $0 <= -60 ? "−∞ dB" : String(format: "%+.1f dB", $0) }
+        pan.valueText = { $0 == 0 ? "Center" : String(format: "%@ %.0f°", $0 > 0 ? "Left" : "Right", abs($0)) }
         pan.isVertical = true
         if #available(macOS 26.0, *) { pan.neutralValue = 0 }
         pan.numberOfTickMarks = 3; pan.allowsTickMarkValuesOnly = false
@@ -207,6 +265,7 @@ final class Timeline: NSView {
     var selectingRange = false
     var rangeAnchor: Double?
     var didDragRange = false
+    private var lastRangeDragPoint: NSPoint?
     private(set) var marqueeAnchor: NSPoint?
     private(set) var marqueeRect: NSRect?
     private var marqueeInitialSelection = Set<UUID>()
@@ -588,6 +647,9 @@ final class Timeline: NSView {
         refresh()
     }
     override func flagsChanged(with event: NSEvent) {
+        if selectingRange, didDragRange, canSelectRange, let point = lastRangeDragPoint {
+            updateTimeRange(to: point, flags: event.modifierFlags)
+        }
         if let point = lastFragmentDragPoint, !editor.busy {
             if fragmentResize != nil && didResizeFragment { updateFragmentResize(at: point, flags: event.modifierFlags) }
             else if dragClip != nil && didCheckpoint { updateFragmentMove(at: point, flags: event.modifierFlags) }
@@ -794,7 +856,7 @@ final class Timeline: NSView {
                 NSGraphicsContext.restoreGraphicsState()
             }
             if editor.isRecording && editor.recordingTrack == track.id {
-                let rect = NSRect(x: header + editor.recordingStart * editor.zoom, y: y + 8, width: max(10, (editor.cursor - editor.recordingStart) * editor.zoom), height: rowHeight - 16)
+                let rect = NSRect(x: header + editor.recordingStart * editor.zoom, y: y + 8, width: max(10, (editor.recordingEnd - editor.recordingStart) * editor.zoom), height: rowHeight - 16)
                 fill(rect, NSColor.systemRed.blended(withFraction: 0.85, of: background)!, radius: 6)
                 NSColor.systemRed.setStroke(); NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).stroke()
                 NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
@@ -923,6 +985,18 @@ final class Timeline: NSView {
         NSGraphicsContext.restoreGraphicsState()
         fill(NSRect(x: pinnedHeaderX, y: top, width: header, height: ruler), panelColor)
     }
+    private func timelineTime(at point: NSPoint, flags: NSEvent.ModifierFlags) -> Double {
+        let time = max(0, (point.x - header) / editor.zoom)
+        guard editor.project.tempoMode, !flags.contains(.shift) else { return time }
+        let beat = 60 / editor.project.tempo
+        return (time / beat).rounded() * beat
+    }
+    private func updateTimeRange(to point: NSPoint, flags: NSEvent.ModifierFlags) {
+        let a = rangeAnchor ?? timelineTime(at: dragStart, flags: flags)
+        let b = timelineTime(at: point, flags: flags)
+        editor.range = min(a, b)...max(a, b)
+        editor.update()
+    }
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         pendingFragmentClick = nil; pendingShiftFragmentClick = nil; lastFragmentDragPoint = nil; didResizeFragment = false
@@ -931,7 +1005,7 @@ final class Timeline: NSView {
         // Range selection and handle resizing never touch the transport.
         if pinnedRulerRect.contains(point) {
             guard canSelectRange, point.x >= fragmentLeft else { return }
-            dragStart = point; selectingRange = true; didDragRange = false; rangeAnchor = nil
+            dragStart = point; selectingRange = true; didDragRange = false; rangeAnchor = nil; lastRangeDragPoint = nil
             if let range = editor.range, event.clickCount < 2 {
                 let handles = rangeHandleRects()
                 let hits = handles.indices.filter { handles[$0].contains(point) }
@@ -1005,7 +1079,7 @@ final class Timeline: NSView {
                 }
                 if !event.modifierFlags.contains(.shift) { pendingFragmentClick = clip.id }
                 if event.clickCount == 2 { editor.range = nil }
-                editor.seek(to: (p.x - header) / editor.zoom)
+                editor.seek(to: timelineTime(at: p, flags: event.modifierFlags))
                 if event.modifierFlags.contains(.shift) { if editor.selection.contains(clip.id) { pendingShiftFragmentClick = clip.id } else { editor.selection.insert(clip.id) } }
                 else if !editor.selection.contains(clip.id) { editor.selection = [clip.id] }
                 if editor.selection.contains(clip.id) { editor.hint(.selectFragments, "Shift click to multi select") }
@@ -1085,10 +1159,9 @@ final class Timeline: NSView {
             guard canSelectRange else { return }
             guard didDragRange || abs(p.x - dragStart.x) > 3 else { return }
             didDragRange = true
-            let a = rangeAnchor ?? max(0, (dragStart.x - header) / editor.zoom)
-            let b = max(0, (p.x - header) / editor.zoom)
-            editor.range = min(a, b)...max(a, b)
-            editor.update(); autoscrollRange(with: event); return
+            lastRangeDragPoint = p
+            updateTimeRange(to: p, flags: event.modifierFlags)
+            autoscrollRange(with: event); return
         }
         guard !editor.busy else { return }
         if trackDrag != nil, trackDragRows != nil || hypot(p.x - dragStart.x, p.y - dragStart.y) > 4 {
@@ -1139,18 +1212,19 @@ final class Timeline: NSView {
                 editor.selection = marqueeAdditive ? marqueeInitialSelection : []
                 if event.clickCount == 2 { editor.range = nil }
                 clearMarquee()
-                editor.seek(to: max(0, (p.x - header) / editor.zoom))
+                editor.seek(to: timelineTime(at: p, flags: event.modifierFlags))
             } else {
                 updateMarquee(to: p); clearMarquee()
             }
             return
         }
         if selectingRange {
+            if canSelectRange && didDragRange { updateTimeRange(to: p, flags: event.modifierFlags) }
             if canSelectRange && !didDragRange && rangeAnchor == nil {
                 if event.clickCount == 2 { editor.range = nil }
-                editor.seek(to: max(0, (p.x - header) / editor.zoom))
+                editor.seek(to: timelineTime(at: p, flags: event.modifierFlags))
             }
-            selectingRange = false; rangeAnchor = nil; didDragRange = false
+            selectingRange = false; rangeAnchor = nil; didDragRange = false; lastRangeDragPoint = nil
             return
         }
         var renameID: UUID?

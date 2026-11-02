@@ -170,9 +170,9 @@ extension AppDelegate {
         func check(_ condition: Bool, _ message: String) throws {
             guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
         }
-        func send(_ type: NSEvent.EventType, _ time: Double, clicks: Int = 1, y: CGFloat? = nil) {
+        func send(_ type: NSEvent.EventType, _ time: Double, clicks: Int = 1, y: CGFloat? = nil, shift: Bool = false) {
             let point = NSPoint(x: timeline.header + time * editor.zoom, y: y ?? timeline.ruler / 2)
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: shift ? [.shift] : [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
             switch type {
             case .leftMouseDown: timeline.mouseDown(with: event)
             case .leftMouseDragged: timeline.mouseDragged(with: event)
@@ -223,7 +223,39 @@ extension AppDelegate {
         try check(editor.player === playback && editor.range == 2...5, "Selecting and resizing a range keeps the active audio stream")
         RunLoop.current.run(until: Date().addingTimeInterval(0.12))
         try check(editor.player === playback && editor.cursor >= 1 && editor.cursor < 1.5, "Playhead continues to follow playback while a range is selected")
-        editor.stop(); editor.seek(to: 5.8); editor.zoom = 70; editor.range = 2...5; refresh()
+        editor.stop(); editor.seek(to: 5.8); editor.range = nil
+        let previousMode = editor.project.tempoMode, previousTempo = editor.project.tempo
+        defer { editor.project.tempoMode = previousMode; editor.project.tempo = previousTempo }
+        editor.project.tempoMode = true; editor.project.tempo = 120; refresh()
+        send(.leftMouseDown, 1.17); send(.leftMouseUp, 1.17)
+        try check(editor.cursor == 1, "Tempo ruler clicks seek to the nearest beat start")
+        send(.leftMouseDown, 1.17, shift: true); send(.leftMouseUp, 1.17, shift: true)
+        try check(abs(editor.cursor - 1.17) < 0.000001, "Shift allows arbitrary ruler seeking in Tempo mode")
+        let cursor = editor.cursor
+        drag(0.67, 2.18)
+        try check(editor.range == 0.5...2 && editor.cursor == cursor, "Tempo range selection snaps both bounds without moving the cursor")
+        drag(0.5, 0.88); drag(2, 2.72)
+        try check(editor.range == 1...2.5, "Both range handles snap to beat boundaries")
+        send(.leftMouseDown, 2.5); send(.leftMouseDragged, 2.72, shift: true); send(.leftMouseUp, 2.72, shift: true)
+        try check(abs((editor.range?.upperBound ?? 0) - 2.72) < 0.000001 && editor.range?.lowerBound == 1, "Shift resizes a range freely while preserving its opposite edge")
+        editor.range = nil
+        send(.leftMouseDown, 2.18, shift: true); send(.leftMouseDragged, 0.67, shift: true)
+        let flags = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56)!
+        timeline.flagsChanged(with: flags)
+        try check(editor.range == 0.5...2, "Releasing Shift during a reverse range drag immediately restores beat snapping")
+        send(.leftMouseUp, 0.67)
+        editor.range = nil
+        send(.leftMouseDown, 3.17, y: fragmentY); send(.leftMouseUp, 3.17, y: fragmentY)
+        try check(editor.cursor == 3, "Fragment clicks use the same Tempo cursor snapping")
+        send(.leftMouseDown, 3.17, y: blankY, shift: true); send(.leftMouseUp, 3.17, y: blankY, shift: true)
+        try check(abs(editor.cursor - 3.17) < 0.000001, "Shift bypasses Tempo snapping in the empty fragment area")
+        editor.project.tempo = 90; editor.range = nil
+        drag(0.9, 2.1)
+        try check(abs((editor.range?.lowerBound ?? 0) - 2.0 / 3) < 0.000001 && editor.range?.upperBound == 2, "Range snapping follows the current BPM rather than a fixed time grid")
+        editor.project.tempoMode = false; editor.range = nil
+        drag(0.67, 2.18)
+        try check(abs((editor.range?.lowerBound ?? 0) - 0.67) < 0.000001 && abs((editor.range?.upperBound ?? 0) - 2.18) < 0.000001, "Seconds mode retains arbitrary range boundaries")
+        editor.seek(to: 5.8); editor.zoom = 70; editor.range = 2...5; refresh()
     }
     func verifyPlayheadUI() throws {
         func check(_ condition: Bool, _ message: String) throws {
@@ -1105,4 +1137,186 @@ func runPauseContinuityTests() throws {
     }
     try check(live.isPlaying && live.engine === engine && longestSilence <= 2 && jump < 0.001,
               "Rapid Space pause/resume joins fades without a gap or obsolete pause callback (silence: \(longestSilence), jump: \(jump))")
+}
+
+func runLoopPlaybackTests() throws {
+    func check(_ condition: Bool, _ message: String) throws {
+        guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderLoop-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let format = ProjectAudioFormat(bitDepth: 32)
+    store.configure(format)
+    let values = (0..<48_000).map { Float(0.15 + Double($0) / 240_000) }
+    let source = store.freshURL()
+    try store.write(AudioSignal(channels: [values, values.map { -$0 * 0.5 }]), to: source, bitDepth: 32)
+    var track = Track(name: "Loop", clips: [Clip(name: "Loop", source: source.path, start: 0, duration: 1, order: 1)])
+    track.effects = [PluginEffect(name: "Identity", path: "test", classID: "identity")]
+    let project = Project(tracks: [track], audioFormat: format)
+    let dry = try store.renderAudio(project, onlyTrack: track.id)
+    let cases: [(Range<Double>, Double)] = [(0.123..<0.187, 0.123), (0.031..<0.034, 0.031), (0..<1, 0), (1.2..<1.3, 1.2), (0.123..<0.187, 0.02)]
+    for (region, start) in cases {
+        var instances = 0
+        let graph = try StreamingGraph(project: project, store: store) { _ in
+            instances += 1; return StreamingEffect(latency: 0, tail: 4096) { $0 }
+        }
+        let live = LivePlayback(graph: graph, format: format, start: start)
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+        var finished = 0
+        live.finished = { _ in finished += 1 }
+        live.setLoop(region); try live.startPlayback()
+        defer { live.stop() }
+        let first = Int((region.lowerBound * 48_000).rounded()), last = Int((region.upperBound * 48_000).rounded()), length = last - first
+        let fade = Double(max(1, min(480, length / 2)))
+        let startFrame = Int((start * 48_000).rounded())
+        var count = 0, maximumError = 0.0, wraps = false, previous = start
+        func block() throws {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.001)); live.queue.sync {}
+            guard try live.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render Loop audio") }
+        }
+        for _ in 0..<(length >= 48_000 ? 210 : 75) {
+            try block()
+            for i in 0..<512 {
+                let elapsed = count + i, firstPass = elapsed < last - startFrame
+                let frame = firstPass ? startFrame + elapsed : first + (elapsed - (last - startFrame)) % length
+                let incoming = !firstPass || startFrame == first ? Double(frame - first) / fade : 1
+                let gain = min(1, max(0, min(incoming, Double(last - 1 - frame) / fade)))
+                for channel in 0..<2 {
+                    let expected = frame < dry.frameCount ? dry.channels[channel][frame] * Float(gain) : 0
+                    maximumError = max(maximumError, abs(Double(buffer.floatChannelData![channel][i] - expected)))
+                }
+            }
+            count += 512
+            let position = live.currentTime
+            if position < previous { wraps = true }
+            previous = position
+            try checkPosition(position, in: min(start, region.lowerBound)..<region.upperBound)
+            _ = live.consumeTrackPeaks(at: position)
+        }
+        try check(maximumError < 1e-6 && wraps && live.isPlaying && finished == 0 && live.graph === graph && instances == 1,
+                  "Loop \(region), starting at \(start), repeats exact stereo frames with edge smoothing and an audible cursor, retaining the engine and effects (error: \(maximumError))")
+        try live.pause()
+        for _ in 0..<12 where !live.pauseComplete { try block() }
+        try check(live.pauseComplete && live.engine.isRunning && !live.node.isPlaying, "Space can pause looping playback without restarting hardware")
+        try live.resume(to: live.pausePosition)
+        for _ in 0..<6 { try block() }
+        try check(live.isPlaying && live.graph === graph, "Space resumes the prepared looping transport")
+        live.setLoop(nil)
+        for _ in 0..<180 where finished == 0 { try block() }
+        try check(finished == 1, "Disabling Loop restores natural playback completion")
+        live.stop()
+    }
+    do {
+        let graph = try StreamingGraph(project: project, store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }
+        let live = LivePlayback(graph: graph, format: format, start: 0.3)
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+        var finished = false, error = 0.0
+        live.finished = { _ in finished = true }
+        live.setLoop(0.123..<0.187); try live.startPlayback()
+        func block() throws {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.001)); live.queue.sync {}
+            guard try live.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render playback after Loop region") }
+        }
+        for n in 0..<45 {
+            try block()
+            for i in 0..<512 { for ch in 0..<2 {
+                error = max(error, abs(Double(buffer.floatChannelData![ch][i] - dry.channels[ch][14_400 + n * 512 + i])))
+            } }
+        }
+        try check(error < 1e-6 && live.currentTime > 0.3, "Starting after the selected Loop range plays forward without relocation or attenuation")
+        for _ in 0..<75 where !finished { try block() }
+        try check(finished, "Starting after the Loop range completes normally at the project end")
+        live.stop()
+    }
+    for direction in [-1.0, 1.0] {
+        let graph = try StreamingGraph(project: project, store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }
+        let live = LivePlayback(graph: graph, format: format, start: 0.2)
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+        live.setLoop(0..<1); try live.startPlayback()
+        let engine = live.engine, node = live.node
+        var previous: Float?, jump: Float = 0
+        func block() throws {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.002)); live.queue.sync {}
+            guard try live.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render looping shuttle return") }
+            for i in 0..<512 {
+                let sample = buffer.floatChannelData![0][i]
+                if let previous { jump = max(jump, abs(sample - previous)) }
+                previous = sample
+            }
+        }
+        for _ in 0..<8 { try block() }
+        live.beginShuttle(source: DryShuttleSource(project: project, store: store, processed: graph.outputCache), direction: direction)
+        for _ in 0..<8 { try block() }
+        live.releaseShuttle { _ in
+            try StreamingGraph(project: project, store: store, dryGraph: graph) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }
+        }
+        var restored = false
+        for _ in 0..<160 {
+            try block()
+            if !restored, live.returnReady, abs(live.currentSpeed - 1) < 1e-8 { live.completeReturn(); restored = true }
+        }
+        try check(restored && live.isPlaying && (0..<1).contains(live.currentTime) && live.engine === engine && live.node === node && jump < 0.01,
+                  "Loop survives shuttle release on the same engine without a hard join (\(direction), jump: \(jump))")
+        live.stop()
+    }
+    let editor = Editor(store: store)
+    editor.project = project
+    editor.toggleLoop()
+    try check(editor.loopRange == 0..<1 && editor.project.loopEnabled, "Loop defaults to audio bounds, excluding effect tails")
+    editor.range = 0.2...0.4
+    try check(editor.loopRange == 0.2..<0.4, "Loop uses the selected timeline period")
+    editor.range = 0.3...0.3
+    try check(editor.loopRange == 0..<1, "An empty selection falls back to the whole project")
+    let saved = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(editor.project))
+    try check(saved.loopEnabled, "Project serialization preserves Loop mode")
+    func checkPosition(_ position: Double, in region: Range<Double>) throws {
+        guard position >= region.lowerBound - 1e-8 && position <= region.upperBound + 1e-8 else { throw SounderError.message("Loop cursor escaped its audible range: \(position), \(region)") }
+    }
+}
+
+extension AppDelegate {
+    func verifyLoopUI() throws {
+        let original = editor.project, originalRange = editor.range
+        defer {
+            editor.stop(); editor.project = original; editor.range = originalRange
+            editor.cursor = 0; editor.dirty = false; editor.undoStack = []; editor.redoStack = []; refresh()
+        }
+        editor.project.loopEnabled = false; editor.range = 1...1.2; editor.cursor = 0; refresh()
+        loopButton.performClick(nil)
+        guard editor.project.loopEnabled, loopButton.state == .on else { throw SounderError.message("Loop button did not activate") }
+        editor.playPause()
+        guard let live = editor.player, live.start == 0 else { throw SounderError.message("Loop moved the cursor to the selected period on Play") }
+        let engine = live.engine, node = live.node, graph = live.snapshotGraph
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25)); editor.updateTransportPosition()
+        guard (0..<1).contains(editor.cursor) else { throw SounderError.message("Loop skipped the lead-in before the selected period") }
+        RunLoop.current.run(until: Date().addingTimeInterval(1.2)); editor.updateTransportPosition()
+        guard editor.isPlaying, (1..<1.2).contains(editor.cursor), editor.player === live, editor.lastPlaybackStart == 0 else { throw SounderError.message("Selected Loop did not wrap at its right edge while preserving the start marker") }
+        editor.range = 1.25...1.35
+        RunLoop.current.run(until: Date().addingTimeInterval(0.55)); editor.updateTransportPosition()
+        guard (1.25..<1.35).contains(editor.cursor) else { throw SounderError.message("Loop did not follow a live range edit") }
+        editor.range = nil
+        guard editor.loopRange == 0..<editor.duration else { throw SounderError.message("Clearing the selection did not restore full-project Loop") }
+        loopButton.performClick(nil)
+        guard !editor.project.loopEnabled, loopButton.state == .off, editor.player === live,
+              live.engine === engine, live.node === node, live.snapshotGraph === graph else { throw SounderError.message("Loop toggle restarted the transport") }
+        editor.stopAndReturnToStart()
+        guard !editor.isPlaying else { throw SounderError.message("Stop did not end looping playback") }
+        editor.range = 1...1.2; editor.cursor = 2; loopButton.performClick(nil); editor.playPause()
+        guard editor.player?.start == 2 else { throw SounderError.message("Starting after Loop moved the cursor backward") }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15)); editor.updateTransportPosition()
+        editor.playPause()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1)); editor.updateTransportPosition()
+        let paused = editor.cursor
+        editor.playPause()
+        guard paused >= 2, editor.player?.start == paused else { throw SounderError.message("Resuming outside Loop relocated the cursor") }
+        editor.stop()
+        print("PASS: Loop starts and resumes at the cursor, plays the lead-in, wraps only at the right edge, preserves the start marker, and does not jump backward from after the period")
+    }
 }

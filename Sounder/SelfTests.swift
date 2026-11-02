@@ -216,6 +216,8 @@ func runAudioTests() throws {
     try runTrackSoloTests()
     try runFragmentSettingsTests()
     try runTrackMixTests()
+    try runLoopPlaybackTests()
+    try runLoopRecordingTests()
     try runFragmentFadeTests()
     try runFragmentMuteTests()
     try runNormalizationTests()

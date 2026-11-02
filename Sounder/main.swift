@@ -270,7 +270,7 @@ final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
         super.init()
         volume.formatter = NumericInputFormatter(.signedDecimal); pan.formatter = NumericInputFormatter(.signedDecimal)
         fadeIn.formatter = NumericInputFormatter(.unsignedDecimal); fadeOut.formatter = NumericInputFormatter(.unsignedDecimal)
-        alert.messageText = "Edit fragment"
+        alert.messageText = "Edit fragment \(clip.name)"
         let form = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 190))
         for (title, y) in [("Volume", CGFloat(156)), ("Pan", 112), ("Fade in", 56), ("Fade out", 12)] {
             let label = NSTextField(labelWithString: title); label.frame = NSRect(x: 0, y: y + 2, width: 110, height: 24); form.addSubview(label)
@@ -357,6 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var qualityButton: NSButton!
     var playButton: NSButton!
     var recordButton: NSButton!
+    var loopButton: NSButton!
     var exportButton: NSButton!
     var editButtons: [NSButton] = []
     var fragmentMuteButton: NSButton!
@@ -381,7 +382,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let toolbar = NSStackView(); toolbar.orientation = .horizontal; toolbar.spacing = 14; toolbar.edgeInsets = NSEdgeInsets(top: toolbarTopInset, left: 22, bottom: 12, right: 22)
         playButton = button("Play / pause · Space", "play.fill", #selector(play))
         recordButton = button("Record · R", "record.circle", #selector(record)); recordButton.contentTintColor = .systemRed
-        toolbar.addArrangedSubview(section("PLAYER", [button("Return to start", "backward.end.fill", #selector(rewind)), playButton, button("Stop and return to playback start · Escape", "stop.fill", #selector(stop)), recordButton]))
+        loopButton = button("Loop", "repeat", #selector(toggleLoop))
+        loopButton.setButtonType(.pushOnPushOff)
+        (loopButton as? PointerButton)?.activeAppearanceColor = accent
+        toolbar.addArrangedSubview(section("PLAYER", [button("Return to start", "backward.end.fill", #selector(rewind)), playButton, button("Stop and return to playback start · Escape", "stop.fill", #selector(stop)), recordButton, loopButton]))
         let split = button("Split at playhead · S", "scissors", #selector(split)); let trim = button("Trim to ruler selection", "crop", #selector(trim)); let delete = button("Delete fragments · Delete", "trash", #selector(deleteClips))
         let join = button("Join selected fragments · ⌘J", "link", #selector(join))
         let normalize = button("Normalize · N", "waveform.path", #selector(normalize))
@@ -516,6 +520,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--fragment-settings-ui-test") { try verifyFragmentSettingsUI() }
             if CommandLine.arguments.contains("--numeric-input-ui-test") { try verifyNumericInputUI() }
             if CommandLine.arguments.contains("--track-mix-ui-test") { try verifyTrackMixUI() }
+            if CommandLine.arguments.contains("--loop-ui-test") { try verifyLoopUI() }
+            if CommandLine.arguments.contains("--loop-recording-ui-test") { try verifyLoopRecordingUI() }
             if CommandLine.arguments.contains("--fragment-mute-ui-test") { try verifyFragmentMuteUI() }
             if CommandLine.arguments.contains("--normalize-ui-test") { try verifyNormalizationUI() }
             if CommandLine.arguments.contains("--stop-return-ui-test") { try verifyStopReturnUI() }
@@ -803,6 +809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                                end: { [weak self] in self?.projectLabel.isHidden = false; self?.projectNameView.updateSize() })
     }
     @objc func toggleTempo() { editor.toggleTempoMode() }
+    @objc func toggleLoop() { editor.toggleLoop() }
     @objc func toggleMetronome() { editor.toggleMetronome() }
     @objc func editTempo() {
         if let bpm = TempoDialog(bpm: editor.project.tempo).runModal() { editor.setTempo(bpm) }
@@ -864,6 +871,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         metronomeButton.toolTip = editor.project.metronomeEnabled ? "Metronome on" : "Metronome off"
         tempoButton.isEnabled = !editor.isImporting && !editor.requestingMic
         bpmButton.isEnabled = tempoButton.isEnabled; metronomeButton.isEnabled = tempoButton.isEnabled
+        loopButton.state = editor.project.loopEnabled ? .on : .off
+        loopButton.contentTintColor = editor.project.loopEnabled ? accent : .labelColor
+        loopButton.toolTip = editor.project.loopEnabled ? "Loop on" : "Loop off"
+        loopButton.isEnabled = editor.canToggleLoop
         playButton.image = NSImage(systemSymbolName: editor.isPlaying ? "pause.fill" : "play.fill", accessibilityDescription: "Play / pause")
         playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isImporting; recordButton.isEnabled = editor.canRecord
         editButtons.forEach { $0.isEnabled = !editor.busy }
@@ -913,7 +924,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         menu("Fragments", [("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Mute Fragments", #selector(muteFragments), ""), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
         if let fragments = main.items.last?.submenu { fragments.items.filter { [#selector(split), #selector(normalize)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
         menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
-        menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
+        menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Loop", #selector(toggleLoop), ""), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
         if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
         menu("View", [("Zoom In", #selector(zoomIn), "\u{f700}"), ("Zoom Out", #selector(zoomOut), "\u{f701}")])
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
@@ -971,6 +982,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func importAudio() { editor.importAudio() }
     @objc func exportAudio() { editor.export() }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(toggleLoop) {
+            menuItem.state = editor.project.loopEnabled ? .on : .off
+            return editor.canToggleLoop && NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window)
+        }
         if [#selector(openProject), #selector(saveProject), #selector(saveAs)].contains(menuItem.action) {
             return !editor.busy && NSApp.modalWindow == nil
         }
