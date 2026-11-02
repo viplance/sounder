@@ -515,6 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--tempo-snapping-ui-test") { try verifyTempoSnappingUI() }
             if CommandLine.arguments.contains("--fragment-settings-ui-test") { try verifyFragmentSettingsUI() }
             if CommandLine.arguments.contains("--numeric-input-ui-test") { try verifyNumericInputUI() }
+            if CommandLine.arguments.contains("--track-mix-ui-test") { try verifyTrackMixUI() }
             if CommandLine.arguments.contains("--fragment-mute-ui-test") { try verifyFragmentMuteUI() }
             if CommandLine.arguments.contains("--normalize-ui-test") { try verifyNormalizationUI() }
             if CommandLine.arguments.contains("--stop-return-ui-test") { try verifyStopReturnUI() }
@@ -939,7 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             releasedShuttleKey = nil
         }
         guard event.type == .keyDown, event.window === window, NSApp.modalWindow == nil,
-              !(window.firstResponder is NSTextView), timeline.canSelectRange,
+              !(window.firstResponder is NSTextView), !(window.firstResponder is TrackMixerSlider), timeline.canSelectRange,
               event.modifierFlags.intersection([.command, .shift, .option, .control]) == [.shift] else { return false }
         if !event.isARepeat || shuttleKey != event.keyCode {
             shuttleKey = event.keyCode
@@ -986,6 +987,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 && editor.project.tracks.contains { $0.clips.contains { editor.selection.contains($0.id) } }
         }
         if menuItem.action == #selector(exportAudio) { return editor.canExport }
+        if window.firstResponder is TrackMixerSlider,
+           [#selector(zoomIn), #selector(zoomOut), #selector(seekBackward), #selector(seekForward), #selector(seekToStart), #selector(seekToEnd)].contains(menuItem.action) { return false }
         if [#selector(zoomIn), #selector(zoomOut)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
         }

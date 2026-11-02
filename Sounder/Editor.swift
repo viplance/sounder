@@ -488,6 +488,18 @@ final class Editor: NSObject {
         player?.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
         recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled && player == nil)
     }
+    var canAdjustTrackMix: Bool { !isShuttling && !requestingMic && !isImporting && !isNormalizing }
+    @discardableResult func setTrackMix(_ id: UUID, volumeDB: Double? = nil, pan: Double? = nil, checkpoint shouldCheckpoint: Bool = true) -> Bool {
+        guard canAdjustTrackMix, let i = project.tracks.firstIndex(where: { $0.id == id }) else { return false }
+        var track = project.tracks[i]
+        if let volumeDB, volumeDB.isFinite { track.volumeDB = max(-60, min(12, volumeDB)) }
+        if let pan, pan.isFinite { track.pan = max(-90, min(90, pan)) }
+        guard track.volumeDB != project.tracks[i].volumeDB || track.pan != project.tracks[i].pan else { return false }
+        if shouldCheckpoint { checkpoint() }
+        else { invalidateMixCache(); dirty = true }
+        project.tracks[i] = track; player?.setTrackMix(track)
+        update(); return true
+    }
     func toggleMute(_ trackID: UUID) {
         guard !isRecording, !isShuttling, !requestingMic, !isImporting,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }

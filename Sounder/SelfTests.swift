@@ -215,6 +215,7 @@ func runAudioTests() throws {
     try runTempoTests()
     try runTrackSoloTests()
     try runFragmentSettingsTests()
+    try runTrackMixTests()
     try runFragmentFadeTests()
     try runFragmentMuteTests()
     try runNormalizationTests()
@@ -774,4 +775,68 @@ func runRecordedMediaMoveTests() throws {
     try check(failed && fm.fileExists(atPath: pending.path), "A failed project Save cannot remove a newly recorded temporary take")
     try editor.save(to: clone)
     try check(!fm.fileExists(atPath: pending.path), "A later successful Save moves the retained take after an earlier failure")
+}
+
+func runTrackMixTests() throws {
+    func check(_ condition: Bool, _ message: String) throws {
+        guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderTrackMix-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let source = store.freshURL()
+    try store.write(AudioSignal(channels: [[Float](repeating: 0.2, count: 48_000), [Float](repeating: 0.1, count: 48_000)]), to: source, bitDepth: 32)
+    var parent = Track(name: "Bus"), child = Track(name: "Child", parent: parent.id)
+    child.clips = [Clip(name: "Tone", source: source.path, start: 0, duration: 1, order: 1)]
+    child.volumeDB = -6; child.pan = -45; parent.volumeDB = -3; parent.pan = 30
+    let project = Project(tracks: [parent, child])
+    // Child FX -> child fader -> parent FX -> parent fader. Deliberately
+    // nonlinear processing distinguishes this ordering from source-level gain.
+    store.processEffects = { samples, _ in samples.map { $0 * $0 } }
+    var creations = 0
+    let graph = try StreamingGraph(project: project, store: store) { _ in
+        creations += 1; return StreamingEffect(latency: 0, tail: 0) { $0.map { $0 * $0 } }
+    }
+    // Explicit effects ensure both export and streaming run the same nonlinear buses.
+    let effect = PluginEffect(name: "Square", path: "test", classID: "square")
+    var effected = project; effected.tracks[0].effects = [effect]; effected.tracks[1].effects = [effect]
+    let wet = try StreamingGraph(project: effected, store: store) { _ in
+        creations += 1; return StreamingEffect(latency: 0, tail: 0) { $0.map { $0 * $0 } }
+    }
+    let offline = try store.renderAudio(effected)
+    try wet.seek(to: 2000)
+    let rendered = try wet.render(frames: 512)
+    try check((0..<512).allSatisfy { frame in (0..<2).allSatisfy { abs(rendered[frame * 2 + $0] - offline.channels[$0][2000 + frame]) < 1e-8 } }, "Track volume/Pan match export after child and parent effects")
+    let expectedLeft = pow(pow(0.2, 2) * pow(10, -6.0 / 20), 2) * pow(10, -3.0 / 20) * cos(.pi / 6)
+    try check(abs(Double(rendered[0]) - expectedLeft) < 1e-8, "Nested faders apply once, after their own effects and before ancestor effects")
+    let before = creations, position = wet.position
+    var changed = child; changed.volumeDB = -60; changed.pan = 90
+    wet.setTrackMix(changed)
+    try check(wet.outputCache.cachedRegions(in: 0..<48_000).isEmpty, "Changing track mix invalidates stale processed cache regions")
+    let fade = try wet.render(frames: 512)
+    try check(fade[0] > 0 && fade[0] < rendered[0] && fade.suffix(64).allSatisfy { abs($0) < 1e-12 } && wet.position == position + 512 && creations == before, "Live faders smooth over 10 ms without seeking or recreating effects")
+    wet.setTrackMix(child); _ = try wet.render(frames: 512)
+    let restored = try wet.render(frames: 128)
+    try check(abs(restored[0] - rendered[0]) < 1e-8, "Track volume restores the original post-effect level")
+    store.processEffects = nil
+    let dry = try DryShuttleSource(project: project, store: store).read(2000..<2100)
+    let regular = try store.renderAudio(project)
+    try check((0..<100).allSatisfy { abs(dry[$0 * 2] - regular.channels[0][2000 + $0]) < 1e-8 }, "Dry shuttle honors track and ancestor volume/Pan")
+    let raw = try store.renderAudio(project, onlyTrack: child.id)
+    try check(abs(raw.channels[0][2000] - 0.2) < 1e-7, "Source-only rendering remains independent of track faders")
+    var mono = project; mono.audioFormat.channels = 1; store.configure(mono.audioFormat)
+    let left = try store.renderAudio(mono)
+    mono.tracks[0].pan = -90; mono.tracks[1].pan = 90
+    let right = try store.renderAudio(mono)
+    try check(left.channels == right.channels, "Track Pan leaves mono project audio unchanged")
+    store.configure(project.audioFormat)
+    let editor = Editor(store: store); editor.project = project
+    editor.setTrackMix(child.id, volumeDB: -12, pan: 75)
+    editor.undo(); try check(editor.project.tracks[1].volumeDB == -6 && editor.project.tracks[1].pan == -45, "Track volume and Pan support Undo")
+    editor.redo(); try check(editor.project.tracks[1].volumeDB == -12 && editor.project.tracks[1].pan == 75, "Track volume and Pan support Redo")
+    editor.projectURL = directory.appendingPathComponent("Mix.sounder")
+    try check(editor.save(), "Project with track faders saves")
+    let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!))
+    try check(saved.tracks[1].volumeDB == -12 && saved.tracks[1].pan == 75, "Saving and reopening preserves track volume and Pan")
+    _ = graph // Also exercise default graph construction without effects.
 }

@@ -973,3 +973,101 @@ extension AppDelegate {
         print("PASS: Actual numeric fields reject letters, malformed numbers and invalid pasted text; decimals, signs, editing, clearing and valid pastes work")
     }
 }
+
+extension AppDelegate {
+    func verifyTrackMixUI() throws {
+        let original = editor.project, zoom = editor.zoom
+        defer {
+            editor.stop(); editor.project = original; editor.zoom = zoom; editor.dirty = false
+            editor.undoStack = []; editor.redoStack = []; editor.reconcile(); refresh()
+        }
+        for index in 1...8 { editor.project.tracks.append(Track(name: "Mixer \(index)")) }
+        refresh()
+        let first = timeline.rows[0].0.id
+        guard let controls = timeline.mixerControls[first] else { throw SounderError.message("Track sliders were not installed") }
+        for (row, item) in timeline.rows.enumerated() {
+            guard let view = timeline.mixerControls[item.0.id], !view.isHidden else { continue }
+            let volume = view.volume.convert(view.volume.bounds, to: timeline), pan = view.pan.convert(view.pan.bounds, to: timeline)
+            guard volume.minY >= timeline.trackFXRect(row: row, depth: item.1).maxY,
+                  volume.maxX < pan.minX, pan.maxX < timeline.fragmentLeft,
+                  abs(pan.height - (timeline.rowHeight - 8)) < 0.01, view.pan.isVertical,
+                  timeline.trackNameRect(row: row, depth: item.1).maxX < pan.minX else { throw SounderError.message("Track sliders overlap buttons, leave the sidebar or have the wrong orientation") }
+        }
+        // Measure the rendered native thumb: modern AppKit's legacy cell tick
+        // rectangles do not necessarily describe its vertical layer geometry.
+        func thumbY() throws -> Double {
+            let view = controls.pan
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw SounderError.message("Cannot capture Pan thumb") }
+            view.effectiveAppearance.performAsCurrentDrawingAppearance { view.cacheDisplay(in: view.bounds, to: bitmap) }
+            var sum = 0.0, count = 0.0
+            for y in 0..<bitmap.pixelsHigh { for x in 0..<bitmap.pixelsWide {
+                if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB), color.alphaComponent > 0.8,
+                   color.redComponent > 0.65, color.greenComponent > 0.65, color.blueComponent > 0.65 {
+                    sum += Double(y); count += 1
+                }
+            } }
+            guard count > 0 else { throw SounderError.message("Pan thumb did not render") }
+            return sum / count
+        }
+        var thumbPositions: [Double] = []
+        for (value, expected) in [(90.0, -90.0), (-90.0, 90.0)] {
+            controls.pan.doubleValue = value
+            _ = controls.pan.sendAction(controls.pan.action, to: controls.pan.target)
+            thumbPositions.append(try thumbY())
+            let track = editor.project.tracks[0]
+            guard track.pan == expected,
+                  track.outputGain(channel: expected < 0 ? 0 : 1, channels: 2) > 0.99,
+                  track.outputGain(channel: expected < 0 ? 1 : 0, channels: 2) < 1e-12 else { throw SounderError.message("Pan top must route left and bottom must route right") }
+        }
+        guard thumbPositions[0] < thumbPositions[1] else { throw SounderError.message("Pan left thumb must appear above right thumb: \(thumbPositions)") }
+        editor.zoom = 160; refresh()
+        let clipView = timeline.enclosingScrollView!.contentView
+        clipView.scroll(to: NSPoint(x: 300, y: 0)); timeline.enclosingScrollView!.reflectScrolledClipView(clipView)
+        refresh()
+        let pinned = controls.pan.convert(controls.pan.bounds, to: window.contentView)
+        guard pinned.minX >= 0, pinned.maxX <= timeline.header else { throw SounderError.message("Mixer controls scroll horizontally with fragments") }
+        let history = editor.undoStack.count
+        controls.volume.doubleValue = -6
+        _ = controls.volume.sendAction(controls.volume.action, to: controls.volume.target)
+        controls.pan.doubleValue = -45
+        _ = controls.pan.sendAction(controls.pan.action, to: controls.pan.target)
+        guard editor.project.tracks[0].volumeDB == -6, editor.project.tracks[0].pan == 45, editor.undoStack.count == history + 2 else { throw SounderError.message("Native slider actions did not update track values with Undo") }
+        editor.cursor = 0; editor.playPause()
+        guard let live = editor.player else { throw SounderError.message("Mixer playback did not start") }
+        let engine = live.engine, node = live.node, graph = live.snapshotGraph
+        controls.pan.doubleValue = 30
+        _ = controls.pan.sendAction(controls.pan.action, to: controls.pan.target)
+        guard editor.isPlaying, editor.player === live, live.engine === engine, live.node === node, live.snapshotGraph === graph,
+              editor.project.tracks[0].pan == -30, controls.volume.isEnabled else { throw SounderError.message("Live track fader changed or stopped the playback engine") }
+        editor.stop()
+        clipView.scroll(to: .zero); refresh()
+        // Several continuous slider actions within the same tracking gesture
+        // must create one history entry, independently of device event timing.
+        let slider = controls.volume, beforeDrag = editor.undoStack.count
+        slider.withTrackingGesture {
+            for value in [-12.0, -18, -24] {
+                slider.doubleValue = value
+                _ = slider.sendAction(slider.action, to: slider.target)
+            }
+        }
+        guard editor.undoStack.count == beforeDrag + 1, editor.project.tracks[0].volumeDB == -24 else { throw SounderError.message("One slider drag must create exactly one Undo entry") }
+        for control in [controls.pan, controls.volume] {
+            let before = editor.undoStack.count
+            let event = NSEvent.mouseEvent(with: .leftMouseDown, location: control.convert(NSPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 2, pressure: 1)!
+            control.mouseDown(with: event)
+            let value = control === controls.pan ? editor.project.tracks[0].pan : editor.project.tracks[0].volumeDB
+            guard value == 0, control.doubleValue == 0, editor.undoStack.count == before + 1 else { throw SounderError.message("Double-click did not reset a track slider with one Undo entry") }
+            control.mouseDown(with: event)
+            guard editor.undoStack.count == before + 1 else { throw SounderError.message("Resetting a default slider added an empty Undo action") }
+        }
+        print("PASS: Full-height Pan routes left at the top and right at the bottom; double-click resets both track sliders without empty Undo actions")
+        let contentY = timeline.ruler + timeline.rowHeight * 4 + 40
+        clipView.scroll(to: NSPoint(x: 0, y: contentY)); timeline.enclosingScrollView!.reflectScrolledClipView(clipView)
+        refresh()
+        for view in timeline.mixerControls.values where !view.isHidden {
+            guard view.frame.minY >= timeline.pinnedRulerRect.maxY else { throw SounderError.message("A track slider covers the pinned ruler") }
+        }
+        clipView.scroll(to: .zero); refresh()
+        print("PASS: Native track sliders fit under MUTE/SOLO/FX, Pan is vertical, controls remain pinned and clipped, live changes retain transport, and dragging is one Undo")
+    }
+}

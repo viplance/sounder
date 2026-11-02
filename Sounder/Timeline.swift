@@ -1,5 +1,75 @@
 import AppKit
 
+final class TrackMixerSlider: NSSlider {
+    private(set) var trackingGesture = false
+    var checkpointed = false
+    func withTrackingGesture(_ action: () -> Void) {
+        trackingGesture = true; checkpointed = false
+        defer { trackingGesture = false; checkpointed = false }
+        action()
+    }
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        if event.clickCount == 2 {
+            withTrackingGesture {
+                doubleValue = 0
+                _ = sendAction(action, to: target)
+            }
+            return
+        }
+        withTrackingGesture { super.mouseDown(with: event) }
+    }
+}
+
+/// Native sliders keep keyboard and accessibility support. The clipped holder
+/// follows the pinned sidebar while the document scrolls underneath it.
+final class TrackMixerControls: NSView {
+    let volume = TrackMixerSlider(value: 0, minValue: -60, maxValue: 12, target: nil, action: nil)
+    let pan = TrackMixerSlider(value: 0, minValue: -90, maxValue: 90, target: nil, action: nil)
+    let trackID: UUID
+    private weak var editor: Editor?
+    override var isFlipped: Bool { true }
+    init(track: Track, editor: Editor) {
+        trackID = track.id; self.editor = editor
+        super.init(frame: .zero)
+        wantsLayer = true; layer?.masksToBounds = true
+        for slider in [volume, pan] {
+            slider.controlSize = .mini; slider.isContinuous = true; slider.target = self
+            slider.trackFillColor = accent
+            addSubview(slider)
+        }
+        volume.action = #selector(changeVolume); pan.action = #selector(changePan)
+        pan.isVertical = true
+        if #available(macOS 26.0, *) { pan.neutralValue = 0 }
+        pan.numberOfTickMarks = 3; pan.allowsTickMarkValuesOnly = false
+        configure(track)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let result = super.hitTest(point)
+        return result === self ? nil : result
+    }
+    func configure(_ track: Track) {
+        if !volume.trackingGesture { volume.doubleValue = track.volumeDB }
+        if !pan.trackingGesture { pan.doubleValue = -track.pan }
+        volume.isEnabled = editor?.canAdjustTrackMix == true; pan.isEnabled = volume.isEnabled
+        volume.setAccessibilityLabel("\(track.name) volume")
+        pan.setAccessibilityLabel("\(track.name) Pan")
+        volume.toolTip = track.volumeDB <= -60 ? "Volume: −∞ dB" : String(format: "Volume: %+.1f dB", track.volumeDB)
+        pan.toolTip = track.pan == 0 ? "Pan: Center" : String(format: "Pan: %@ %.0f°", track.pan < 0 ? "Left" : "Right", abs(track.pan))
+    }
+    private func change(_ slider: TrackMixerSlider, isPan: Bool) {
+        guard let editor else { return }
+        let value = ((isPan ? -slider.doubleValue : slider.doubleValue) * 10).rounded() / 10
+        if editor.setTrackMix(trackID, volumeDB: isPan ? nil : value, pan: isPan ? value : nil,
+                              checkpoint: !slider.trackingGesture || !slider.checkpointed) {
+            slider.checkpointed = true
+        }
+    }
+    @objc private func changeVolume(_ sender: TrackMixerSlider) { change(sender, isPan: false) }
+    @objc private func changePan(_ sender: TrackMixerSlider) { change(sender, isPan: true) }
+}
+
 let background = NSColor(calibratedRed: 0.055, green: 0.065, blue: 0.085, alpha: 1)
 let panelColor = NSColor(calibratedRed: 0.085, green: 0.10, blue: 0.13, alpha: 1)
 let accent = NSColor(calibratedRed: 0.40, green: 0.88, blue: 0.75, alpha: 1)
@@ -151,6 +221,7 @@ final class Timeline: NSView {
     private(set) var headerControls: NSView?
     private var scrollObserver: NSObjectProtocol?
     private var controlsTracking: NSTrackingArea?
+    private(set) var mixerControls: [UUID: TrackMixerControls] = [:]
     private var followedPlayback = false
     private var hoveredTrackControl: (id: UUID, kind: Int)?
     override var isFlipped: Bool { true }
@@ -210,6 +281,27 @@ final class Timeline: NSView {
     }
     private func positionHeaderControls() {
         headerControls?.frame = NSRect(x: pinnedHeaderX, y: pinnedRulerRect.minY, width: header, height: ruler)
+        positionMixerControls()
+    }
+    private func positionMixerControls() {
+        let ids = Set(rows.map { $0.0.id })
+        for id in Array(mixerControls.keys) where !ids.contains(id) { mixerControls.removeValue(forKey: id)?.removeFromSuperview() }
+        for (row, item) in rows.enumerated() {
+            let (track, depth) = item
+            let control = mixerControls[track.id] ?? TrackMixerControls(track: track, editor: editor)
+            if control.superview == nil { addSubview(control); mixerControls[track.id] = control }
+            let y = ruler + CGFloat(row) * rowHeight
+            let rect = NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight)
+                .intersection(NSRect(x: pinnedHeaderX, y: pinnedRulerRect.maxY, width: header, height: max(0, visibleRect.maxY - pinnedRulerRect.maxY)))
+            control.isHidden = rect.isEmpty || rect.isNull
+            guard !control.isHidden else { continue }
+            control.frame = rect
+            let offset = y - rect.minY
+            let first = trackMuteRect(row: row, depth: depth), last = trackFXRect(row: row, depth: depth)
+            control.volume.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + 56, width: last.maxX - first.minX, height: 18)
+            control.pan.frame = NSRect(x: header - 24, y: offset + 4, width: 20, height: rowHeight - 8)
+            control.configure(track)
+        }
     }
     deinit { if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) } }
     var pinnedRulerRect: NSRect { NSRect(x: 0, y: max(0, visibleRect.minY), width: bounds.width, height: ruler) }
@@ -505,7 +597,7 @@ final class Timeline: NSView {
     func trackNameRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
         let meterWidth: CGFloat = rows.indices.contains(row) && editor.showsTrackMeter(rows[row].0.id) ? 66 : 0
-        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 12 - meterWidth, height: 22)
+        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 34 - meterWidth, height: 22)
     }
     func trackNameHitRect(row: Int, depth: Int) -> NSRect {
         guard rows.indices.contains(row) else { return .zero }
@@ -517,14 +609,14 @@ final class Timeline: NSView {
         return rect
     }
     func trackMuteRect(row: Int, depth: Int) -> NSRect {
-        NSRect(x: pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18, y: ruler + CGFloat(row) * rowHeight + 42, width: 46, height: 23)
+        NSRect(x: pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18, y: ruler + CGFloat(row) * rowHeight + 34, width: 46, height: 20)
     }
     func trackSoloRect(row: Int, depth: Int) -> NSRect {
         trackMuteRect(row: row, depth: depth).offsetBy(dx: 54, dy: 0)
     }
     func trackFXRect(row: Int, depth: Int) -> NSRect {
-        let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
-        return NSRect(x: min(fragmentLeft - 54, x + 108), y: ruler + CGFloat(row) * rowHeight + 42, width: 46, height: 23)
+        let x = pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18
+        return NSRect(x: x + 108, y: ruler + CGFloat(row) * rowHeight + 34, width: 46, height: 20)
     }
     func rangeHandleRects() -> [NSRect] {
         guard let range = editor.range else { return [] }
@@ -763,7 +855,7 @@ final class Timeline: NSView {
             if editor.showsTrackMeter(track.id) {
                 for (channel, value) in [meter.left, meter.right].enumerated() {
                     let text = (channel == 0 ? "L " : "R ") + value.peakText
-                    label(text, NSRect(x: fragmentLeft - 78, y: y + 5 + CGFloat(channel) * 14, width: 66, height: 14), size: 9, color: meterColor(value.peak), weight: .medium, alignment: .right)
+                    label(text, NSRect(x: fragmentLeft - 100, y: y + 5 + CGFloat(channel) * 14, width: 66, height: 14), size: 9, color: meterColor(value.peak), weight: .medium, alignment: .right)
                 }
             }
             let color = trackColors[index % trackColors.count]
@@ -774,15 +866,15 @@ final class Timeline: NSView {
             let muteRect = trackMuteRect(row: index, depth: depth)
             fill(muteRect, track.muted ? NSColor.systemOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
             drawTrackControlHover(track.id, kind: 0, rect: muteRect)
-            label(track.muted ? "MUTED" : "MUTE", NSRect(x: muteRect.minX, y: muteRect.minY + 5, width: muteRect.width, height: 15), size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, weight: .semibold, alignment: .center)
+            label(track.muted ? "MUTED" : "MUTE", NSRect(x: muteRect.minX, y: muteRect.minY + 3, width: muteRect.width, height: 15), size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, weight: .semibold, alignment: .center)
             let soloRect = trackSoloRect(row: index, depth: depth)
             fill(soloRect, track.solo ? NSColor.systemBlue.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
             drawTrackControlHover(track.id, kind: 1, rect: soloRect)
-            label("SOLO", NSRect(x: soloRect.minX, y: soloRect.minY + 5, width: soloRect.width, height: 15), size: 9, color: track.solo ? .systemBlue : .secondaryLabelColor, weight: .semibold, alignment: .center)
+            label("SOLO", NSRect(x: soloRect.minX, y: soloRect.minY + 3, width: soloRect.width, height: 15), size: 9, color: track.solo ? .systemBlue : .secondaryLabelColor, weight: .semibold, alignment: .center)
             let fxRect = trackFXRect(row: index, depth: depth)
             fill(fxRect, track.effects.isEmpty ? NSColor.white.withAlphaComponent(0.06) : color.withAlphaComponent(0.18), radius: 5)
             drawTrackControlHover(track.id, kind: 2, rect: fxRect)
-            label("FX", NSRect(x: fxRect.minX, y: fxRect.minY + 5, width: fxRect.width, height: 15), size: 10, color: track.effects.isEmpty ? .secondaryLabelColor : color, weight: .semibold, alignment: .center)
+            label("FX", NSRect(x: fxRect.minX, y: fxRect.minY + 3, width: fxRect.width, height: 15), size: 10, color: track.effects.isEmpty ? .secondaryLabelColor : color, weight: .semibold, alignment: .center)
             line(NSPoint(x: pinnedHeaderX, y: y + rowHeight), NSPoint(x: fragmentLeft, y: y + rowHeight), .white.withAlphaComponent(0.065))
         }
         NSGraphicsContext.restoreGraphicsState()

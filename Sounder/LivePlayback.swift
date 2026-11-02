@@ -113,6 +113,7 @@ final class ProcessedMixCache {
         }
         catch { try? FileManager.default.removeItem(at: url); throw error }
     }
+    func invalidate() { lock.lock(); regions.removeAll(); extent = 0; lock.unlock() }
     func append(_ samples: [Float]) throws { try write(samples, at: frames) }
     func write(_ samples: [Float], at frame: Int) throws {
         lock.lock(); defer { lock.unlock() }
@@ -162,8 +163,18 @@ final class StreamingGraph {
         let tail: Int
         let dryDelay: SampleDelay
         let childDelays: [SampleDelay]
-        init(dry: [Float], children: [Bus], effects: [StreamingEffect], channels: Int, muted: Bool) {
-            self.muted = muted
+        var gains: [Double]
+        var targetGains: [Double]
+        var rampRemaining = 0
+        let rampLength: Int
+        func setMix(_ track: Track) {
+            targetGains = (0..<channels).map { track.outputGain(channel: $0, channels: channels) }
+            rampRemaining = rampLength
+        }
+        init(dry: [Float], children: [Bus], effects: [StreamingEffect], channels: Int, track: Track, sampleRate: Double) {
+            self.muted = track.muted
+            gains = (0..<channels).map { track.outputGain(channel: $0, channels: channels) }
+            targetGains = gains; rampLength = max(1, Int(sampleRate * 0.010))
             self.dry = dry; self.children = children; self.effects = effects; self.channels = channels
             let childLatency = children.map(\.latency).max() ?? 0
             latency = childLatency + effects.reduce(0) { $0 + $1.latency }
@@ -188,6 +199,13 @@ final class StreamingGraph {
                 for i in input.indices { input[i] += signal[i] }
             }
             for effect in effects { input = try effect.process(input) }
+            for frame in 0..<frames {
+                for channel in 0..<channels {
+                    if rampRemaining > 0 { gains[channel] += (targetGains[channel] - gains[channel]) / Double(rampRemaining) }
+                    input[frame * channels + channel] *= Float(gains[channel])
+                }
+                if rampRemaining > 0 { rampRemaining -= 1 }
+            }
             let output = muted || !soloBus ? [Float](repeating: 0, count: input.count) : input
             let metered = meterDelay?.apply(output) ?? output
             peak = StereoLevels()
@@ -231,7 +249,7 @@ final class StreamingGraph {
             }
             let children = try project.tracks.filter { $0.parent == track.id }.map { try bus($0) }
             let effects = try track.effects.filter { !$0.bypassed }.map(makeEffect)
-            let result = Bus(dry: dry, children: children, effects: effects, channels: channelCount, muted: track.muted)
+            let result = Bus(dry: dry, children: children, effects: effects, channels: channelCount, track: track, sampleRate: project.audioFormat.sampleRate)
             trackBuses[track.id] = result
             return result
         }
@@ -247,6 +265,7 @@ final class StreamingGraph {
     }
     // Call on the playback worker, alongside render, to preserve processor state.
     func setMuted(_ muted: Bool, trackID: UUID) { buses[trackID]?.muted = muted }
+    func setTrackMix(_ track: Track) { buses[track.id]?.setMix(track); outputCache.invalidate() }
     func setSolo(_ ids: Set<UUID>) {
         let routing = TrackSoloRouting(tracks: tracks, soloIDs: ids)
         for (id, bus) in buses { bus.soloDry = routing.dry.contains(id); bus.soloBus = routing.buses.contains(id) }
@@ -722,6 +741,7 @@ final class LivePlayback {
         queue.async { self.graph.setMuted(muted, trackID: trackID) }
     }
     func setSolo(_ ids: Set<UUID>) { queue.async { self.graph.setSolo(ids) } }
+    func setTrackMix(_ track: Track) { queue.async { self.graph.setTrackMix(track) } }
     func stop() {
         cancelReturn(); queue.sync { running = false; streamGeneration += 1; pausing = false }
         node.stop(); engine.stop()
@@ -880,10 +900,16 @@ final class DryShuttleSource {
             return try processed.read((range.lowerBound + latency)..<(range.upperBound + latency))
         }
         var output = [Float](repeating: 0, count: range.count * channels)
+        let ancestors = Dictionary(uniqueKeysWithValues: project.tracks.map { ($0.id, $0) })
         for track in tracks {
+            var gains = [Double](repeating: 1, count: channels), current: Track? = track
+            while let node = current {
+                for channel in 0..<channels { gains[channel] *= node.outputGain(channel: channel, channels: channels) }
+                current = node.parent.flatMap { ancestors[$0] }
+            }
             let signal = try store.renderAudio(project, onlyTrack: track.id, sourceFrames: range)
             for frame in 0..<min(signal.frameCount, range.count) {
-                for ch in 0..<channels { output[frame * channels + ch] += signal.channels[ch][frame] }
+                for ch in 0..<channels { output[frame * channels + ch] += signal.channels[ch][frame] * Float(gains[ch]) }
             }
         }
         if let processed {

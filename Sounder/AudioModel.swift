@@ -156,6 +156,20 @@ struct Track: Codable, Identifiable {
     var clips: [Clip] = []
     var effects: [PluginEffect] = []
     var nextTakeNumber = 1
+    var volumeDB = 0.0
+    var pan = 0.0
+    func outputGain(channel: Int, channels: Int) -> Double {
+        let gain = volumeDB <= -60 ? 0 : pow(10, volumeDB / 20)
+        guard channels > 1 else { return gain }
+        let attenuation = channel == 0 ? max(0, pan) : max(0, -pan)
+        return gain * cos(attenuation / 90 * .pi / 2)
+    }
+    func applyMix(to signal: AudioSignal) -> AudioSignal {
+        AudioSignal(channels: signal.channels.enumerated().map { channel, samples in
+            let gain = Float(outputGain(channel: channel, channels: signal.channels.count))
+            return samples.map { $0 * gain }
+        })
+    }
 }
 // Soloed parent buses include their subtree. Soloed children still pass through
 // ancestor effects, without adding the ancestors' own fragments or other branches.
@@ -221,7 +235,7 @@ enum TrackHierarchy {
 }
 // Keep projects saved before effects and per-track take numbering readable.
 extension Track {
-    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, clips, effects, nextTakeNumber }
+    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, clips, effects, nextTakeNumber, volumeDB, pan }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
@@ -232,6 +246,9 @@ extension Track {
         clips = try values.decode([Clip].self, forKey: .clips)
         effects = try values.decodeIfPresent([PluginEffect].self, forKey: .effects) ?? []
         nextTakeNumber = max(1, try values.decodeIfPresent(Int.self, forKey: .nextTakeNumber) ?? 1)
+        volumeDB = try values.decodeIfPresent(Double.self, forKey: .volumeDB) ?? 0
+        pan = try values.decodeIfPresent(Double.self, forKey: .pan) ?? 0
+        guard volumeDB.isFinite, (-60...12).contains(volumeDB), pan.isFinite, (-90...90).contains(pan) else { throw SounderError.message("Invalid track volume or pan") }
     }
 }
 struct ProjectAudioFormat: Codable, Equatable {
@@ -528,8 +545,9 @@ final class AudioStore {
             guard !track.muted, solo.buses.contains(track.id) else { return silence(length) }
             var signal = solo.dry.contains(track.id) ? try raw(track) : silence(length)
             for child in project.tracks where child.parent == track.id { sum(try bus(child), into: &signal) }
-            if let processEffects { return AudioSignal(channels: try signal.channels.map { try processEffects($0, track.effects) }) }
-            return try PluginProcessing.apply(signal, effects: track.effects, format: project.audioFormat)
+            if let processEffects { signal = AudioSignal(channels: try signal.channels.map { try processEffects($0, track.effects) }) }
+            else { signal = try PluginProcessing.apply(signal, effects: track.effects, format: project.audioFormat) }
+            return track.applyMix(to: signal)
         }
         var mix = silence(length)
         for track in project.tracks where track.parent == nil { sum(try bus(track), into: &mix) }
