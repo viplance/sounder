@@ -172,6 +172,50 @@ final class ProjectNameView: NSView {
     }
 }
 
+// Button-only confirmations support keyboard choice regardless of the macOS
+// keyboard-navigation preference. Form dialogs retain their normal field keys.
+final class ActionChoiceAlert: NSAlert {
+    var cancellationIndex: Int?
+    private(set) var selectedButtonIndex = 0
+    private func selectButton(_ index: Int) {
+        selectedButtonIndex = index
+        for (i, button) in buttons.enumerated() {
+            if button.keyEquivalent == "\r" { button.keyEquivalent = "" }
+            if i == index { button.keyEquivalent = "\r"; button.keyEquivalentModifierMask = [] }
+        }
+        window.defaultButtonCell = buttons[index].cell as? NSButtonCell
+        window.makeFirstResponder(buttons[index])
+    }
+    @discardableResult func handleChoiceKey(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.window === window, NSApp.modalWindow === window,
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return false }
+        let enabled = buttons.indices.filter { buttons[$0].isEnabled }
+        guard !enabled.isEmpty else { return false }
+        switch event.keyCode {
+        case 48, 125, 126:
+            let step = event.keyCode == 126 || (event.keyCode == 48 && event.modifierFlags.contains(.shift)) ? -1 : 1
+            let current = enabled.firstIndex(of: selectedButtonIndex) ?? 0
+            selectButton(enabled[(current + step + enabled.count) % enabled.count]); return true
+        case 36, 76:
+            guard buttons.indices.contains(selectedButtonIndex), buttons[selectedButtonIndex].isEnabled else { return false }
+            buttons[selectedButtonIndex].performClick(nil); return true
+        case 53:
+            guard let index = cancellationIndex, buttons.indices.contains(index), buttons[index].isEnabled else { return false }
+            buttons[index].performClick(nil); return true
+        default: return false
+        }
+    }
+    override func runModal() -> NSApplication.ModalResponse {
+        layout()
+        if let first = buttons.indices.first(where: { buttons[$0].isEnabled }) { selectButton(first) }
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.handleChoiceKey(event) == true ? nil : event
+        }
+        defer { if let monitor { NSEvent.removeMonitor(monitor) } }
+        return super.runModal()
+    }
+}
+
 // Settings use a compact form layout rather than NSAlert's reserved icon area.
 final class CompactSettingsAlert: NSAlert {
     var minimumWidth: CGFloat = 340
@@ -520,6 +564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--fragment-settings-ui-test") { try verifyFragmentSettingsUI() }
             if CommandLine.arguments.contains("--numeric-input-ui-test") { try verifyNumericInputUI() }
             if CommandLine.arguments.contains("--track-mix-ui-test") { try verifyTrackMixUI() }
+            if CommandLine.arguments.contains("--choice-alert-ui-test") { try verifyChoiceAlertsUI() }
             if CommandLine.arguments.contains("--loop-ui-test") { try verifyLoopUI() }
             if CommandLine.arguments.contains("--loop-recording-ui-test") { try verifyLoopRecordingUI() }
             if CommandLine.arguments.contains("--fragment-mute-ui-test") { try verifyFragmentMuteUI() }

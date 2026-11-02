@@ -136,7 +136,7 @@ final class Editor: NSObject {
         guard !busy else { return }
         guard let index = selectedIndex else { notifications.show("Select a track to delete", style: .hint); return }
         let id = project.tracks[index].id
-        let alert = NSAlert(); alert.messageText = "Delete track?"; alert.informativeText = "This removes the track, its fragments and nested tracks. You can undo this action."; alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel")
+        let alert = ActionChoiceAlert(); alert.cancellationIndex = 1; alert.messageText = "Delete track?"; alert.informativeText = "This removes the track, its fragments and nested tracks. You can undo this action."; alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         checkpoint(); let ids = descendants(of: id); project.tracks.removeAll { ids.contains($0.id) }; reconcile(); notifications.show("Track deleted", style: .error); update()
     }
@@ -417,6 +417,18 @@ final class Editor: NSObject {
         self.recorder = recorder; startTimer(); update()
     }
     func showsTrackMeter(_ id: UUID) -> Bool { isPlaying || isRecording || (trackMeters[id]?.peak ?? 0) > 0 }
+    func displayedTrackMeter(_ track: Track) -> StereoTrackLevelMeter {
+        var meter = trackMeters[track.id] ?? StereoTrackLevelMeter()
+        // Playback is already metered after the fader. Capture snapshots are
+        // source PCM; apply the current controls to both bars and held peaks.
+        if isRecording && recordingTrack == track.id {
+            let left = track.outputGain(channel: 0, channels: project.audioFormat.channels)
+            let right = track.outputGain(channel: 1, channels: project.audioFormat.channels)
+            meter.left.level *= left; meter.left.peak *= left
+            meter.right.level *= right; meter.right.peak *= right
+        }
+        return meter
+    }
     private func updateTrackMeters(_ peaks: [UUID: StereoLevels], at time: Double = ProcessInfo.processInfo.systemUptime) {
         let ids = Set(project.tracks.map(\.id))
         trackMeters = trackMeters.filter { ids.contains($0.key) }
@@ -906,7 +918,7 @@ final class Editor: NSObject {
     func confirmDiscard() -> Bool {
         flushPluginEdits()
         guard dirty else { return true }
-        let alert = NSAlert(); alert.messageText = "Save changes to this project?"; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Discard"); alert.addButton(withTitle: "Cancel")
+        let alert = ActionChoiceAlert(); alert.cancellationIndex = 2; alert.messageText = "Save changes to this project?"; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Discard"); alert.addButton(withTitle: "Cancel")
         switch alert.runModal() { case .alertFirstButtonReturn: return save(); case .alertSecondButtonReturn: return true; default: return false }
     }
     func open() {

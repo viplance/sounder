@@ -1,6 +1,50 @@
 import AppKit
 
 extension AppDelegate {
+    func verifyChoiceAlertsUI() throws {
+        let cases: [(String, [String], [(UInt16, NSEvent.ModifierFlags)], Int, Bool)] = [
+            ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(125, []), (126, []), (36, [])], 0, false),
+            ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(48, []), (36, [])], 1, false),
+            ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(48, [.shift]), (76, [])], 2, false),
+            ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(125, []), (53, [])], 2, false),
+            ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(125, [])], 0, true),
+            ("Delete track?", ["Delete", "Cancel"], [(125, []), (36, [])], 1, false),
+            ("Delete track?", ["Delete", "Cancel"], [(126, []), (48, []), (36, [])], 0, false)
+        ]
+        for (title, titles, keys, expected, mouse) in cases {
+            let alert = ActionChoiceAlert(); alert.messageText = title; alert.cancellationIndex = titles.count - 1
+            for title in titles { alert.addButton(withTitle: title) }
+            var failure: String?
+            let timer = Timer(timeInterval: 0.1, repeats: false) { _ in
+                if alert.selectedButtonIndex != 0 || alert.window.defaultButtonCell !== alert.buttons[0].cell { failure = "Confirmation did not initially select its primary button" }
+                let otherWindow = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: self.window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 48)!
+                if alert.handleChoiceKey(otherWindow) { failure = "Confirmation intercepted another window's keyboard input" }
+                for (code, flags) in keys {
+                    let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: alert.window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+                    NSApp.postEvent(event, atStart: false)
+                }
+                if mouse {
+                    // Native mouse button actions must remain independent of
+                    // whichever button keyboard navigation selected.
+                    let click = Timer(timeInterval: 0.1, repeats: false) { _ in alert.buttons[0].performClick(nil) }
+                    RunLoop.main.add(click, forMode: .modalPanel)
+                }
+            }
+            let timeout = Timer(timeInterval: 3, repeats: false) { _ in
+                failure = "Confirmation keyboard input did not complete the modal session"
+                alert.buttons.last?.performClick(nil)
+            }
+            RunLoop.main.add(timer, forMode: .modalPanel); RunLoop.main.add(timeout, forMode: .modalPanel)
+            let response = alert.runModal()
+            timer.invalidate(); timeout.invalidate()
+            if let failure { throw SounderError.message(failure) }
+            guard response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + expected else { throw SounderError.message("Wrong confirmation choice for \(title): \(response.rawValue)") }
+        }
+        print("PASS: Save/Discard/Cancel and Delete/Cancel navigate with Up/Down, Tab and Shift-Tab; Return/keypad Enter activate the selected button, Escape cancels and mouse actions remain native")
+    }
+}
+
+extension AppDelegate {
     func verifyPinnedRulerUI() throws {
         func check(_ condition: Bool, _ message: String) throws {
             guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
@@ -1041,6 +1085,57 @@ extension AppDelegate {
               editor.project.tracks[0].pan == -30, controls.volume.isEnabled else { throw SounderError.message("Live track fader changed or stopped the playback engine") }
         editor.stop()
         clipView.scroll(to: .zero); refresh()
+        for control in [controls.volume, controls.pan] {
+            func hoverEvent(_ type: NSEvent.EventType) -> NSEvent {
+                NSEvent.enterExitEvent(with: type, location: control.convert(NSPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
+            }
+            control.mouseEntered(with: hoverEvent(.mouseEntered))
+            guard control.visibleValueText == control.valueText?(control.doubleValue), let hoverFrame = control.visibleValueFrame, control.toolTip == nil else { throw SounderError.message("Slider hover must show its value synchronously without a native delayed tooltip") }
+            var sameReadout = false
+            control.withTrackingGesture {
+                sameReadout = control.visibleValueFrame == hoverFrame
+                control.mouseExited(with: hoverEvent(.mouseExited))
+                sameReadout = sameReadout && control.visibleValueFrame == hoverFrame
+            }
+            guard sameReadout, control.visibleValueText == nil else { throw SounderError.message("Hover and dragging must use the same readout, retain it when dragging outside and hide after release outside") }
+            control.mouseEntered(with: hoverEvent(.mouseEntered))
+            control.mouseExited(with: hoverEvent(.mouseExited))
+            guard control.visibleValueText == nil else { throw SounderError.message("Hover readout did not disappear immediately when leaving the slider") }
+            control.isEnabled = false; control.mouseEntered(with: hoverEvent(.mouseEntered))
+            guard control.visibleValueText == nil else { throw SounderError.message("Disabled slider must not show a hover readout") }
+            control.mouseExited(with: hoverEvent(.mouseExited)); control.isEnabled = true
+        }
+        print("PASS: Both sliders show values immediately on hover at the exact drag-readout position, preserve them during dragging and hide on exit; disabled sliders have no hover")
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let volume = controls.volume
+            func thumbX() throws -> CGFloat {
+                guard let bitmap = volume.bitmapImageRepForCachingDisplay(in: volume.bounds) else { throw SounderError.message("Cannot capture volume thumb") }
+                volume.effectiveAppearance.performAsCurrentDrawingAppearance { volume.cacheDisplay(in: volume.bounds, to: bitmap) }
+                var sum = 0.0, count = 0.0
+                for y in 0..<bitmap.pixelsHigh { for x in 0..<bitmap.pixelsWide {
+                    if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB), color.alphaComponent > 0.8,
+                       color.redComponent > 0.65, color.greenComponent > 0.65, color.blueComponent > 0.65 { sum += Double(x); count += 1 }
+                } }
+                guard count > 0 else { throw SounderError.message("Volume thumb did not render") }
+                return (sum / count + 0.5) * volume.bounds.width / CGFloat(bitmap.pixelsWide)
+            }
+            volume.doubleValue = -48; _ = volume.sendAction(volume.action, to: volume.target)
+            let start = try thumbX(), history = editor.undoStack.count
+            let point = NSPoint(x: volume.bounds.maxX - 8, y: volume.bounds.midY)
+            func clickEvent(_ type: NSEvent.EventType) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: volume.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+            }
+            NSApp.postEvent(clickEvent(.leftMouseUp), atStart: true)
+            volume.mouseDown(with: clickEvent(.leftMouseDown))
+            let immediate = try thumbX()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.07))
+            let middle = try thumbX()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            let end = try thumbX()
+            guard abs(immediate - start) < 4, middle > immediate + 3, end > middle + 3,
+                  editor.project.tracks[0].volumeDB > 0, editor.undoStack.count == history + 1 else { throw SounderError.message("Rail click must animate the rendered volume thumb through intermediate positions and create one Undo action: \(start), \(immediate), \(middle), \(end)") }
+            print("PASS: Clicking the volume rail animates the actual thumb smoothly to its destination with one Undo action")
+        }
         // Several continuous slider actions within the same tracking gesture
         // must create one history entry, independently of device event timing.
         let slider = controls.volume, beforeDrag = editor.undoStack.count

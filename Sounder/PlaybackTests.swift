@@ -521,7 +521,18 @@ extension AppDelegate {
         try check(editor.isPlaying && zip(tracks, [0.1, 0.6, 0.95]).allSatisfy { abs((editor.trackMeters[$0.0.id]?.peak ?? 0) - $0.1) < 1e-5 }, "Header meters follow actual playback peaks for green, yellow and red levels")
         try check(zip(tracks, [0.05, 0.3, 0.475]).allSatisfy { abs((editor.trackMeters[$0.0.id]?.right.peak ?? 0) - $0.1) < 1e-5 }, "Header meters preserve separate right-channel levels")
         for row in tracks.indices {
-            try check(timeline.trackNameRect(row: row, depth: 0).maxX < timeline.fragmentLeft - 74, "Track name leaves room for its peak readout")
+            guard let slider = timeline.mixerControls[tracks[row].id]?.volume,
+                  let cell = slider.cell as? TrackVolumeMeterCell else { throw SounderError.message("Volume slider has no stereo meter") }
+            let sliderRect = slider.convert(slider.bounds, to: timeline)
+            let readout = timeline.trackMeterReadoutRect(row: row, channel: 0)
+            try check(readout.minX >= sliderRect.maxX + 5 && readout.maxX < timeline.fragmentLeft - 24 && readout.minY >= timeline.trackFXRect(row: row, depth: 0).maxY && timeline.trackMeterReadoutRect(row: row, channel: 1).maxY < timeline.ruler + CGFloat(row + 1) * timeline.rowHeight,
+                      "Stereo numeric peaks sit after the volume rail without overlapping buttons, Pan or adjacent tracks")
+            try check(abs(cell.levels[0] - Double([Float(0.1), 0.6, 0.95][row])) < 1e-5 && abs(cell.levels[1] - cell.levels[0] * 0.5) < 1e-5,
+                      "Volume rail follows actual separate post-fader playback levels")
+            let rect = cell.barRect(flipped: slider.isFlipped)
+            let end = cell.meterEndX(pow(10, slider.doubleValue / 20), inside: rect, flipped: slider.isFlipped)
+            let knob = cell.knobRect(flipped: slider.isFlipped)
+            try check(abs(end - knob.midX) < 1, "A 0 dB pre-fader signal fills exactly to the volume thumb (end: \(end), thumb: \(knob.midX))")
         }
         func snapshot(_ suffix: String) {
             guard let index = CommandLine.arguments.firstIndex(of: "--snapshot"), index + 1 < CommandLine.arguments.count else { return }
@@ -533,6 +544,11 @@ extension AppDelegate {
             }
         }
         snapshot("meters")
+        editor.setTrackMix(tracks[0].id, volumeDB: -12, pan: 60)
+        RunLoop.current.run(until: Date().addingTimeInterval(1.08)); editor.updateTransportPosition()
+        let adjusted = editor.project.tracks[0], displayed = editor.displayedTrackMeter(editor.project.tracks[0])
+        try check(abs(displayed.left.peak - 0.1 * adjusted.outputGain(channel: 0, channels: 2)) < 1e-5 && abs(displayed.right.peak - 0.05 * adjusted.outputGain(channel: 1, channels: 2)) < 1e-5,
+                  "Playback numeric peaks include live volume and Pan exactly once after their peak hold expires")
         editor.toggleMute(tracks[1].id)
         RunLoop.current.run(until: Date().addingTimeInterval(0.15))
         guard let playback = editor.player else { throw SounderError.message("Meter UI playback stopped unexpectedly") }
@@ -540,6 +556,7 @@ extension AppDelegate {
         try check(mutedPeak == StereoLevels(), "Muted tracks report zero signal without restarting playback")
         editor.stop(); refresh()
         try check(editor.trackMeters.values.allSatisfy { $0.level == 0 }, "Stopping clears every header fill immediately")
+        try check(timeline.mixerControls.values.allSatisfy { ($0.volume.cell as? TrackVolumeMeterCell)?.levels == [0, 0] }, "Stopping clears volume rail fills instead of retaining a static fill to the thumb")
         RunLoop.current.run(until: Date().addingTimeInterval(1.05))
         try check(editor.trackMeters.values.allSatisfy { $0.peak == 0 }, "Stopped peak readouts clear after the one-second hold")
         editor.selectedTrack = tracks[0].id; editor.cursor = 0
@@ -552,6 +569,18 @@ extension AppDelegate {
         try check(editor.isRecording && (editor.trackMeters[tracks[0].id]?.peak ?? 0) > 0.4, "Recording peak readout measures actual captured microphone-format PCM")
         guard let recordingMeter = editor.trackMeters[tracks[0].id] else { throw SounderError.message("Missing stereo recording meter") }
         try check(abs(recordingMeter.right.peak - recordingMeter.left.peak * 0.25) < 1e-5, "Recording meters preserve independent captured left and right peaks")
+        editor.project.tracks[0].volumeDB = -12; editor.project.tracks[0].pan = 60; refresh()
+        guard let cell = timeline.mixerControls[tracks[0].id]?.volume.cell as? TrackVolumeMeterCell else { throw SounderError.message("Missing recording rail") }
+        let track = editor.project.tracks[0]
+        let displayedRecording = editor.displayedTrackMeter(track)
+        try check(cell.recording && abs(cell.levels[0] - recordingMeter.left.level * track.outputGain(channel: 0, channels: 2)) < 1e-9 && abs(cell.levels[1] - recordingMeter.right.level * track.outputGain(channel: 1, channels: 2)) < 1e-9,
+                  "Recording rail is red and follows volume and Pan")
+        try check(abs(displayedRecording.left.peak - recordingMeter.left.peak * track.outputGain(channel: 0, channels: 2)) < 1e-9 && abs(displayedRecording.right.peak - recordingMeter.right.peak * track.outputGain(channel: 1, channels: 2)) < 1e-9,
+                  "Recording numeric peaks and rail share the same current Volume/Pan gains without changing captured PCM")
+        editor.setTrackMix(track.id, volumeDB: -60)
+        let silent = editor.displayedTrackMeter(editor.project.tracks[0])
+        try check(silent.left.peakText == "−∞ dB" && silent.right.peakText == "−∞ dB", "Moving capture volume to silence immediately updates both held numeric peaks")
+        editor.setTrackMix(track.id, volumeDB: -12)
         snapshot("recording")
     }
 }
@@ -684,7 +713,7 @@ func runShuttleAudioTests() throws {
         let before = try stopping.render(frames: 512)!
         let position = stopping.renderedPosition, speed = stopping.renderedSpeed
         stopping.retarget(0)
-        try check(stopping.motion.position(at: 0) == position && stopping.motion.speed(at: 0) == speed && stopping.motion.settlingDuration == 0.5, "Release-to-pause takes 0.5 seconds and preserves position and signed speed (\(direction))")
+        try check(stopping.motion.position(at: 0) == position && stopping.motion.speed(at: 0) == speed && stopping.motion.settlingDuration == 0.25, "Release-to-pause takes 0.25 seconds and preserves position and signed speed (\(direction))")
         let first = try stopping.render(frames: 512)!
         try check(abs(first.floatChannelData![0][0] - before.floatChannelData![0][511]) < 0.0001, "Release-to-pause has no sample discontinuity (\(direction))")
         var last = first, blocks = 0
@@ -695,8 +724,8 @@ func runShuttleAudioTests() throws {
     for initial in [-8.0, -4.0, 0.0, 4.0, 8.0] {
         let returning = ShuttleMotion(start: 10, direction: 1, end: 100, initialSpeed: initial, target: 1)
         let duration = returning.settlingDuration
-        try check(duration == 0.5 && returning.speed(at: 0) == initial && returning.speed(at: duration) == 1 && returning.speed(at: duration + 2) == 1, "Release-to-Play continuously reaches and maintains exactly 1x (\(initial))")
-        if initial < 0 { try check(returning.speed(at: 0.25) < 0 && returning.speed(at: duration) > 0, "Releasing reverse playback brakes through zero before going forward") }
+        try check(duration == 0.25 && returning.speed(at: 0) == initial && returning.speed(at: duration) == 1 && returning.speed(at: duration + 2) == 1, "Release-to-Play continuously reaches and maintains exactly 1x (\(initial))")
+        if initial < 0 { try check(returning.speed(at: duration / 2) < 0 && returning.speed(at: duration) > 0, "Releasing reverse playback brakes through zero before going forward") }
     }
     for direction in [-1.0, 1.0] {
         let old = try StreamingGraph(project: project, store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }

@@ -888,7 +888,7 @@ func runStreamingGraphTests() throws {
 /// same integral, independent of keyboard repeat settings and UI timer jitter.
 struct ShuttleMotion {
     static let maximumRate = 8.0
-    static let releaseDuration = 0.5
+    static let releaseDuration = 0.25
     let start: Double
     let direction: Double
     let end: Double

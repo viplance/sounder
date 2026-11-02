@@ -1,11 +1,78 @@
 import AppKit
 
+final class TrackVolumeMeterCell: NSSliderCell {
+    var levels = [0.0, 0.0]
+    var recording = false
+    private var animationFrom: Double?
+    private var animationStart = 0.0
+    private var animationTimer: Timer?
+    var displayedValue: Double {
+        guard let from = animationFrom else { return doubleValue }
+        let t = min(1, max(0, (ProcessInfo.processInfo.systemUptime - animationStart) / 0.18))
+        let eased = t * t * (3 - 2 * t)
+        return from + (doubleValue - from) * eased
+    }
+    func animateRailClick() {
+        let from = displayedValue
+        cancelKnobAnimation()
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        animationFrom = from; animationStart = ProcessInfo.processInfo.systemUptime
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if ProcessInfo.processInfo.systemUptime - self.animationStart >= 0.18 { self.cancelKnobAnimation() }
+            self.controlView?.needsDisplay = true
+            (self.controlView as? TrackMixerSlider)?.refreshValuePresentation()
+        }
+        animationTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+    }
+    func cancelKnobAnimation() {
+        animationTimer?.invalidate(); animationTimer = nil; animationFrom = nil
+        controlView?.needsDisplay = true
+    }
+    override func continueTracking(last lastPoint: NSPoint, current currentPoint: NSPoint, in controlView: NSView) -> Bool {
+        if hypot(currentPoint.x - lastPoint.x, currentPoint.y - lastPoint.y) > 1 { cancelKnobAnimation() }
+        return super.continueTracking(last: lastPoint, current: currentPoint, in: controlView)
+    }
+    override func drawKnob(_ knobRect: NSRect) {
+        let travel = max(0, barRect(flipped: controlView?.isFlipped ?? false).width - knobRect.width)
+        let offset = (displayedValue - doubleValue) / (maxValue - minValue) * travel
+        super.drawKnob(knobRect.offsetBy(dx: offset, dy: 0))
+    }
+    deinit { animationTimer?.invalidate() }
+    func fraction(_ amplitude: Double) -> Double {
+        max(0, min(1, (TrackLevelMeter.decibels(amplitude) - minValue) / (maxValue - minValue)))
+    }
+    func meterEndX(_ amplitude: Double, inside rect: NSRect, flipped: Bool) -> CGFloat {
+        let amount = fraction(amplitude)
+        guard amount > 0 else { return rect.minX }
+        let inset = knobRect(flipped: flipped).width / 2
+        return rect.minX + inset + max(0, rect.width - 2 * inset) * amount
+    }
+    override func drawBar(inside rect: NSRect, flipped: Bool) {
+        let rail = NSRect(x: rect.minX, y: rect.midY - 3, width: rect.width, height: 6)
+        fill(rail, NSColor.white.withAlphaComponent(0.16), radius: 3)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(roundedRect: rail, xRadius: 3, yRadius: 3).addClip()
+        let color = recording ? NSColor.systemRed : accent
+        for channel in 0..<2 {
+            let top = flipped ? channel : 1 - channel
+            fill(NSRect(x: rail.minX, y: rail.minY + CGFloat(top) * 3.5, width: meterEndX(levels[channel], inside: rail, flipped: flipped) - rail.minX, height: 2.5), color)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
 final class TrackMixerSlider: NSSlider {
     private(set) var trackingGesture = false
     var checkpointed = false
     var valueText: ((Double) -> String)?
     private var valuePanel: NSPanel?
     private let valueLabel = NSTextField(labelWithString: "")
+    private var valueTrackingArea: NSTrackingArea?
+    private var hovering = false
+    private var resignKeyObserver: NSObjectProtocol?
     var visibleValueText: String? { valuePanel?.isVisible == true ? valueLabel.stringValue : nil }
     var visibleValueFrame: NSRect? { valuePanel?.isVisible == true ? valuePanel?.frame : nil }
     private func showValue() {
@@ -26,7 +93,8 @@ final class TrackMixerSlider: NSSlider {
         valueLabel.stringValue = valueText(doubleValue); valueLabel.sizeToFit()
         let size = NSSize(width: max(50, valueLabel.frame.width + 18), height: 27)
         let rect = window.convertToScreen(convert(bounds, to: nil))
-        let fraction = max(0, min(1, (doubleValue - minValue) / (maxValue - minValue)))
+        let displayedValue = (cell as? TrackVolumeMeterCell)?.displayedValue ?? doubleValue
+        let fraction = max(0, min(1, (displayedValue - minValue) / (maxValue - minValue)))
         var origin: NSPoint
         if isVertical {
             // The rectangle is already in screen coordinates, where Y grows
@@ -49,31 +117,66 @@ final class TrackMixerSlider: NSSlider {
         valuePanel?.orderOut(nil)
         if let panel = valuePanel { panel.parent?.removeChildWindow(panel) }
     }
+    func refreshValuePresentation() {
+        if isEnabled, !isHiddenOrHasHiddenAncestor, window?.isKeyWindow == true, hovering || trackingGesture { showValue() }
+        else { hideValue() }
+    }
+    private var pointerIsInside: Bool {
+        guard let window, window.isKeyWindow, !isHiddenOrHasHiddenAncestor else { return false }
+        return visibleRect.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let valueTrackingArea { removeTrackingArea(valueTrackingArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect, .enabledDuringMouseDrag], owner: self)
+        addTrackingArea(area); valueTrackingArea = area
+        hovering = pointerIsInside; refreshValuePresentation()
+    }
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true; refreshValuePresentation()
+    }
+    override func mouseExited(with event: NSEvent) {
+        hovering = false; refreshValuePresentation()
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
+        resignKeyObserver = window.map { window in
+            NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+                self?.hovering = false; self?.hideValue()
+            }
+        }
+    }
+    deinit { if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) } }
     override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if newWindow == nil { hideValue() }
+        if newWindow == nil { hideValue(); (cell as? TrackVolumeMeterCell)?.cancelKnobAnimation() }
         super.viewWillMove(toWindow: newWindow)
     }
     override func sendAction(_ action: Selector?, to target: Any?) -> Bool {
         let sent = super.sendAction(action, to: target)
-        if trackingGesture { showValue() }
+        refreshValuePresentation()
         return sent
     }
     func withTrackingGesture(_ action: () -> Void) {
         trackingGesture = true; checkpointed = false
         showValue()
-        defer { hideValue(); trackingGesture = false; checkpointed = false }
+        defer { trackingGesture = false; checkpointed = false; refreshValuePresentation() }
         action()
     }
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }
-        if event.clickCount == 2 {
-            withTrackingGesture {
+        if let cell = cell as? TrackVolumeMeterCell {
+            let point = convert(event.locationInWindow, from: nil)
+            if event.clickCount == 1 && !cell.knobRect(flipped: isFlipped).contains(point) { cell.animateRailClick() }
+            else { cell.cancelKnobAnimation() }
+        }
+        withTrackingGesture {
+            if event.clickCount == 2 {
                 doubleValue = 0
                 _ = sendAction(action, to: target)
-            }
-            return
+            } else { super.mouseDown(with: event) }
+            hovering = pointerIsInside
         }
-        withTrackingGesture { super.mouseDown(with: event) }
     }
 }
 
@@ -89,6 +192,9 @@ final class TrackMixerControls: NSView {
         trackID = track.id; self.editor = editor
         super.init(frame: .zero)
         wantsLayer = true; layer?.masksToBounds = true
+        let meterCell = TrackVolumeMeterCell()
+        meterCell.minValue = -60; meterCell.maxValue = 12; meterCell.doubleValue = track.volumeDB
+        volume.cell = meterCell
         for slider in [volume, pan] {
             slider.controlSize = .mini; slider.isContinuous = true; slider.target = self
             slider.trackFillColor = accent
@@ -113,8 +219,15 @@ final class TrackMixerControls: NSView {
         volume.isEnabled = editor?.canAdjustTrackMix == true; pan.isEnabled = volume.isEnabled
         volume.setAccessibilityLabel("\(track.name) volume")
         pan.setAccessibilityLabel("\(track.name) Pan")
-        volume.toolTip = track.volumeDB <= -60 ? "Volume: −∞ dB" : String(format: "Volume: %+.1f dB", track.volumeDB)
-        pan.toolTip = track.pan == 0 ? "Pan: Center" : String(format: "Pan: %@ %.0f°", track.pan < 0 ? "Left" : "Right", abs(track.pan))
+        volume.toolTip = nil; pan.toolTip = nil
+        volume.refreshValuePresentation(); pan.refreshValuePresentation()
+        if let cell = volume.cell as? TrackVolumeMeterCell, let editor {
+            let meter = editor.displayedTrackMeter(track)
+            cell.recording = editor.isRecording && editor.recordingTrack == track.id
+            let active = editor.isPlaying || editor.isRecording
+            cell.levels = active ? [meter.left.level, meter.right.level] : [0, 0]
+            volume.needsDisplay = true
+        }
     }
     private func change(_ slider: TrackMixerSlider, isPan: Bool) {
         guard let editor else { return }
@@ -356,8 +469,8 @@ final class Timeline: NSView {
             guard !control.isHidden else { continue }
             control.frame = rect
             let offset = y - rect.minY
-            let first = trackMuteRect(row: row, depth: depth), last = trackFXRect(row: row, depth: depth)
-            control.volume.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + 56, width: last.maxX - first.minX, height: 18)
+            let first = trackMuteRect(row: row, depth: depth)
+            control.volume.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + 56, width: trackMeterReadoutRect(row: row, channel: 0).minX - 6 - first.minX, height: 18)
             control.pan.frame = NSRect(x: header - 24, y: offset + 4, width: 20, height: rowHeight - 8)
             control.configure(track)
         }
@@ -658,8 +771,10 @@ final class Timeline: NSView {
     }
     func trackNameRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
-        let meterWidth: CGFloat = rows.indices.contains(row) && editor.showsTrackMeter(rows[row].0.id) ? 66 : 0
-        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 34 - meterWidth, height: 22)
+        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 34, height: 22)
+    }
+    func trackMeterReadoutRect(row: Int, channel: Int) -> NSRect {
+        NSRect(x: fragmentLeft - 86, y: ruler + CGFloat(row) * rowHeight + 54 + CGFloat(channel) * 11, width: 56, height: 11)
     }
     func trackNameHitRect(row: Int, depth: Int) -> NSRect {
         guard rows.indices.contains(row) else { return .zero }
@@ -905,19 +1020,11 @@ final class Timeline: NSView {
             let selected = editor.selectedTrack == track.id
             let trackDimmed = dimmed.contains(track.id)
             fill(NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight), selected ? NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.19, alpha: 1) : panelColor)
-            let meter = editor.trackMeters[track.id] ?? StereoTrackLevelMeter()
-            let recording = editor.isRecording && editor.recordingTrack == track.id
-            let headerRect = NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight)
-            if recording || editor.isPlaying {
-                let half = rowHeight / 2
-                for (channel, value) in [meter.left, meter.right].enumerated() where value.fraction > 0 {
-                    fill(NSRect(x: headerRect.minX, y: y + CGFloat(channel) * half, width: header * value.fraction, height: half - 0.5), (recording ? NSColor.systemRed : accent).withAlphaComponent(0.25))
-                }
-            }
+            let meter = editor.displayedTrackMeter(track)
             if editor.showsTrackMeter(track.id) {
                 for (channel, value) in [meter.left, meter.right].enumerated() {
                     let text = (channel == 0 ? "L " : "R ") + value.peakText
-                    label(text, NSRect(x: fragmentLeft - 100, y: y + 5 + CGFloat(channel) * 14, width: 66, height: 14), size: 9, color: meterColor(value.peak), weight: .medium, alignment: .right)
+                    label(text, trackMeterReadoutRect(row: index, channel: channel), size: 8, color: meterColor(value.peak), weight: .medium, alignment: .right)
                 }
             }
             let color = trackColors[index % trackColors.count]
