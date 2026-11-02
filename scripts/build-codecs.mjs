@@ -38,7 +38,7 @@ export function buildCodecs() {
     run('./configure',args,base+'/'+name);
     run('make',['-j8'],base+'/'+name); run('make',['install'],base+'/'+name);
   }
-  run('clang',['-O2','-arch','arm64','-mmacosx-version-min=14.0',helper,'-I'+prefix+'/include','-L'+prefix+'/lib','-lmp3lame','-lvorbisenc','-lvorbisfile','-lvorbis','-logg','-lm','-o',base+'/AudioEncoder']);
+  run('clang',['-O2','-arch','arm64','-mmacosx-version-min=14.0',helper,'-I'+prefix+'/include','-L'+prefix+'/lib','-lmp3lame','-lvorbisenc','-lvorbisfile','-lvorbis','-logg','-lm','-framework','CoreFoundation','-o',base+'/AudioEncoder']);
   writeFileSync(base + '/stamp',stamp);
 }
 if (process.argv[1] === fileURLToPath(import.meta.url)) buildCodecs();

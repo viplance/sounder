@@ -757,13 +757,13 @@ final class Timeline: NSView {
             if recording || editor.isPlaying {
                 let half = rowHeight / 2
                 for (channel, value) in [meter.left, meter.right].enumerated() where value.fraction > 0 {
-                    fill(NSRect(x: headerRect.minX, y: y + CGFloat(channel) * half, width: header * value.fraction, height: half - 0.5), accent.withAlphaComponent(0.25))
+                    fill(NSRect(x: headerRect.minX, y: y + CGFloat(channel) * half, width: header * value.fraction, height: half - 0.5), (recording ? NSColor.systemRed : accent).withAlphaComponent(0.25))
                 }
             }
             if editor.showsTrackMeter(track.id) {
                 for (channel, value) in [meter.left, meter.right].enumerated() {
                     let text = (channel == 0 ? "L " : "R ") + value.peakText
-                    label(text, NSRect(x: fragmentLeft - 78, y: y + 5 + CGFloat(channel) * 14, width: 66, height: 14), size: 9, color: recording ? .systemRed : meterColor(value.peak), weight: .medium, alignment: .right)
+                    label(text, NSRect(x: fragmentLeft - 78, y: y + 5 + CGFloat(channel) * 14, width: 66, height: 14), size: 9, color: meterColor(value.peak), weight: .medium, alignment: .right)
                 }
             }
             let color = trackColors[index % trackColors.count]

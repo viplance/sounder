@@ -275,6 +275,7 @@ struct Project: Codable {
     var audioFormat = ProjectAudioFormat()
     var exportSettings: ExportSettings?
     var exportSettingsConfirmed = false
+    var metadata = AudioMetadata()
     var tempo = 120.0
     var tempoMode = false
     var metronomeEnabled = false
@@ -285,7 +286,7 @@ struct Project: Codable {
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, tempo, tempoMode, metronomeEnabled, normalizationLevel }
+    enum CodingKeys: String, CodingKey { case tracks, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, normalizationLevel }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
@@ -295,6 +296,8 @@ extension Project {
         try audioFormat.validate()
         exportSettings = try values.decodeIfPresent(ExportSettings.self, forKey: .exportSettings)
         try exportSettings?.validate()
+        metadata = try values.decodeIfPresent(AudioMetadata.self, forKey: .metadata) ?? AudioMetadata()
+        try metadata.validate()
         // Earlier builds remembered dialog choices before a file was exported.
         exportSettingsConfirmed = try values.decodeIfPresent(Bool.self, forKey: .exportSettingsConfirmed) ?? false
         tempo = try values.decodeIfPresent(Double.self, forKey: .tempo) ?? 120

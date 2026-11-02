@@ -131,6 +131,7 @@ final class CompactSettingsAlert: NSAlert {
     var minimumWidth: CGFloat = 340
     var minimumButtonWidth: CGFloat = 96
     var buttonSpacing: CGFloat = 12
+    var leadingButton: NSButton?
     private var prepared = false
     override func layout() {
         if !prepared { prepared = true; super.layout() }
@@ -138,7 +139,8 @@ final class CompactSettingsAlert: NSAlert {
         let form = accessoryView
         let errorHeight: CGFloat = informativeText.isEmpty ? 0 : 38
         let buttonWidths = buttons.map { max(minimumButtonWidth, $0.intrinsicContentSize.width + 12) }
-        let width = max(minimumWidth, (form?.frame.width ?? 0) + 40, buttonWidths.reduce(0, +) + CGFloat(max(0, buttons.count - 1)) * buttonSpacing + 40)
+        let leadingWidth: CGFloat = leadingButton == nil ? 0 : 124
+        let width = max(minimumWidth, (form?.frame.width ?? 0) + 40, buttonWidths.reduce(0, +) + CGFloat(max(0, buttons.count - 1)) * buttonSpacing + 40 + leadingWidth)
         let formY: CGFloat = 66 + errorHeight
         let titleY = formY + (form?.frame.height ?? 0) + 12
         let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: titleY + 24 + 16))
@@ -151,6 +153,11 @@ final class CompactSettingsAlert: NSAlert {
             let error = NSTextField(wrappingLabelWithString: informativeText)
             error.font = .systemFont(ofSize: 11); error.textColor = .secondaryLabelColor
             error.frame = NSRect(x: 20, y: 56, width: width - 40, height: 36); root.addSubview(error)
+        }
+        if let leadingButton {
+            leadingButton.removeFromSuperview()
+            leadingButton.frame = NSRect(x: 20, y: 16, width: 112, height: 32)
+            root.addSubview(leadingButton)
         }
         var right = width - 20
         // Preserve NSAlert response order while placing the primary action at the right.

@@ -875,19 +875,22 @@ final class Editor: NSObject {
     }
     func export() {
         guard canExport else { return }
-        let options = ExportOptionsController(settings: project.defaultExportSettings, range: range)
+        let options = ExportOptionsController(settings: project.defaultExportSettings, range: range, metadata: project.metadata)
         guard let settings = options.runModal() else { return }
         let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(filenameExtension: settings.format.rawValue) ?? .audio]
         panel.allowsOtherFileTypes = false
         panel.nameFieldStringValue = projectName.replacingOccurrences(of: "/", with: "-") + "." + settings.format.rawValue
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try export(to: url, settings: settings, range: options.selectedRange) } catch { self.error(error) }
+        do { try export(to: url, settings: settings, range: options.selectedRange, metadata: options.metadata) } catch { self.error(error) }
     }
-    func export(to url: URL, settings: ExportSettings, range: Range<Double>? = nil) throws {
+    func export(to url: URL, settings: ExportSettings, range: Range<Double>? = nil, metadata: AudioMetadata? = nil) throws {
         flushPluginEdits()
-        try AudioExporter.write(project: project, store: audio, settings: settings, to: url, range: range)
-        if settings != project.exportSettings || !project.exportSettingsConfirmed {
+        var exportedProject = project
+        if let metadata { exportedProject.metadata = metadata }
+        try AudioExporter.write(project: exportedProject, store: audio, settings: settings, to: url, range: range)
+        if settings != project.exportSettings || !project.exportSettingsConfirmed || exportedProject.metadata != project.metadata {
             checkpoint(); project.exportSettings = settings; project.exportSettingsConfirmed = true
+            project.metadata = exportedProject.metadata
         }
         update("Exported \(url.lastPathComponent)")
     }

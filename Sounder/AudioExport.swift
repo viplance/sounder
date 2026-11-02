@@ -2,6 +2,40 @@ import AppKit
 import AVFoundation
 import UniformTypeIdentifiers
 
+/// Project-level tags shared by the export dialog and all file encoders.
+struct AudioMetadata: Codable, Equatable {
+    var trackName = ""
+    var artist = ""
+    var album = ""
+    var albumArtist = ""
+    var composer = ""
+    var genre = ""
+    var year = ""
+    var trackNumber = ""
+    var discNumber = ""
+    var copyright = ""
+    var comment = ""
+    static let fields: [(label: String, key: WritableKeyPath<AudioMetadata, String>, tag: String, riff: String?)] = [
+        ("Track name", \.trackName, "TITLE", "INAM"), ("Artist", \.artist, "ARTIST", "IART"),
+        ("Album", \.album, "ALBUM", "IPRD"), ("Album artist", \.albumArtist, "ALBUMARTIST", nil),
+        ("Composer", \.composer, "COMPOSER", nil), ("Genre", \.genre, "GENRE", "IGNR"),
+        ("Year", \.year, "DATE", "ICRD"), ("Track number", \.trackNumber, "TRACKNUMBER", "ITRK"),
+        ("Disc number", \.discNumber, "DISCNUMBER", nil), ("Copyright", \.copyright, "COPYRIGHT", "ICOP"),
+        ("Comment", \.comment, "COMMENT", "ICMT")
+    ]
+    var encoderArguments: [String] {
+        Self.fields.flatMap { field in self[keyPath: field.key].isEmpty ? [] : [field.tag, self[keyPath: field.key]] }
+    }
+    func validate() throws {
+        for field in Self.fields {
+            let value = self[keyPath: field.key]
+            guard !value.utf8.contains(0), value.utf8.count <= 8192 else {
+                throw SounderError.message("\(field.label) must be at most 8192 UTF-8 bytes and contain no null characters")
+            }
+        }
+    }
+}
+
 enum ExportFormat: String, Codable, CaseIterable {
     case mp3, wav, ogg
     var title: String { rawValue.uppercased() }
@@ -28,7 +62,11 @@ final class ExportOptionsController: NSObject {
     let selectedRangeCheckbox = PointerButton(title: "Selected range", target: nil, action: nil)
     private let availableRange: ClosedRange<Double>?
     private var showsRateError = false
-    init(settings: ExportSettings, range: ClosedRange<Double>? = nil) {
+    let metadataButton = PointerButton(title: "Metadata", target: nil, action: nil)
+    private(set) var metadataFields: [NSTextField] = []
+    private var metadataExpanded = false
+    private var metadataPanel = NSView()
+    init(settings: ExportSettings, range: ClosedRange<Double>? = nil, metadata: AudioMetadata = AudioMetadata()) {
         availableRange = range.flatMap { $0.lowerBound.isFinite && $0.upperBound.isFinite && $0.lowerBound >= 0 && $0.upperBound > $0.lowerBound ? $0 : nil }
         super.init()
         alert.messageText = "Export audio"
@@ -53,7 +91,25 @@ final class ExportOptionsController: NSObject {
         selectedRangeCheckbox.setButtonType(.switch); selectedRangeCheckbox.state = .off
         selectedRangeCheckbox.frame = NSRect(x: 0, y: 0, width: 390, height: 24)
         selectedRangeCheckbox.isHidden = availableRange == nil; form.addSubview(selectedRangeCheckbox)
-        alert.accessoryView = form; changed()
+        alert.accessoryView = form
+        metadataButton.bezelStyle = .rounded
+        metadataButton.imagePosition = .imageLeft
+        metadataButton.target = self; metadataButton.action = #selector(toggleMetadata)
+        metadataButton.setAccessibilityLabel("Show or hide metadata")
+        alert.leadingButton = metadataButton
+        for (index, field) in AudioMetadata.fields.enumerated() {
+            let x = CGFloat(index % 2) * 300, y = CGFloat(5 - index / 2) * 52
+            let label = NSTextField(labelWithString: field.label)
+            label.font = .systemFont(ofSize: 11); label.textColor = .secondaryLabelColor
+            label.frame = NSRect(x: x, y: y + 28, width: 280, height: 16)
+            let input = NSTextField(string: metadata[keyPath: field.key])
+            input.frame = NSRect(x: x, y: y, width: 280, height: 24)
+            input.setAccessibilityLabel(field.label)
+            metadataPanel.addSubview(label); metadataPanel.addSubview(input); metadataFields.append(input)
+        }
+        metadataPanel.frame = NSRect(x: 0, y: rangeHeight, width: 580, height: 312)
+        metadataPanel.isHidden = true; form.addSubview(metadataPanel)
+        updateMetadataButton(); changed()
     }
     var selectedRange: Range<Double>? {
         guard selectedRangeCheckbox.state == .on, let availableRange else { return nil }
@@ -72,13 +128,41 @@ final class ExportOptionsController: NSObject {
         note.isHidden = !invalidMP3Rate
         if invalidMP3Rate != showsRateError, let form = alert.accessoryView {
             let shift: CGFloat = invalidMP3Rate ? 54 : -54
-            for view in form.subviews where view !== note && view !== selectedRangeCheckbox { view.frame.origin.y += shift }
+            for view in form.subviews where view !== note && view !== selectedRangeCheckbox && view !== metadataPanel { view.frame.origin.y += shift }
             form.frame.size.height += shift
             showsRateError = invalidMP3Rate
             alert.layout()
         }
     }
-    func runModal() -> ExportSettings? { alert.runModal() == .alertFirstButtonReturn ? settings : nil }
+    var metadata: AudioMetadata {
+        var result = AudioMetadata()
+        for (index, field) in AudioMetadata.fields.enumerated() {
+            result[keyPath: field.key] = metadataFields[index].stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return result
+    }
+    private func updateMetadataButton() {
+        metadataButton.image = NSImage(systemSymbolName: metadataExpanded ? "chevron.down" : "chevron.right", accessibilityDescription: nil)
+    }
+    @objc func toggleMetadata() {
+        guard let form = alert.accessoryView else { return }
+        // End field editing before reparenting the alert's views.
+        alert.window.makeFirstResponder(nil)
+        let shift: CGFloat = metadataExpanded ? -324 : 324
+        for view in form.subviews where view !== selectedRangeCheckbox && view !== metadataPanel { view.frame.origin.y += shift }
+        form.frame.size.height += shift
+        form.frame.size.width = metadataExpanded ? 390 : 580
+        metadataExpanded.toggle(); metadataPanel.isHidden = !metadataExpanded
+        updateMetadataButton(); alert.layout()
+    }
+    func runModal() -> ExportSettings? {
+        while alert.runModal() == .alertFirstButtonReturn {
+            alert.window.makeFirstResponder(nil)
+            do { try metadata.validate(); return settings }
+            catch { alert.informativeText = error.localizedDescription }
+        }
+        return nil
+    }
 }
 
 enum AudioExporter {
@@ -93,8 +177,44 @@ enum AudioExporter {
         guard process.terminationStatus == 0 else { throw SounderError.message(String(data: failure, encoding: .utf8) ?? "Audio export failed") }
         return result
     }
+    private static func riffChunk(_ name: String, _ payload: Data) throws -> Data {
+        guard payload.count <= Int(UInt32.max) else { throw SounderError.message("Metadata is too large") }
+        var size = UInt32(payload.count).littleEndian
+        var result = Data(name.utf8)
+        withUnsafeBytes(of: &size) { result.append(contentsOf: $0) }
+        result.append(payload)
+        if payload.count % 2 != 0 { result.append(0) }
+        return result
+    }
+    private static func addWAVMetadata(_ metadata: AudioMetadata, to url: URL) throws {
+        guard !metadata.encoderArguments.isEmpty else { return }
+        var info = Data("INFO".utf8)
+        for field in AudioMetadata.fields {
+            guard let name = field.riff, !metadata[keyPath: field.key].isEmpty else { continue }
+            var value = Data(metadata[keyPath: field.key].utf8); value.append(0)
+            info.append(try riffChunk(name, value))
+        }
+        // ID3 preserves all Unicode fields, including tags without a RIFF INFO equivalent.
+        let id3 = try runEncoder(["--id3"] + metadata.encoderArguments)
+        var tags = Data()
+        if info.count > 4 { tags.append(try riffChunk("LIST", info)) }
+        tags.append(try riffChunk("id3 ", id3))
+        let file = try FileHandle(forUpdating: url); defer { try? file.close() }
+        let header = try file.read(upToCount: 12) ?? Data()
+        guard header.count == 12, header.prefix(4) == Data("RIFF".utf8), header.suffix(4) == Data("WAVE".utf8) else {
+            throw SounderError.message("Cannot add metadata to this WAV container")
+        }
+        let end = try file.seekToEnd()
+        guard end + UInt64(tags.count) + end % 2 - 8 <= UInt64(UInt32.max) else { throw SounderError.message("WAV file exceeds the RIFF size limit") }
+        if end % 2 != 0 { try file.write(contentsOf: Data([0])) }
+        try file.write(contentsOf: tags)
+        var size = UInt32(try file.offset() - 8).littleEndian
+        try file.seek(toOffset: 4)
+        try withUnsafeBytes(of: &size) { try file.write(contentsOf: Data($0)) }
+    }
     static func write(project: Project, store: AudioStore, settings: ExportSettings, to destination: URL, range: Range<Double>? = nil) throws {
         try settings.validate()
+        try project.metadata.validate()
         if let range {
             guard range.lowerBound.isFinite, range.upperBound.isFinite, range.lowerBound >= 0, range.upperBound > range.lowerBound else { throw SounderError.message("Select a nonempty time range to export") }
         }
@@ -127,6 +247,7 @@ enum AudioExporter {
             let writer = try AudioStore(directory: work)
             writer.configure(ProjectAudioFormat(sampleRate: settings.sampleRate, channels: project.audioFormat.channels, bitDepth: settings.bitDepth))
             try writer.write(signal, to: temporary, bitDepth: settings.bitDepth)
+            try addWAVMetadata(project.metadata, to: temporary)
         } else {
             let raw = work.appendingPathComponent("mix.f32")
             fm.createFile(atPath: raw.path, contents: nil)
@@ -140,7 +261,7 @@ enum AudioExporter {
                 }
                 try file.close()
             } catch { try? file.close(); throw error }
-            try runEncoder([settings.format.rawValue, String(Int(settings.sampleRate)), String(project.audioFormat.channels), raw.path, temporary.path, settings.format == .mp3 ? String(settings.mp3Bitrate) : "0.7"])
+            try runEncoder([settings.format.rawValue, String(Int(settings.sampleRate)), String(project.audioFormat.channels), raw.path, temporary.path, settings.format == .mp3 ? String(settings.mp3Bitrate) : "0.7"] + project.metadata.encoderArguments)
         }
         if fm.fileExists(atPath: destination.path) { _ = try fm.replaceItemAt(destination, withItemAt: temporary) }
         else { try fm.moveItem(at: temporary, to: destination) }
