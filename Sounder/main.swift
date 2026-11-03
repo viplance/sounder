@@ -412,7 +412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     let masterLabel = NSTextField(labelWithString: "MASTER")
     var masterGroup: NSStackView!
     private var titlebarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
-    private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("quality"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("open"), NSToolbarItem.Identifier("save"), NSToolbarItem.Identifier("export")]
+    private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("open"), NSToolbarItem.Identifier("save"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("quality"), NSToolbarItem.Identifier("export")]
     var closingConfirmed = false
     var dialogAutomation: ((NSAlert) -> Void)?
     var fragmentDialogAutomation: ((FragmentSettingsDialog) -> Void)?
@@ -574,10 +574,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         masterGroup.heightAnchor.constraint(equalToConstant: 26).isActive = true
         let controls: [(String, String, NSView)] = [
             ("project", "Project name", projectNameView),
-            ("quality", "Project audio settings", qualityButton),
-            ("master", "Master", masterGroup),
             ("open", "Open project", button("Open project", "folder", #selector(openProject))),
             ("save", "Save project", button("Save project", "square.and.arrow.down", #selector(saveProject))),
+            ("master", "Master", masterGroup),
+            ("quality", "Project audio settings", qualityButton),
             ("export", "Export", export)
         ]
         for (id, label, view) in controls {

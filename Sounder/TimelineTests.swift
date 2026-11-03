@@ -1058,11 +1058,15 @@ extension AppDelegate {
             guard let view = timeline.mixerControls[item.0.id], !view.isHidden else { continue }
             let volume = view.volume.convert(view.volume.bounds, to: timeline), pan = view.pan.convert(view.pan.bounds, to: timeline)
             let fx = view.fx.convert(view.fx.bounds, to: timeline)
-            guard volume.minY >= timeline.trackFXRect(row: row, depth: item.1).maxY,
-                  fx == timeline.trackFXRect(row: row, depth: item.1),
+            let expectedFX = timeline.trackFXRect(row: row, depth: item.1)
+            guard volume.minY >= timeline.trackNameRect(row: row, depth: item.1).maxY,
+                  volume.maxY <= timeline.trackFXRect(row: row, depth: item.1).minY,
+                  abs(fx.minX - expectedFX.minX) < 0.01, abs(fx.minY - expectedFX.minY) < 0.01,
+                  abs(fx.width - expectedFX.width) < 0.01, abs(fx.height - expectedFX.height) < 0.01,
+                  abs(volume.midY - pan.midY) < 0.01,
                   volume.maxX < pan.minX, pan.maxX < timeline.fragmentLeft,
                   abs(pan.height - (timeline.rowHeight - 8)) < 0.01, view.pan.isVertical,
-                  timeline.trackNameRect(row: row, depth: item.1).maxX < pan.minX else { throw SounderError.message("Track sliders overlap buttons, leave the sidebar or have the wrong orientation") }
+                  timeline.trackNameRect(row: row, depth: item.1).maxX < pan.minX else { throw SounderError.message("Track sliders overlap buttons, leave the sidebar or have the wrong orientation: row=\(row), volume=\(volume), name=\(timeline.trackNameRect(row: row, depth: item.1)), fx=\(fx), expectedFX=\(expectedFX), pan=\(pan)") }
         }
         // Measure the rendered native thumb: modern AppKit's legacy cell tick
         // rectangles do not necessarily describe its vertical layer geometry.

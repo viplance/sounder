@@ -7,13 +7,14 @@ struct TrackLevelMeter {
     private var updatedAt: Double?
     static func decibels(_ amplitude: Double) -> Double { amplitude > 0 ? 20 * log10(amplitude) : -.infinity }
     var fraction: Double { max(0, min(1, (Self.decibels(level) + 60) / 60)) }
-    var peakText: String { peak > 0 ? String(format: "%.1f dB", Self.decibels(peak)) : "−∞ dB" }
+    var peakText: String { peak > 0 ? String(format: "%.1f dB", Self.decibels(peak)) : "" }
     mutating func update(_ amplitude: Double, at time: Double) {
         let value = amplitude.isFinite ? max(0, amplitude) : 0
         let elapsed = max(0, time - (updatedAt ?? time))
         level = max(value, level * pow(10, -24 * elapsed / 20))
         if level < 0.001 { level = 0 }
-        if value >= peak || time - peakTime >= 1 { peak = value; peakTime = time }
+        if value >= peak { peak = value; peakTime = time }
+        else if time - peakTime >= 1 { peak = value }
         updatedAt = time
     }
 }

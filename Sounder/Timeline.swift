@@ -73,10 +73,17 @@ final class TrackVolumeMeterCell: NSSliderCell {
         if hypot(currentPoint.x - lastPoint.x, currentPoint.y - lastPoint.y) > 1 { cancelKnobAnimation() }
         return super.continueTracking(last: lastPoint, current: currentPoint, in: controlView)
     }
+    func displayedKnobRect(flipped: Bool) -> NSRect {
+        let rail = barRect(flipped: flipped)
+        let fraction = max(0, min(1, (displayedValue - minValue) / (maxValue - minValue)))
+        let x = rail.minX + 4 + max(0, rail.width - 8) * fraction
+        return NSRect(x: x - 4, y: knobRect(flipped: flipped).midY - 7, width: 8, height: 14)
+    }
     override func drawKnob(_ knobRect: NSRect) {
-        let travel = max(0, barRect(flipped: controlView?.isFlipped ?? false).width - knobRect.width)
-        let offset = (displayedValue - doubleValue) / (maxValue - minValue) * travel
-        super.drawKnob(knobRect.offsetBy(dx: offset, dy: 0))
+        // Preserve native tracking and its generous hit target, but let the
+        // narrow visible thumb reach both rail edges instead of retaining the
+        // inset reserved for the much wider system thumb.
+        super.drawKnob(displayedKnobRect(flipped: controlView?.isFlipped ?? false))
     }
     deinit { animationTimer?.invalidate() }
     func fraction(_ amplitude: Double) -> Double {
@@ -85,7 +92,7 @@ final class TrackVolumeMeterCell: NSSliderCell {
     func meterEndX(_ amplitude: Double, inside rect: NSRect, flipped: Bool) -> CGFloat {
         let amount = fraction(amplitude)
         guard amount > 0 else { return rect.minX }
-        let inset = knobRect(flipped: flipped).width / 2
+        let inset: CGFloat = 4
         return rect.minX + inset + max(0, rect.width - 2 * inset) * amount
     }
     override func drawBar(inside rect: NSRect, flipped: Bool) {
@@ -139,7 +146,12 @@ final class TrackMixerSlider: NSSlider {
             let y = rect.minY + 7 + (rect.height - 14) * fraction
             origin = NSPoint(x: rect.minX - size.width - 6, y: y - size.height / 2)
         } else {
-            origin = NSPoint(x: rect.minX + 7 + (rect.width - 14) * fraction - size.width / 2, y: rect.maxY + 5)
+            let x: CGFloat
+            if let cell = cell as? TrackVolumeMeterCell {
+                let thumb = window.convertToScreen(convert(cell.displayedKnobRect(flipped: isFlipped), to: nil))
+                x = thumb.midX
+            } else { x = rect.minX + 7 + (rect.width - 14) * fraction }
+            origin = NSPoint(x: x - size.width / 2, y: rect.maxY + 5)
         }
         if let screen = window.screen?.visibleFrame {
             origin.x = max(screen.minX + 5, min(screen.maxX - size.width - 5, origin.x))
@@ -221,21 +233,23 @@ final class TrackMixerSlider: NSSlider {
 
 /// Shared post-fader stereo meter, native volume control and peak readouts.
 final class MixerVolumeControl: NSView {
+    static let peakReadoutWidth: CGFloat = 46
+    private static let railReadoutGap: CGFloat = 2
     let slider = TrackMixerSlider(value: 0, minValue: -60, maxValue: 12, target: nil, action: nil)
-    private var meter = StereoTrackLevelMeter()
-    private var showsPeaks = false
+    let peakReadout = MixerPeakReadout(frame: .zero)
     override var isFlipped: Bool { true }
     override init(frame: NSRect) {
         super.init(frame: frame)
         let cell = TrackVolumeMeterCell(); cell.minValue = -60; cell.maxValue = 12; cell.doubleValue = 0
         slider.cell = cell; slider.controlSize = .mini; slider.isContinuous = true
         slider.valueText = { $0 <= -60 ? "−∞ dB" : String(format: "%+.1f dB", $0) }
-        addSubview(slider)
+        addSubview(slider); addSubview(peakReadout)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
         super.layout()
-        slider.frame = NSRect(x: 0, y: bounds.midY - 9, width: max(24, bounds.width - 62), height: 18)
+        slider.frame = NSRect(x: 0, y: bounds.midY - 9, width: max(24, bounds.width - Self.peakReadoutWidth - Self.railReadoutGap), height: 18)
+        peakReadout.frame = NSRect(x: bounds.maxX - Self.peakReadoutWidth, y: bounds.midY - 11, width: Self.peakReadoutWidth, height: 22)
     }
     func configure(track: Track, meter: StereoTrackLevelMeter, active: Bool, recording: Bool, enabled: Bool, showsPeaks: Bool) {
         if !slider.trackingGesture && slider.doubleValue != track.volumeDB { slider.doubleValue = track.volumeDB }
@@ -245,31 +259,71 @@ final class MixerVolumeControl: NSView {
         updateMeter(meter, active: active, recording: recording, showsPeaks: showsPeaks)
     }
     func updateMeter(_ meter: StereoTrackLevelMeter, active: Bool, recording: Bool, showsPeaks: Bool) {
-        let oldLabels = [self.meter.left.peakText, self.meter.right.peakText]
-        func band(_ peak: Double) -> Int {
-            let db = TrackLevelMeter.decibels(peak)
-            return db >= -1 ? 2 : db >= -6 ? 1 : 0
-        }
-        let oldBands = [band(self.meter.left.peak), band(self.meter.right.peak)]
-        let oldPeaks = self.showsPeaks
-        self.meter = meter; self.showsPeaks = showsPeaks
+        peakReadout.update(meter, visible: active && showsPeaks)
         if let cell = slider.cell as? TrackVolumeMeterCell {
             let levels = active ? [meter.left.level, meter.right.level] : [0, 0]
             if cell.recording != recording || cell.levels != levels {
                 cell.recording = recording; cell.levels = levels; slider.needsDisplay = true
             }
         }
-        if oldPeaks != showsPeaks || oldLabels != [meter.left.peakText, meter.right.peakText] || oldBands != [band(meter.left.peak), band(meter.right.peak)] { needsDisplay = true }
+    }
+}
+
+/// Each channel retains its last text while fading, including when its track
+/// ends before the rest of the project. Repeated silent polls do not restart it.
+final class MixerPeakReadout: NSView {
+    let channels = [MixerPeakChannelReadout(frame: .zero), MixerPeakChannelReadout(frame: .zero)]
+    override var isFlipped: Bool { true }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        channels.forEach { addSubview($0) }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func layout() {
+        super.layout()
+        for (index, channel) in channels.enumerated() {
+            channel.frame = NSRect(x: 0, y: CGFloat(index) * 11, width: bounds.width, height: 11)
+        }
+    }
+    func update(_ meter: StereoTrackLevelMeter, visible: Bool) {
+        for (index, value) in [meter.left, meter.right].enumerated() {
+            channels[index].update(value, suffix: index == 0 ? " L" : " R", visible: visible && value.peak > 0)
+        }
+    }
+}
+
+final class MixerPeakChannelReadout: NSView {
+    private var text = ""
+    private var color = accent
+    private var visible = false
+    override var isFlipped: Bool { true }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true; layer?.opacity = 0
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func update(_ value: TrackLevelMeter, suffix: String, visible: Bool) {
+        if visible {
+            let db = TrackLevelMeter.decibels(value.peak)
+            let nextColor: NSColor = db >= -1 ? .systemRed : db >= -6 ? .systemYellow : accent
+            let nextText = value.peakText + suffix
+            if text != nextText || color != nextColor { text = nextText; color = nextColor; needsDisplay = true }
+        }
+        guard self.visible != visible else { return }
+        self.visible = visible
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        layer?.removeAnimation(forKey: "stopFade")
+        layer?.opacity = visible ? 1 : 0
+        if !visible {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 1; fade.toValue = 0; fade.duration = 1
+            layer?.add(fade, forKey: "stopFade")
+        }
+        CATransaction.commit()
     }
     override func draw(_ dirtyRect: NSRect) {
-        guard showsPeaks else { return }
-        for (channel, value) in [meter.left, meter.right].enumerated() {
-            let db = TrackLevelMeter.decibels(value.peak)
-            let color: NSColor = db >= -1 ? .systemRed : db >= -6 ? .systemYellow : accent
-            label((channel == 0 ? "L " : "R ") + value.peakText,
-                  NSRect(x: bounds.maxX - 56, y: bounds.midY - 11 + CGFloat(channel) * 11, width: 56, height: 11),
-                  size: 8, color: color, weight: .medium, alignment: .right)
-        }
+        label(text, bounds, size: 8, color: color, weight: .medium, alignment: .right)
     }
 }
 
@@ -547,6 +601,8 @@ final class Timeline: NSView {
     let editor: Editor
     let header: CGFloat = 220
     let rowHeight: CGFloat = 116 / 1.5
+    private var trackVolumeY: CGFloat { rowHeight / 2 - 11 }
+    private let trackButtonsY: CGFloat = 51
     let ruler: CGFloat = 42
     var rows: [(Track, Int)] = []
     var dragClip: UUID?
@@ -704,11 +760,11 @@ final class Timeline: NSView {
             if needsLayout {
                 let offset = y - rect.minY
                 let first = trackMuteRect(row: row, depth: depth)
-                control.volumeControl.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + 54, width: trackMeterReadoutRect(row: row, channel: 0).maxX - first.minX, height: 22)
+                control.volumeControl.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + trackVolumeY, width: trackMeterReadoutRect(row: row, channel: 0).maxX - first.minX, height: 22)
                 control.volumeControl.layoutSubtreeIfNeeded()
                 control.pan.frame = NSRect(x: header - 24, y: offset + 4, width: 20, height: rowHeight - 8)
                 let fxRect = trackFXRect(row: row, depth: depth)
-                control.fx.frame = NSRect(x: fxRect.minX - pinnedHeaderX, y: offset + 34, width: fxRect.width, height: fxRect.height)
+                control.fx.frame = NSRect(x: fxRect.minX - pinnedHeaderX, y: fxRect.minY - rect.minY, width: fxRect.width, height: fxRect.height)
             }
             if updateConfiguration { control.configure(track, color: trackColors[row % trackColors.count]) }
         }
@@ -1077,10 +1133,10 @@ final class Timeline: NSView {
     }
     func trackNameRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 6)) * 15 + 18
-        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 34, height: 22)
+        return NSRect(x: x, y: ruler + CGFloat(row) * rowHeight + 10, width: fragmentLeft - x - 34, height: 17)
     }
     func trackMeterReadoutRect(row: Int, channel: Int) -> NSRect {
-        NSRect(x: fragmentLeft - 86, y: ruler + CGFloat(row) * rowHeight + 54 + CGFloat(channel) * 11, width: 56, height: 11)
+        NSRect(x: fragmentLeft - 30 - MixerVolumeControl.peakReadoutWidth, y: ruler + CGFloat(row) * rowHeight + trackVolumeY + CGFloat(channel) * 11, width: MixerVolumeControl.peakReadoutWidth, height: 11)
     }
     func trackNameHitRect(row: Int, depth: Int) -> NSRect {
         guard rows.indices.contains(row) else { return .zero }
@@ -1092,14 +1148,14 @@ final class Timeline: NSView {
         return rect
     }
     func trackMuteRect(row: Int, depth: Int) -> NSRect {
-        NSRect(x: pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18, y: ruler + CGFloat(row) * rowHeight + 34, width: 46, height: 20)
+        NSRect(x: pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: 46, height: 20)
     }
     func trackSoloRect(row: Int, depth: Int) -> NSRect {
         trackMuteRect(row: row, depth: depth).offsetBy(dx: 54, dy: 0)
     }
     func trackFXRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18
-        return NSRect(x: x + 108, y: ruler + CGFloat(row) * rowHeight + 34, width: 46, height: 20)
+        return NSRect(x: x + 108, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: 46, height: 20)
     }
     func rangeHandleRects() -> [NSRect] {
         guard let range = editor.range else { return [] }

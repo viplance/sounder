@@ -525,14 +525,27 @@ extension AppDelegate {
                   let cell = slider.cell as? TrackVolumeMeterCell else { throw SounderError.message("Volume slider has no stereo meter") }
             let sliderRect = slider.convert(slider.bounds, to: timeline)
             let readout = timeline.trackMeterReadoutRect(row: row, channel: 0)
-            try check(readout.minX >= sliderRect.maxX + 5 && readout.maxX < timeline.fragmentLeft - 24 && readout.minY >= timeline.trackFXRect(row: row, depth: 0).maxY && timeline.trackMeterReadoutRect(row: row, channel: 1).maxY < timeline.ruler + CGFloat(row + 1) * timeline.rowHeight,
+            try check(readout.minX >= sliderRect.maxX + 1 && readout.maxX < timeline.fragmentLeft - 24 && readout.minY >= timeline.trackNameRect(row: row, depth: 0).maxY && timeline.trackMeterReadoutRect(row: row, channel: 1).maxY < timeline.trackFXRect(row: row, depth: 0).minY,
                       "Stereo numeric peaks sit after the volume rail without overlapping buttons, Pan or adjacent tracks")
             try check(abs(cell.levels[0] - Double([Float(0.1), 0.6, 0.95][row])) < 1e-5 && abs(cell.levels[1] - cell.levels[0] * 0.5) < 1e-5,
                       "Volume rail follows actual separate post-fader playback levels")
             let rect = cell.barRect(flipped: slider.isFlipped)
             let end = cell.meterEndX(pow(10, slider.doubleValue / 20), inside: rect, flipped: slider.isFlipped)
-            let knob = cell.knobRect(flipped: slider.isFlipped)
+            let knob = cell.displayedKnobRect(flipped: slider.isFlipped)
             try check(abs(end - knob.midX) < 1, "A 0 dB pre-fader signal fills exactly to the volume thumb (end: \(end), thumb: \(knob.midX))")
+        }
+        for control in tracks.compactMap({ timeline.mixerControls[$0.id]?.volumeControl }) + [masterVolumeControl] {
+            let slider = control.slider, saved = control.slider.doubleValue
+            let cell = slider.cell as! TrackVolumeMeterCell
+            for endpoint in [slider.minValue, slider.maxValue] {
+                slider.doubleValue = endpoint
+                let rail = cell.barRect(flipped: slider.isFlipped)
+                let thumb = cell.displayedKnobRect(flipped: slider.isFlipped)
+                let edge = endpoint == slider.minValue ? thumb.minX - rail.minX : thumb.maxX - rail.maxX
+                try check(abs(edge) < 0.01 && cell.knobRect(flipped: slider.isFlipped).contains(NSPoint(x: thumb.midX, y: thumb.midY)),
+                          "Track and MASTER visible thumbs cover rail endpoints and remain inside native drag targets")
+            }
+            slider.doubleValue = saved
         }
         func snapshot(_ suffix: String) {
             guard let index = CommandLine.arguments.firstIndex(of: "--snapshot"), index + 1 < CommandLine.arguments.count else { return }
@@ -557,8 +570,33 @@ extension AppDelegate {
         editor.stop(); refresh()
         try check(editor.trackMeters.values.allSatisfy { $0.level == 0 }, "Stopping clears every header fill immediately")
         try check(timeline.mixerControls.values.allSatisfy { ($0.volume.cell as? TrackVolumeMeterCell)?.levels == [0, 0] }, "Stopping clears volume rail fills instead of retaining a static fill to the thumb")
-        RunLoop.current.run(until: Date().addingTimeInterval(1.05))
-        try check(editor.trackMeters.values.allSatisfy { $0.peak == 0 }, "Stopped peak readouts clear after the one-second hold")
+        let readouts = (tracks.compactMap { timeline.mixerControls[$0.id]?.volumeControl.peakReadout } + [masterVolumeControl.peakReadout]).flatMap(\.channels)
+        try check(readouts.count == 8 && readouts.allSatisfy { ($0.layer?.animation(forKey: "stopFade") as? CABasicAnimation)?.duration == 1 && $0.layer?.opacity == 0 },
+                  "Track and MASTER peaks fade over one second while their controls remain visible")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        try check(readouts.allSatisfy { let opacity = $0.layer?.presentation()?.opacity ?? 0; return opacity > 0 && opacity < 1 },
+                  "Stopped numeric readouts remain partially visible during the fade")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.65))
+        try check(editor.trackMeters.values.allSatisfy { $0.peak == 0 } && readouts.allSatisfy { $0.layer?.animation(forKey: "stopFade") == nil && $0.layer?.opacity == 0 }, "Stopped peak readouts disappear completely after one second")
+        // Exercise a track falling silent while the project is still playing.
+        editor.toggleMute(tracks[1].id)
+        editor.seek(to: 0); editor.playPause()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        let control = timeline.mixerControls[tracks[0].id]!.volumeControl
+        var silence = StereoTrackLevelMeter()
+        silence.update(StereoLevels(left: 0, right: 0.1), at: 0)
+        control.updateMeter(silence, active: true, recording: false, showsPeaks: true)
+        try check(control.peakReadout.channels[0].layer?.animation(forKey: "stopFade") != nil && control.peakReadout.channels[1].layer?.opacity == 1,
+                  "A silent channel fades independently while playback and the other channel continue")
+        editor.seek(to: 1.7)
+        let deadline = Date().addingTimeInterval(3)
+        while editor.player != nil && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+        try check(editor.player == nil && readouts.allSatisfy { $0.layer?.animation(forKey: "stopFade") != nil },
+                  "Natural end of playback fades track and MASTER numbers instead of removing them")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        try check(readouts.allSatisfy { let opacity = $0.layer?.presentation()?.opacity ?? 0; return opacity > 0 && opacity < 1 },
+                  "Numbers remain visibly fading after natural completion and cursor return")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.75))
         editor.selectedTrack = tracks[0].id; editor.cursor = 0
         let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
         let recorder = try LiveRecorder(url: editor.audio.freshURL(), format: editor.project.audioFormat, inputFormat: input)
@@ -579,7 +617,7 @@ extension AppDelegate {
                   "Recording numeric peaks and rail share the same current Volume/Pan gains without changing captured PCM")
         editor.setTrackMix(track.id, volumeDB: -60)
         let silent = editor.displayedTrackMeter(editor.project.tracks[0])
-        try check(silent.left.peakText == "−∞ dB" && silent.right.peakText == "−∞ dB", "Moving capture volume to silence immediately updates both held numeric peaks")
+        try check(silent.left.peakText.isEmpty && silent.right.peakText.isEmpty, "Moving capture volume to silence immediately updates both held numeric peaks")
         editor.setTrackMix(track.id, volumeDB: -12)
         snapshot("recording")
     }

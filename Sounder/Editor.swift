@@ -439,10 +439,13 @@ final class Editor: NSObject {
             meter.update(peaks[id] ?? StereoLevels(), at: time); trackMeters[id] = meter
         }
     }
+    private var meterStopRevision: UInt64 = 0
     private func stopTrackMeters() {
+        meterStopRevision &+= 1
+        let revision = meterStopRevision
         for id in Array(trackMeters.keys) { trackMeters[id]?.clearLevels() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            guard let self, !self.isPlaying, !self.isRecording else { return }
+            guard let self, !self.isPlaying, !self.isRecording, self.meterStopRevision == revision else { return }
             self.updateTrackMeters([:])
             if let notify = self.transportChanged { notify() } else { self.changed?() }
         }
