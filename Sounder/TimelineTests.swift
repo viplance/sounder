@@ -1290,6 +1290,18 @@ extension AppDelegate {
         if let index = CommandLine.arguments.firstIndex(of: "--master-plugin-ui-test"), index + 1 < CommandLine.arguments.count {
             rack.add(URL(fileURLWithPath: CommandLine.arguments[index + 1]))
             guard let effect = editor.project.masterEffects.first, let plugin = editor.pluginWindows[effect.id] else { throw SounderError.message("Adding a master plug-in must open its editor immediately") }
+            func verifyPluginStaysVisible(_ plugin: PluginEditorWindow) throws {
+                for _ in 0..<3 {
+                    window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
+                    refresh(); RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                    let ordered = NSApp.orderedWindows
+                    guard window.isKeyWindow, plugin.window.isVisible, !plugin.window.hidesOnDeactivate,
+                          plugin.window.level > window.level,
+                          let pluginIndex = ordered.firstIndex(of: plugin.window), let mainIndex = ordered.firstIndex(of: window),
+                          pluginIndex < mainIndex else { throw SounderError.message("Plug-in editor was covered when focus returned to the fragment editor") }
+                }
+            }
+            try verifyPluginStaysVisible(plugin)
             if let parameter = plugin.host.parameters().first, let value = parameter["value"] as? NSNumber, let index = parameter["index"] as? NSNumber {
                 plugin.host.setParameter(index.intValue, value: value.doubleValue > 0.5 ? value.doubleValue - 0.1 : value.doubleValue + 0.1)
                 plugin.captureChanges()
@@ -1302,7 +1314,15 @@ extension AppDelegate {
             RunLoop.current.run(until: Date().addingTimeInterval(0.15)); editor.updateTransportPosition()
             guard editor.isPlaying, (editor.trackMeters[Project.masterID]?.level ?? 0) > 0 else { throw SounderError.message("Real master plug-in did not process live project output") }
             editor.stop()
-            plugin.close(); rack.table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            plugin.window.performClose(nil)
+            guard !plugin.window.isVisible, editor.pluginWindows[effect.id] == nil else { throw SounderError.message("Floating plug-in editor did not close and release its UI timer") }
+            let parameters = PluginEditorWindow(host: plugin.host, editor: editor, effectID: effect.id)
+            parameters.show(native: false)
+            try verifyPluginStaysVisible(parameters)
+            parameters.window.performClose(nil)
+            guard !parameters.window.isVisible, editor.pluginWindows[effect.id] == nil else { throw SounderError.message("Floating parameter editor did not close") }
+            print("PASS: Native plug-in and parameter windows remain above the focused fragment editor until explicitly closed")
+            rack.table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
             rack.bypass()
             guard editor.project.masterEffects[0].bypassed else { throw SounderError.message("Master effect bypass did not apply") }
             rack.remove()
@@ -1311,5 +1331,159 @@ extension AppDelegate {
         }
         rack.done(); window.makeKeyAndOrderFront(nil)
         print("PASS: Centered MASTER → FX → volume uses the track FX size/font at normal/minimum widths, live gain retains transport and one-step Undo, and effects window is reused")
+    }
+}
+
+
+extension AppDelegate {
+    func verifyEffectsRackUI(_ path: URL) throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw SounderError.message(message) }; print("PASS: " + message)
+        }
+        let original = editor.project
+        let track = editor.project.tracks[0].id
+        defer {
+            editor.closePluginWindows(capture: false)
+            editor.effectsWindows[track]?.done()
+            editor.project = original; editor.dirty = false; refresh()
+        }
+        editor.showEffects(for: track)
+        let rack = editor.effectsWindows[track]!
+        try check(rack.effects.isEmpty && rack.plugins.popover.isShown && rack.plugins.search.currentEditor() != nil && rack.plugins.search.window?.firstResponder === rack.plugins.search.currentEditor(),
+                  "Opening an empty FX chain immediately expands the picker and focuses Search plug-ins")
+        rack.plugins.popover.close()
+        editor.showEffects(for: track)
+        try check(editor.effectsWindows[track] === rack && rack.plugins.popover.isShown && rack.plugins.search.currentEditor() != nil,
+                  "Reopening the existing empty FX window reuses it and focuses search again")
+        rack.add(path)
+        editor.showEffects(for: track)
+        try check(!rack.plugins.popover.isShown, "A nonempty FX chain does not automatically open plug-in search")
+        let first = rack.effects.last!
+        let second = PluginEffect(name: "Second effect", path: first.path, classID: first.classID, state: first.state)
+        let third = PluginEffect(name: "Third effect", path: first.path, classID: first.classID, state: first.state)
+        rack.effects = [first, second, third]; rack.reload()
+        func buttons(_ view: NSView) -> [NSButton] { (view as? NSButton).map { [$0] } ?? view.subviews.flatMap(buttons) }
+        func action(_ title: String, row: Int) -> NSButton {
+            rack.table.layoutSubtreeIfNeeded()
+            let view = rack.table.view(atColumn: 0, row: row, makeIfNecessary: true)!
+            return buttons(view).first { $0.identifier?.rawValue == title }!
+        }
+        let browse = rack.makeBrowsePanel()
+        try check(Set(browse.allowedContentTypes.compactMap(\.preferredFilenameExtension)) == Set(["vst", "vst3"]) && !browse.allowsOtherFileTypes && !browse.canChooseDirectories,
+                  "Browse filters file selection to VST and VST3 plug-in bundles")
+        let firstRow = rack.table.view(atColumn: 0, row: 0, makeIfNecessary: true)!
+        firstRow.layoutSubtreeIfNeeded()
+        let removeFrame = action("Remove", row: 0).convert(action("Remove", row: 0).bounds, to: firstRow)
+        try check(abs(removeFrame.maxX - (firstRow.bounds.maxX - 7)) < 0.1 && firstRow.bounds.width > rack.table.enclosingScrollView!.contentSize.width - 20,
+                  "FX actions stay at the right edge of the full-width row")
+        try check(["Open", "Up", "Down", "Bypass", "Remove"].allSatisfy { let button = action($0, row: 0); return button.title.isEmpty && button.image != nil && button.imagePosition == .imageOnly },
+                  "All plug-in row actions use icons with accessible names")
+        func overlays(_ view: NSView) -> Int { (view is ToastOverlay ? 1 : 0) + view.subviews.reduce(0) { $0 + overlays($1) } }
+        try check(overlays(window.contentView!) == 1 && overlays(rack.window.contentView!) == 0 && editor.pluginWindows.values.allSatisfy { overlays($0.window.contentView!) == 0 },
+                  "Project notifications appear only once in the main editor")
+        // Keep one closed FX window and another visible one to distinguish
+        // restoration from reopening every window indiscriminately.
+        editor.showEffects(for: Project.masterID)
+        let hiddenRack = editor.effectsWindows[Project.masterID]!
+        hiddenRack.window.orderOut(nil)
+        let native = editor.pluginWindows[first.id]!
+        let rackFrame = rack.window.frame, nativeFrame = native.window.frame
+        window.miniaturize(nil)
+        let miniDeadline = Date().addingTimeInterval(2)
+        while !window.isMiniaturized && Date() < miniDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        try check(window.isMiniaturized && !rack.window.isVisible && !native.window.isVisible, "Minimizing the editor hides all visible project FX and plug-in windows")
+        window.deminiaturize(nil)
+        let restoreDeadline = Date().addingTimeInterval(2)
+        while (!rack.window.isVisible || !native.window.isVisible) && Date() < restoreDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        try check(rack.window.isVisible && native.window.isVisible && !hiddenRack.window.isVisible && rack.window.frame == rackFrame && native.window.frame == nativeFrame,
+                  "Restoring the editor restores only previously visible windows at their original positions")
+        window.miniaturize(nil)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        hiddenRack.done(); native.close()
+        window.deminiaturize(nil)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        try check(!hiddenRack.window.isVisible && editor.effectsWindows[Project.masterID] == nil && !native.window.isVisible && editor.pluginWindows[first.id] == nil && rack.window.isVisible,
+                  "A visible plug-in closed while minimized is not resurrected, while its FX chain is restored")
+        try check(!action("Up", row: 0).isEnabled && !action("Down", row: 2).isEnabled, "FX row order buttons disable at chain boundaries")
+        try check(action("Bypass", row: 0).state == .on && (action("Bypass", row: 0) as? PointerButton)?.activeAppearanceColor == .systemGreen && action("Bypass", row: 0).toolTip == "Выключить",
+                  "An enabled effect has a green power icon and a disable tooltip")
+        action("Bypass", row: 0).performClick(nil)
+        try check(rack.effects[0].bypassed && action("Bypass", row: 0).state == .off && action("Bypass", row: 0).contentTintColor == .secondaryLabelColor && action("Bypass", row: 0).toolTip == "Включить",
+                  "Clicking power bypasses the effect, grays the icon and offers to enable it")
+        action("Bypass", row: 0).performClick(nil)
+        try check(!rack.effects[0].bypassed && action("Bypass", row: 0).state == .on && action("Bypass", row: 0).toolTip == "Выключить",
+                  "Clicking again re-enables processing and restores the green power icon")
+        let retainedBypass = action("Bypass", row: 1), history = editor.undoStack.count
+        let writer = rack.tableView(rack.table, pasteboardWriterForRow: 0) as? NSPasteboardItem
+        try check(writer?.string(forType: NSPasteboard.PasteboardType("enotix.Sounder.effect")) == first.id.uuidString,
+                  "Dragging an FX row publishes its stable plug-in ID")
+        try check(rack.reorder(id: first.id, insertion: 3) && rack.effects.map(\.id) == [second.id, third.id, first.id] && editor.undoStack.count == history + 1,
+                  "Drag reorder preserves plug-in state and commits one Undo step")
+        retainedBypass.performClick(nil)
+        try check(rack.effects[0].id == second.id && rack.effects[0].bypassed && !rack.effects[2].bypassed,
+                  "Row actions keep targeting the same plug-in after a reorder")
+        action("Up", row: 2).performClick(nil)
+        try check(rack.effects.map(\.id) == [second.id, first.id, third.id], "Per-row Up moves only its plug-in by one position")
+        action("Down", row: 1).performClick(nil)
+        try check(rack.effects.map(\.id) == [second.id, third.id, first.id], "Per-row Down moves only its plug-in by one position")
+        let unchanged = editor.undoStack.count
+        try check(!rack.reorder(id: first.id, insertion: 3) && !rack.reorder(id: first.id, insertion: -1) && editor.undoStack.count == unchanged,
+                  "Unchanged or invalid FX drops do not create Undo entries")
+        editor.undo(); rack.reload()
+        try check(rack.effects.map(\.id) == [second.id, first.id, third.id], "Undo restores the previous processing order")
+        editor.redo(); rack.reload()
+        action("Open", row: 1).performClick(nil)
+        try check(editor.pluginWindows[third.id]?.window.isVisible == true, "Per-row Open opens the correct native plug-in")
+        action("Remove", row: 1).performClick(nil)
+        try check(rack.effects.map(\.id) == [second.id, first.id] && editor.pluginWindows[third.id] == nil, "Per-row Remove closes its plug-in UI and removes only that effect")
+        window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        try check(rack.window.isVisible && rack.window.level > window.level && !rack.window.hidesOnDeactivate,
+                  "FX chain remains floating while the main fragment editor has focus")
+        let root = rack.window.contentView!
+        let captions = root.subviews.compactMap { ($0 as? NSTextField)?.stringValue }
+        try check(!captions.contains("Track effects") && !captions.contains("Master effects") && !buttons(root).contains { $0.title == "Done" || $0.title == "Parameters…" || $0.title == "Open editor…" || $0.title == "Add" },
+                  "FX window has no heading or bottom action strip")
+        try check(rack.plugins.frame.maxY > root.bounds.maxY - 20 && rack.table.enclosingScrollView!.frame.minY < 20,
+                  "Plug-in picker and Browse/Rescan occupy the top without a separate Add button")
+        rack.plugins.showPicker()
+        try check(rack.plugins.vst3Only.state == .on && rack.plugins.vst3Only.frame.minX > rack.plugins.search.frame.maxX && rack.plugins.matches.allSatisfy { $0.pathExtension.lowercased() == "vst3" } && rack.plugins.selectedURL?.pathExtension.lowercased() == "vst3",
+                  "VST3 only is checked by default, sits to the right of search and filters both results and the initial selection")
+        rack.plugins.search.stringValue = "vGi vst"; rack.plugins.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+        try check(!rack.plugins.matches.isEmpty && rack.plugins.matches.allSatisfy { PluginPicker.displayName($0).localizedCaseInsensitiveContains("vgi") },
+                  "Plug-in search matches case-insensitive name fragments and multiple words")
+        let resultRow = rack.plugins.results.selectedRow
+        let result = rack.plugins.results.view(atColumn: 0, row: resultRow, makeIfNecessary: true) as! PluginNameRow
+        result.layoutSubtreeIfNeeded()
+        let label = result.textField!.convert(result.textField!.bounds, to: rack.plugins.results)
+        let rowRect = rack.plugins.results.rect(ofRow: resultRow)
+        try check(abs(label.midY - rowRect.midY) < 0.5, "Plug-in name and native selection highlight share the same vertical center")
+        let chosen = rack.plugins.matches[resultRow], beforeChoose = rack.effects.count
+        _ = rack.plugins.control(rack.plugins.search, textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:)))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        try check(rack.plugins.selectedURL == chosen && !rack.plugins.popover.isShown && rack.effects.count == beforeChoose + 1 && rack.effects.last?.path == chosen.path && editor.pluginWindows[rack.effects.last!.id]?.window.isVisible == true,
+                  "Enter adds the chosen plug-in once, closes the picker and opens its editor immediately")
+        rack.plugins.filter("no-such-plugin-450719")
+        try check(rack.plugins.matches.isEmpty, "Unmatched search safely produces no results")
+        rack.plugins.showPicker()
+        try check(rack.plugins.matches.count == rack.installed.filter { $0.pathExtension.lowercased() == "vst3" }.count, "Clearing search preserves the VST3-only filter")
+        rack.plugins.vst3Only.performClick(nil)
+        try check(rack.plugins.vst3Only.state == .off && rack.plugins.matches.count == rack.installed.count, "Disabling VST3 only restores all installed VST/VST3 plug-ins")
+        if let legacy = rack.installed.first(where: { $0.pathExtension.lowercased() == "vst" && $0.deletingPathExtension().lastPathComponent == "IVGI2" }) {
+            rack.plugins.search.stringValue = PluginPicker.displayName(legacy)
+            rack.plugins.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+            let beforeClick = rack.effects.count
+            _ = rack.plugins.results.sendAction(rack.plugins.results.action, to: rack.plugins.results.target)
+            try check(rack.plugins.selectedURL == legacy && rack.effects.count == beforeClick + 1 && rack.effects.last?.path == legacy.path,
+                      "A single result click immediately adds a legacy VST when the filter is disabled")
+            rack.plugins.showPicker()
+            rack.plugins.search.stringValue = PluginPicker.displayName(legacy)
+            rack.plugins.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+            rack.plugins.vst3Only.performClick(nil)
+            try check(rack.plugins.matches.isEmpty && rack.plugins.selectedURL?.pathExtension.lowercased() == "vst3", "Enabling VST3 only reapplies the current search and replaces an incompatible selection")
+        }
+        rack.plugins.showPicker()
+        try check(rack.plugins.vst3Only.state == .on && rack.plugins.matches.allSatisfy { $0.pathExtension.lowercased() == "vst3" }, "Reopening the picker retains its format filter")
+        rack.plugins.popover.close()
     }
 }

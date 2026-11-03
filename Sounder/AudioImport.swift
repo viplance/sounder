@@ -96,12 +96,10 @@ final class AudioImportController: NSObject, NSWindowDelegate {
         guard !urls.isEmpty, !isRunning else { return }
         isRunning = true
         let visibleHeight = CGFloat(min(6, urls.count)) * 74
-        let height = visibleHeight + 110
+        let height = visibleHeight + 70
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: height), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Import audio"; window.delegate = self; window.isReleasedWhenClosed = false
         let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
-        let title = NSTextField(labelWithString: "Importing audio")
-        title.font = .systemFont(ofSize: 20, weight: .semibold); title.frame = NSRect(x: 22, y: height - 44, width: 516, height: 28); root.addSubview(title)
         let scroll = NSScrollView(frame: NSRect(x: 22, y: 54, width: 516, height: visibleHeight))
         scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 508, height: CGFloat(urls.count) * 74))
@@ -113,7 +111,6 @@ final class AudioImportController: NSObject, NSWindowDelegate {
         scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, content.frame.height - visibleHeight)))
         button.title = "Cancel"; button.target = self; button.action = #selector(pressButton); button.bezelStyle = .rounded
         button.frame = NSRect(x: 426, y: 12, width: 112, height: 30); root.addSubview(button)
-        ToastOverlay.install(in: root, center: editor!.notifications)
         window.center(); window.makeKeyAndOrderFront(nil)
         editor?.update()
         // Enqueue work after showing the window. No decoding or copying runs on main.

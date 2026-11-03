@@ -3,7 +3,7 @@
 ## Notifications and UX hints
 
 - Do not add permanent status messages or instructional captions to the main interface (including the footer, timeline heading, and empty timeline).
-- Present action feedback as rectangular notifications in the upper-right corner of the active application window.
+- Present action feedback only in the upper-right corner of the main editor window. Never install duplicate notification overlays in FX, plug-in or import windows.
 - Successful edits and saves: green background, white text. Errors: red background, white text. UX hints: yellow background, dark readable text.
 - Size each notification to its text plus horizontal padding, align right edges, and wrap long messages at the viewport-aware maximum width.
 - Every message remains for 5 seconds independently. Append newer messages below older messages. Animate remaining messages upward when earlier messages expire.
@@ -62,12 +62,17 @@
 
 ## Live plug-in editing
 
+- FX chain windows float above the main editor until closed. Use a compact top row with searchable installed plug-ins, Browse and Rescan (no Add button); omit the large heading and bottom actions. Each effect row has its name on the left and icon-only Open, Up/Down, Bypass and Remove controls pinned to the far right; show the power/Bypass icon green for an enabled plug-in and gray when bypassed; use «Выключить» for the enabled tooltip and «Включить» when bypassed, with matching accessible action names; disable order buttons at chain boundaries. Support local drag-and-drop reordering by stable effect ID, preserve plug-in state and create one Undo step. Search matches case-insensitive/diacritic-insensitive name fragments and multiple words, with Up/Down, Enter and Escape navigation. Put a VST3 only checkbox to the right of Search, checked by default; apply it to search results and the selected installed plug-in, preserve it while reopening/rescanning the picker, and allow legacy VST when unchecked. Opening an empty FX chain (including an existing window) automatically expands the plug-in picker and focuses Search plug-ins, even with no installed plug-ins; a nonempty chain does not auto-expand. Selecting a picker result by click or Enter immediately adds one instance and opens its editor; filtering and arrow navigation must not add effects. Restrict Browse to .vst/.vst3 bundles. Vertically center view-based result text in the native selection highlight. Share this UI for tracks and MASTER.
+
+- Plug-in editor windows (native VST/VST3 and generic parameter views) stay at the floating window level and do not hide on deactivation. Focusing the main editor or fragments must not cover them; explicit Close still detaches the plug-in UI and stops its idle timer.
 - Plug-in editors are nonmodal and have no Apply/Cancel controls. Parameter edits immediately affect the shared live processor; closing an editor retains changes in memory. Only project Save writes plug-in settings to disk.
 - Replenish queued playback buffers on consumption, not device presentation completion. Use presentation completion only for the final buffer, and retain a short render-ahead margin to prevent underruns.
 - Keep plug-in processing on the playback worker in short blocks, preserve child-to-parent routing and compensate parallel bus latency. Export uses current in-memory parameter state.
 - Opening an editor must not mark the project dirty; actual parameter changes do. Saving with an editor open must capture its latest settings.
 
 ## Audio import
+
+- Keep the Import audio progress window compact without an Importing audio heading or empty heading space.
 
 - After selecting multiple files, show an English placement dialog with Separate tracks first and selected by default, followed by One track, and Import/Cancel. Single-track placement is sequential; separate-track placement starts at the captured active track, follows visible hierarchy order below it, and gives all fragments the same captured cursor time. Create missing root tracks with the corresponding imported fragment names (respecting track name limits). Keep existing tracks/fragments intact; commit successful files and any new tracks together as one Undo action. Single-file import does not show this dialog. Within this modal window, Tab/Shift-Tab and Up/Down cycle the radio selection immediately, regardless of system keyboard-navigation preferences; Enter and Escape retain Import/Cancel behavior. Scope the key handler to this dialog and remove it when closed.
 
@@ -112,6 +117,8 @@
 - Zoom out stops when the complete timeline width fits the scroll viewport, including the track header. Derive the minimum zoom from the viewport width and timeline duration rather than a fixed pixels-per-second floor. All fragments must fit, reset horizontal scrolling at the limit, and keep ruler labels readable for long projects.
 
 ## Window header
+
+- Minimize all visible project FX, plug-in and import windows together with the main editor, and restore only those still open when the editor is restored, at their original positions and stacking order. Close transient plug-in search popovers when minimizing; do not resurrect closed or previously hidden windows.
 
 - Render the project name as plain text with an I-beam cursor, without button chrome. Allow up to 640 pt for the project name; use 13 pt semibold for both display and editing, and a smaller 10 pt audio-quality caption. Explicitly set the project NSToolbarItem.isBordered to false so macOS does not wrap the custom title view in a glass bezel. Keep the editable project name followed immediately by Open project and Save project in the native compact titlebar toolbar. Place clickable project audio quality on the right immediately before Export, with MASTER centered between the left and right groups. Hide the system window title. Omit the app icon and Sounder wordmark from the titlebar; retain the application icon for the Dock and Finder. Place the PLAYER/FRAGMENTS/TRACKS/VIEW panel directly below the titlebar, with no separate project header row or extra vertical gap.
 

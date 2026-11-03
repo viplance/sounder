@@ -95,7 +95,9 @@ final class Editor: NSObject {
         invalidateMixCache()
         closePluginWindows(capture: false)
         pluginHosts = [:]
-        for window in Array(effectsWindows.values) { window.done() }
+        for window in Array(effectsWindows.values) {
+            if window.exists { window.reload(notifyEditor: false) } else { window.done() }
+        }
         audio.configure(project.audioFormat)
         if !project.tracks.contains(where: { $0.id == selectedTrack }) { selectedTrack = project.tracks.first?.id }
         selection = selection.intersection(Set(project.tracks.flatMap(\.clips).map(\.id)))

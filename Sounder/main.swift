@@ -440,8 +440,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if editor.timer == nil && !timeline.isEasingPlaybackScroll { link.isPaused = true }
     }
     func windowDidChangeOcclusionState(_ notification: Notification) { synchronizeDisplayLink() }
+    private var hiddenProjectWindows: [NSWindow] = []
+    private var projectAuxiliaryWindows: [NSWindow] {
+        Array(editor.effectsWindows.values).compactMap { $0.window } +
+        Array(editor.pluginWindows.values).compactMap { $0.window } +
+        [editor.importer?.window].compactMap { $0 }
+    }
+    func windowWillMiniaturize(_ notification: Notification) {
+        guard notification.object as? NSWindow === window else { return }
+        for rack in editor.effectsWindows.values { rack.plugins.popover.close() }
+        let auxiliary = projectAuxiliaryWindows
+        // Preserve front-to-back order and restore only windows still owned by
+        // the project: closing an effect/import while hidden must stay closed.
+        hiddenProjectWindows = NSApp.orderedWindows.filter { candidate in
+            candidate.isVisible && auxiliary.contains(where: { $0 === candidate })
+        }
+        hiddenProjectWindows.forEach { $0.orderOut(nil) }
+    }
     func windowDidMiniaturize(_ notification: Notification) { synchronizeDisplayLink() }
-    func windowDidDeminiaturize(_ notification: Notification) { synchronizeDisplayLink() }
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard notification.object as? NSWindow === window else { return }
+        let auxiliary = projectAuxiliaryWindows
+        for hidden in hiddenProjectWindows.reversed() where auxiliary.contains(where: { $0 === hidden }) { hidden.orderFront(nil) }
+        hiddenProjectWindows = []
+        synchronizeDisplayLink()
+    }
     private func updatePositionLabel() {
         let time = editor.cursor
         if editor.project.tempoMode {
@@ -637,6 +660,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--fragment-settings-ui-test") { try verifyFragmentSettingsUI() }
             if CommandLine.arguments.contains("--numeric-input-ui-test") { try verifyNumericInputUI() }
             if CommandLine.arguments.contains("--track-mix-ui-test") { try verifyTrackMixUI() }
+            if let index = CommandLine.arguments.firstIndex(of: "--effects-rack-ui-test"), index + 1 < CommandLine.arguments.count {
+                try verifyEffectsRackUI(URL(fileURLWithPath: CommandLine.arguments[index + 1]))
+            }
             if CommandLine.arguments.contains("--master-mix-ui-test") { try verifyMasterMixerUI() }
             if CommandLine.arguments.contains("--choice-alert-ui-test") { try verifyChoiceAlertsUI() }
             if CommandLine.arguments.contains("--loop-ui-test") { try verifyLoopUI() }
