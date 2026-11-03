@@ -589,6 +589,22 @@ final class Timeline: NSView {
     private var controlsTracking: NSTrackingArea?
     private(set) var mixerControls: [UUID: TrackMixerControls] = [:]
     private var followedPlayback = false
+    private var lastPlaybackScrollRequest: UInt64 = 0
+    private struct PlaybackScroll {
+        static let duration = 1.0
+        let startedAt: Double
+        let origin: CGFloat
+        func position(target: CGFloat, at time: Double) -> CGFloat {
+            let t = min(1, max(0, (time - startedAt) / Self.duration))
+            let blend = t * t * (3 - 2 * t)
+            return origin + (target - origin) * blend
+        }
+    }
+    private var playbackScroll: PlaybackScroll?
+    private var steppingPausedCursor = false
+    private var pausedScrollCursor: Double?
+    var scrollAnimationChanged: (() -> Void)?
+    var isEasingPlaybackScroll: Bool { playbackScroll != nil }
     private var hoveredTrackControl: (id: UUID, kind: Int)?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -793,7 +809,21 @@ final class Timeline: NSView {
         else { updateTrackControlHover(at: nil) }
         needsDisplay = true
         let followsPlayback = editor.isPlaying || editor.isShuttling
-        if followsPlayback || followedPlayback { centerOnPlayhead() }
+        let requested = lastPlaybackScrollRequest != editor.playbackScrollRequest
+        lastPlaybackScrollRequest = editor.playbackScrollRequest
+        if requested, editor.isPlaying, !editor.isShuttling, !editor.isRecording {
+            playbackScroll = PlaybackScroll(startedAt: ProcessInfo.processInfo.systemUptime, origin: visibleRect.minX)
+        }
+        if editor.isShuttling || editor.isRecording { playbackScroll = nil }
+        if followsPlayback { pausedScrollCursor = nil; followPlayhead() }
+        else if !followedPlayback, playbackScroll != nil, steppingPausedCursor || pausedScrollCursor == editor.cursor { followPlayhead() }
+        else {
+            let wasEasing = playbackScroll != nil
+            playbackScroll = nil; pausedScrollCursor = nil
+            // A fading pause keeps its polling timer until the node pauses; freeze that viewport.
+            // Stop/natural completion invalidates the timer and still reveals its final marker.
+            if followedPlayback && (!wasEasing || editor.timer == nil) { centerOnPlayhead() }
+        }
         followedPlayback = followsPlayback
         if editor.isRecording, let scroll = enclosingScrollView {
             let visible = scroll.documentVisibleRect, x = header + editor.cursor * editor.zoom
@@ -841,8 +871,8 @@ final class Timeline: NSView {
                         scroll.reflectScrolledClipView(scroll.contentView)
                     }
                 }
-            } else { centerOnPlayhead() }
-        }
+            } else { followPlayhead() }
+        } else if playbackScroll != nil { followPlayhead() }
         presentPlayhead()
     }
     func clipRect(_ clip: Clip, row: Int, layer: Int) -> NSRect {
@@ -1700,15 +1730,28 @@ final class Timeline: NSView {
         needsDisplay = true
         if let renameID { renameTrack(renameID) }
     }
-    func centerOnPlayhead() {
+    private var centeredPlayheadOrigin: CGFloat {
+        let width = viewportSize.width
+        return min(max(0, frame.width - width), max(0, editor.cursor * editor.zoom - (width - header) / 2))
+    }
+    private func scrollHorizontally(to requested: CGFloat) {
         guard let scroll = enclosingScrollView else { return }
-        let width = scroll.contentSize.width
-        let x = header + editor.cursor * editor.zoom
-        var origin = x - header - (width - header) / 2
-        origin = min(max(0, frame.width - width), max(0, origin))
+        let origin = min(max(0, frame.width - scroll.contentSize.width), max(0, requested))
         guard abs(scroll.contentView.bounds.minX - origin) > 0.001 else { return }
         scroll.contentView.scroll(to: NSPoint(x: origin, y: scroll.contentView.bounds.minY))
         scroll.reflectScrolledClipView(scroll.contentView)
+    }
+    private func followPlayhead(at time: Double = ProcessInfo.processInfo.systemUptime) {
+        let target = centeredPlayheadOrigin
+        if let animation = playbackScroll {
+            scrollHorizontally(to: animation.position(target: target, at: time))
+            if time - animation.startedAt >= PlaybackScroll.duration { playbackScroll = nil; pausedScrollCursor = nil }
+        } else { scrollHorizontally(to: target) }
+    }
+    func centerOnPlayhead() {
+        // Explicit zoom, playback arrows and boundary commands retain immediate centering.
+        playbackScroll = nil; pausedScrollCursor = nil
+        scrollHorizontally(to: centeredPlayheadOrigin)
     }
     func movePlayhead(direction: Double) {
         guard canSelectRange else { return }
@@ -1717,8 +1760,20 @@ final class Timeline: NSView {
         guard fragmentWidth > 0 else { return }
         let step = Double(fragmentWidth) / editor.zoom * 0.01
         let position = editor.player?.seekPosition ?? editor.cursor
+        let paused = !editor.isPlaying && !editor.isShuttling
+        let origin = visibleRect.minX
+        steppingPausedCursor = paused
         editor.seek(to: position + direction * step)
-        centerOnPlayhead()
+        steppingPausedCursor = false
+        if paused {
+            // Repeats keep the original one-second deadline and update the target,
+            // so holding an arrow cannot continually restart and stall the scroll.
+            if playbackScroll == nil {
+                playbackScroll = PlaybackScroll(startedAt: ProcessInfo.processInfo.systemUptime, origin: origin)
+            }
+            pausedScrollCursor = editor.cursor
+            scrollAnimationChanged?()
+        } else { centerOnPlayhead() }
     }
     func beginShuttle(direction: Double) {
         guard canSelectRange else { return }

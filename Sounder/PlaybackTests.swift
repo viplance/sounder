@@ -840,8 +840,8 @@ extension AppDelegate {
         _ = handleShuttleShortcut(key(.keyUp, 123))
         waitFor { !editor.isShuttling }
         try check(!editor.isPlaying && !editor.isShuttling, "Releasing an arrow while initially paused glides to a stopped cursor")
-        editor.playPause(); RunLoop.current.run(until: Date().addingTimeInterval(0.12))
-        try check(editor.isPlaying && centered(), "Ordinary playback keeps the cursor centered horizontally")
+        editor.playPause(); timeline.centerOnPlayhead(); RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+        try check(editor.isPlaying && centered(), "Explicit centering during playback follows the audio cursor immediately")
         let originalPlayer = editor.player!
         let positionAtPress = originalPlayer.currentTime
         _ = handleShuttleShortcut(key(.keyDown, 123))
@@ -1475,5 +1475,107 @@ extension AppDelegate {
         editor.stop(); RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         try check(transportDisplayIsPaused, "Display callbacks pause immediately when transport stops")
         print("PASS: Graphics optimization integration")
+    }
+}
+
+
+extension AppDelegate {
+    func verifyPlaybackScrollUI() throws {
+        let windowLevel = window.level
+        window.level = .floating
+        window.makeKeyAndOrderFront(nil)
+        defer { window.level = windowLevel }
+        func check(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let saved = editor.project, zoom = editor.zoom, cursor = editor.cursor, selected = editor.selectedTrack, selection = editor.selection
+        defer {
+            editor.stop(); editor.project = saved; editor.zoom = zoom; editor.cursor = cursor
+            editor.selectedTrack = selected; editor.selection = selection; refresh()
+        }
+        let source = saved.tracks[0].clips[0].source
+        let track = Track(name: "Scroll test", clips: [Clip(name: "First", source: source, start: 0, duration: 8, order: 1),
+                                                       Clip(name: "Second", source: source, start: 8, duration: 8, order: 2)])
+        editor.stop(); editor.project = Project(tracks: [track]); editor.selectedTrack = track.id; editor.selection = []
+        editor.zoom = 400; editor.cursor = 0; refresh()
+        let scroll = timeline.enclosingScrollView!
+        scroll.contentView.scroll(to: .zero)
+        func wait(_ seconds: Double) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
+        func centered() -> Bool {
+            let target = min(max(0, timeline.frame.width - timeline.viewportSize.width), max(0, editor.cursor * editor.zoom - (timeline.viewportSize.width - timeline.header) / 2))
+            return abs(timeline.visibleRect.minX - target) < 2
+        }
+        func click(_ time: Double) {
+            let point = NSPoint(x: timeline.header + time * editor.zoom, y: timeline.pinnedRulerRect.midY)
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                              windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+                if type == .leftMouseDown { timeline.mouseDown(with: event) } else { timeline.mouseUp(with: event) }
+            }
+        }
+        wait(0.15) // Let the newly opened AppKit window complete its first display/occlusion update.
+        click(2.5)
+        try check(editor.cursor == 2.5 && abs(timeline.visibleRect.minX) < 0.01, "Stopped timeline selection moves the marker without centering the viewport")
+        let stoppedHistory = editor.undoStack.count
+        let beforeStep = editor.cursor, beforeOrigin = timeline.visibleRect.minX
+        timeline.movePlayhead(direction: 1)
+        let step = (timeline.viewportSize.width - timeline.header) / editor.zoom * 0.01
+        try check(abs(editor.cursor - beforeStep - step) < 0.000001 && abs(timeline.visibleRect.minX - beforeOrigin) < 1 && timeline.isEasingPlaybackScroll,
+                  "Paused Right moves the marker by one percent immediately and starts smooth scrolling without a viewport jump")
+        wait(0.2)
+        let movingOrigin = timeline.visibleRect.minX
+        try check(movingOrigin > beforeOrigin && !centered() && editor.player == nil && !editor.isPlaying,
+                  "Paused arrow centering animates using the display link without starting audio")
+        for _ in 0..<5 { timeline.movePlayhead(direction: 1); wait(0.05) }
+        try check(timeline.visibleRect.minX > movingOrigin, "Held arrow repeats keep scrolling instead of restarting the animation on every key event")
+        wait(0.7)
+        try check(centered() && !timeline.isEasingPlaybackScroll && transportDisplayIsPaused && editor.undoStack.count == stoppedHistory,
+                  "Paused arrows reach the updated target in one second, then suspend display callbacks without editing history")
+        timeline.movePlayhead(direction: -1)
+        try check(timeline.isEasingPlaybackScroll, "Paused Left uses the same smooth centering")
+        wait(1.1)
+        try check(centered() && transportDisplayIsPaused, "Paused Left also completes and stops its display link (origin: \(timeline.visibleRect.minX), cursor: \(editor.cursor), easing: \(timeline.isEasingPlaybackScroll), linkPaused: \(transportDisplayIsPaused), windowVisible: \(window.isVisible), occlusion: \(window.occlusionState.rawValue))")
+        click(2.5); scroll.contentView.scroll(to: .zero)
+        editor.playPause()
+        try check(editor.isPlaying && timeline.isEasingPlaybackScroll && abs(timeline.visibleRect.minX) < 1,
+                  "Play begins at the selected cursor without an instantaneous scroll jump")
+        wait(0.25)
+        try check(timeline.visibleRect.minX > 0 && !centered(), "Initial playback scroll begins gradually instead of snapping to center (origin: \(timeline.visibleRect.minX), cursor: \(editor.cursor), easing: \(timeline.isEasingPlaybackScroll))")
+        wait(0.95)
+        try check(!timeline.isEasingPlaybackScroll && centered(), "After one second the viewport catches the moving playback cursor and resumes centered following")
+        let player = editor.player!, origin = timeline.visibleRect.minX, history = editor.undoStack.count
+        click(4.75)
+        try check(editor.player === player && editor.isPlaying && abs(player.start - 4.75) < 0.001 && abs(timeline.visibleRect.minX - origin) < 2,
+                  "A live timeline click seeks on the existing engine while the viewport initially stays in place")
+        wait(0.12)
+        try check(abs(editor.cursor - player.currentTime) < 0.06 && editor.cursor >= 4.75 && timeline.isEasingPlaybackScroll && !centered(),
+                  "Audio and marker immediately follow the selected time independently of the one-second scroll")
+        let early = timeline.visibleRect.minX
+        wait(0.3)
+        try check(timeline.visibleRect.minX > early && !centered(), "The viewport is still smoothly approaching the moving target midway through the transition")
+        wait(0.75)
+        try check(centered() && !timeline.isEasingPlaybackScroll && editor.undoStack.count == history,
+                  "Live seeking finishes centering after one second without editing project history")
+        editor.seek(to: 2)
+        wait(0.15)
+        let midway = timeline.visibleRect.minX
+        editor.seek(to: 5)
+        try check(abs(timeline.visibleRect.minX - midway) < 2 && timeline.isEasingPlaybackScroll,
+                  "Repeated seeking restarts easing from the current viewport without a jump")
+        editor.playPause(); wait(0.1)
+        let paused = timeline.visibleRect.minX
+        wait(0.12)
+        try check(!timeline.isEasingPlaybackScroll && abs(timeline.visibleRect.minX - paused) < 0.1,
+                  "Pausing cancels the scroll transition and leaves the viewport at rest")
+        editor.seek(to: 2); timeline.movePlayhead(direction: 1); wait(1.1)
+        try check(centered() && !timeline.isEasingPlaybackScroll && transportDisplayIsPaused && !editor.isPlaying,
+                  "Expiring held peak meters after Pause cannot cancel an idle arrow-centering animation")
+        editor.playPause(); wait(0.08); zoomIn()
+        try check(!timeline.isEasingPlaybackScroll && centered(), "Explicit zoom retains its immediate centered behavior")
+        editor.stop(); editor.seek(to: 15.85); editor.playPause(); wait(0.6)
+        try check(editor.player == nil && abs(editor.cursor - 15.85) < 0.001 && centered() && !timeline.isEasingPlaybackScroll,
+                  "Natural completion during an unfinished scroll still returns to and reveals the last-start marker")
+        editor.stop()
+        print("PASS: One-second playback scroll integration")
     }
 }

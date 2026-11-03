@@ -429,14 +429,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             link.add(to: .main, forMode: .modalPanel)
             transportDisplayLink = link
         }
-        transportDisplayLink?.isPaused = editor.timer == nil || !window.isVisible || window.isMiniaturized || !window.occlusionState.contains(.visible)
+        transportDisplayLink?.isPaused = (editor.timer == nil && !timeline.isEasingPlaybackScroll) || !window.isVisible || window.isMiniaturized || !window.occlusionState.contains(.visible)
     }
     @objc private func displayTransportFrame(_ link: CADisplayLink) {
-        guard editor.timer != nil else { link.isPaused = true; return }
+        guard editor.timer != nil || timeline.isEasingPlaybackScroll else { link.isPaused = true; return }
         editor.updateTransportFrame()
         timeline.presentTransportFrame()
         updatePositionLabel()
         transportFrameCount += 1
+        if editor.timer == nil && !timeline.isEasingPlaybackScroll { link.isPaused = true }
     }
     func windowDidChangeOcclusionState(_ notification: Notification) { synchronizeDisplayLink() }
     func windowDidMiniaturize(_ notification: Notification) { synchronizeDisplayLink() }
@@ -527,6 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let scroll = NSScrollView(); scroll.hasHorizontalScroller = true; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
         timeline = Timeline(editor); scroll.documentView = timeline; timeline.installHeaderControls(timelineControls); add(scroll, to: stack)
         notificationOverlay = ToastOverlay.install(in: content, center: editor.notifications)
+        timeline.scrollAnimationChanged = { [weak self] in self?.synchronizeDisplayLink() }
         editor.changed = { [weak self] in self?.refresh() }
         editor.transportChanged = { [weak self] in self?.refreshTransport() }
         buildMenu()
@@ -622,6 +624,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 editor.project.tracks[1].effects = [PluginEffect(name: host.pluginName, path: path, classID: host.classID, state: try host.saveState(), bypassed: true)]
             }
             refresh()
+            if CommandLine.arguments.contains("--playback-scroll-ui-test") { try verifyPlaybackScrollUI() }
             if CommandLine.arguments.contains("--graphics-ui-test") { try verifyGraphicsUI() }
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
             if CommandLine.arguments.contains("--button-hover-ui-test") { try verifyButtonHoverUI() }
@@ -680,6 +683,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 }
                 try? FileManager.default.removeItem(at: url)
                 print("PASS: AppKit window and waveform timeline rendered")
+                // The UI harness owns only disposable fixture data, never a user's project.
+                self.closingConfirmed = true
                 NSApp.terminate(nil)
             }
         } catch { fputs("UI test failed: \(error)\n", stderr); exit(1) }

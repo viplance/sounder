@@ -9,6 +9,7 @@ final class Editor: NSObject {
     var selection = Set<UUID>()
     var cursor = 0.0
     private(set) var lastPlaybackStart: Double?
+    private(set) var playbackScrollRequest: UInt64 = 0
     var range: ClosedRange<Double>? { didSet { updateLoop() } }
     var zoom = 70.0
     var changed: (() -> Void)?
@@ -442,7 +443,8 @@ final class Editor: NSObject {
         for id in Array(trackMeters.keys) { trackMeters[id]?.clearLevels() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, !self.isPlaying, !self.isRecording else { return }
-            self.updateTrackMeters([:]); self.changed?()
+            self.updateTrackMeters([:])
+            if let notify = self.transportChanged { notify() } else { self.changed?() }
         }
     }
     func updateRecordingWaveform(handleFailure: Bool = true) {
@@ -633,6 +635,7 @@ final class Editor: NSObject {
                 stopPlayback(at: target); update(); return
             }
             playback.seek(to: target)
+            playbackScrollRequest &+= 1
             lastPlaybackStart = playback.start
             cursor = playback.currentTime
             update(); return
@@ -786,7 +789,7 @@ final class Editor: NSObject {
                     guard let self, let playback, self.player === playback else { return }
                     self.updateTransportPosition()
                 }
-                if rememberStart { lastPlaybackStart = playback.start }
+                if rememberStart { lastPlaybackStart = playback.start; if !forRecording { playbackScrollRequest &+= 1 } }
                 cursor = playback.currentTime; startTimer(); update(); return
             }
             discardPausedPlayback()
@@ -825,7 +828,7 @@ final class Editor: NSObject {
             if forRecording { try playback.prepareForRecording() }
             try playback.startPlayback(playImmediately: !forRecording)
             cursor = playback.start
-            if rememberStart { lastPlaybackStart = playback.start }
+            if rememberStart { lastPlaybackStart = playback.start; if !forRecording { playbackScrollRequest &+= 1 } }
             startTimer(); update()
         } catch { player?.stop(); player = nil; self.error(error) }
     }
