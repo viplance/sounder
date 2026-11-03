@@ -1,9 +1,31 @@
 import AppKit
 import QuartzCore
+import CoreText
 
 final class MixerFXButton: PointerButton {
+    static let controlWidth: CGFloat = 54
+    let power = PointerButton(title: "", target: nil, action: nil)
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        power.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 10, weight: .regular))
+        power.imagePosition = .imageOnly; power.isBordered = false
+        power.setButtonType(.pushOnPushOff); power.activeAppearanceColor = .systemGreen
+        power.contentTintColor = .secondaryLabelColor
+        power.target = self; power.action = #selector(toggleEffects)
+        addSubview(power)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        positionPower()
+    }
+    override func layout() { super.layout(); positionPower() }
+    private func positionPower() {
+        power.frame = NSRect(x: bounds.maxX - 18, y: bounds.midY - 9, width: 18, height: 18)
+    }
     private weak var editor: Editor?
     private var trackID: UUID?
+    private var hasActiveEffects = false { didSet { if oldValue != hasActiveEffects { needsDisplay = true } } }
     private var hasEffects = false { didSet { if oldValue != hasEffects { needsDisplay = true } } }
     private var effectColor = accent { didSet { if oldValue != effectColor { needsDisplay = true } } }
     func configure(editor: Editor, track: Track, color: NSColor) {
@@ -15,26 +37,39 @@ final class MixerFXButton: PointerButton {
         setAccessibilityLabel("\(track.name) effects")
         if isEnabled != editor.canEditEffects { isEnabled = editor.canEditEffects }
         hasEffects = !track.effects.isEmpty; effectColor = color
+        let active = track.effects.contains { !$0.bypassed }
+        hasActiveEffects = active
+        let caption = hasEffects ? "FX  •" : "FX"
+        if title != caption { title = caption; needsDisplay = true }
+        power.state = active ? .on : .off
+        power.isEnabled = editor.canEditEffects && hasEffects
+        power.toolTip = active ? "Выключить все эффекты" : "Включить все эффекты"
+        power.setAccessibilityLabel((power.toolTip ?? "") + " · " + track.name)
+        positionPower()
     }
     @objc private func openEffects() {
         guard let editor, let trackID else { return }
         editor.showEffects(for: trackID)
     }
-    override var intrinsicContentSize: NSSize { NSSize(width: 46, height: 20) }
-    private static func drawFace(in rect: NSRect, hasEffects: Bool, color: NSColor, hovered: Bool) {
-        fill(rect, hasEffects ? color.withAlphaComponent(0.18) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+    @objc private func toggleEffects() {
+        guard let editor, let trackID else { return }
+        editor.toggleAllEffects(for: trackID)
+    }
+    override var intrinsicContentSize: NSSize { NSSize(width: Self.controlWidth, height: 20) }
+    private static func drawFace(in rect: NSRect, title: String, active: Bool, color: NSColor, hovered: Bool, flipped: Bool) {
+        fill(rect, active ? color.withAlphaComponent(0.18) : NSColor.white.withAlphaComponent(0.06), radius: 5)
         if hovered {
             fill(rect, NSColor.white.withAlphaComponent(0.10), radius: 5)
             NSColor.white.withAlphaComponent(0.16).setStroke()
             let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.4, dy: 0.4), xRadius: 5, yRadius: 5)
             path.lineWidth = 0.7; path.stroke()
         }
-        label("FX", NSRect(x: rect.minX, y: rect.minY + 3, width: rect.width, height: 15), size: 10,
-              color: hasEffects ? color : .secondaryLabelColor, weight: .semibold, alignment: .center)
+        centeredControlLabel(title, NSRect(x: rect.minX, y: rect.minY, width: max(0, rect.width - 18), height: rect.height), size: 10,
+                             color: active ? color : .secondaryLabelColor, flipped: flipped)
     }
     override func draw(_ dirtyRect: NSRect) {
-        Self.drawFace(in: bounds, hasEffects: hasEffects, color: effectColor,
-                      hovered: isEnabled && window?.isKeyWindow == true && isHovering)
+        Self.drawFace(in: bounds, title: title, active: hasActiveEffects, color: effectColor,
+                      hovered: isEnabled && window?.isKeyWindow == true && isHovering, flipped: isFlipped)
     }
 }
 
@@ -348,7 +383,7 @@ final class TrackMixerControls: NSView {
         pan.valueText = { $0 == 0 ? "Center" : String(format: "%@ %.0f°", $0 > 0 ? "Left" : "Right", abs($0)) }
         pan.isVertical = true
         if #available(macOS 26.0, *) { pan.neutralValue = 0 }
-        pan.numberOfTickMarks = 3; pan.allowsTickMarkValuesOnly = false
+        pan.numberOfTickMarks = 0; pan.allowsTickMarkValuesOnly = false
         configure(track)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -389,6 +424,21 @@ let trackColors: [NSColor] = [accent, .init(calibratedRed: 0.57, green: 0.62, bl
 func label(_ text: String, _ rect: NSRect, size: CGFloat = 12, color: NSColor = .labelColor, weight: NSFont.Weight = .regular, alignment: NSTextAlignment = .left) {
     let style = NSMutableParagraphStyle(); style.lineBreakMode = .byTruncatingTail; style.alignment = alignment
     (text as NSString).draw(in: rect, withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: weight), .foregroundColor: color, .paragraphStyle: style])
+}
+/// Center actual glyph ink instead of a text container with unused leading.
+func centeredControlLabel(_ text: String, _ rect: NSRect, size: CGFloat, color: NSColor, flipped: Bool) {
+    guard let context = NSGraphicsContext.current?.cgContext else { return }
+    let text = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold),
+        NSAttributedString.Key(kCTForegroundColorAttributeName as String): color.cgColor])
+    let textLine = CTLineCreateWithAttributedString(text)
+    let ink = CTLineGetImageBounds(textLine, nil)
+    context.saveGState()
+    context.translateBy(x: rect.midX, y: rect.midY)
+    if flipped { context.scaleBy(x: 1, y: -1) }
+    context.textMatrix = .identity
+    context.textPosition = CGPoint(x: -ink.midX, y: -ink.midY)
+    CTLineDraw(textLine, context)
+    context.restoreGState()
 }
 func fill(_ rect: NSRect, _ color: NSColor, radius: CGFloat = 0) { color.setFill(); NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill() }
 func line(_ from: NSPoint, _ to: NSPoint, _ color: NSColor, width: CGFloat = 1) { color.setStroke(); let p = NSBezierPath(); p.lineWidth = width; p.move(to: from); p.line(to: to); p.stroke() }
@@ -1151,11 +1201,11 @@ final class Timeline: NSView {
         NSRect(x: pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: 46, height: 20)
     }
     func trackSoloRect(row: Int, depth: Int) -> NSRect {
-        trackMuteRect(row: row, depth: depth).offsetBy(dx: 54, dy: 0)
+        trackMuteRect(row: row, depth: depth).offsetBy(dx: 50, dy: 0)
     }
     func trackFXRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18
-        return NSRect(x: x + 108, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: 46, height: 20)
+        return NSRect(x: x + 100, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: MixerFXButton.controlWidth, height: 20)
     }
     func rangeHandleRects() -> [NSRect] {
         guard let range = editor.range else { return [] }
@@ -1446,11 +1496,11 @@ final class Timeline: NSView {
             let muteRect = trackMuteRect(row: index, depth: depth)
             fill(muteRect, track.muted ? NSColor.systemOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
             drawTrackControlHover(track.id, kind: 0, rect: muteRect)
-            label(track.muted ? "MUTED" : "MUTE", NSRect(x: muteRect.minX, y: muteRect.minY + 3, width: muteRect.width, height: 15), size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, weight: .semibold, alignment: .center)
+            centeredControlLabel(track.muted ? "MUTED" : "MUTE", muteRect, size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, flipped: isFlipped)
             let soloRect = trackSoloRect(row: index, depth: depth)
             fill(soloRect, track.solo ? NSColor.systemBlue.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
             drawTrackControlHover(track.id, kind: 1, rect: soloRect)
-            label("SOLO", NSRect(x: soloRect.minX, y: soloRect.minY + 3, width: soloRect.width, height: 15), size: 9, color: track.solo ? .systemBlue : .secondaryLabelColor, weight: .semibold, alignment: .center)
+            centeredControlLabel("SOLO", soloRect, size: 9, color: track.solo ? .systemBlue : .secondaryLabelColor, flipped: isFlipped)
             line(NSPoint(x: pinnedHeaderX, y: y + rowHeight), NSPoint(x: fragmentLeft, y: y + rowHeight), .white.withAlphaComponent(0.065))
         }
         NSGraphicsContext.restoreGraphicsState()

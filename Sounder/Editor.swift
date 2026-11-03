@@ -540,6 +540,16 @@ final class Editor: NSObject {
         if trackID != Project.masterID { selectedTrack = trackID; update() }
         EffectsWindow(editor: self, trackID: trackID).run()
     }
+    func toggleAllEffects(for trackID: UUID) {
+        guard canEditEffects, var chain = effectChain(for: trackID), !chain.isEmpty else { return }
+        let bypass = chain.contains { !$0.bypassed }
+        checkpoint()
+        for index in chain.indices { chain[index].bypassed = bypass }
+        setEffectChain(chain, for: trackID)
+        effectsChanged()
+        effectsWindows[trackID]?.reload(notifyEditor: false)
+        update()
+    }
     func setEffectChain(_ effects: [PluginEffect], for trackID: UUID) {
         if trackID == Project.masterID { project.masterEffects = effects }
         else if let index = project.tracks.firstIndex(where: { $0.id == trackID }) { project.tracks[index].effects = effects }
@@ -962,7 +972,8 @@ final class Editor: NSObject {
     func confirmDiscard() -> Bool {
         flushPluginEdits()
         guard dirty else { return true }
-        let alert = ActionChoiceAlert(); alert.cancellationIndex = 2; alert.messageText = "Save changes to this project?"; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Discard"); alert.addButton(withTitle: "Cancel")
+        let alert = ActionChoiceAlert(); alert.icon = NSApp.applicationIconImage
+        alert.cancellationIndex = 2; alert.messageText = "Save changes to this project?"; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Discard"); alert.addButton(withTitle: "Cancel")
         switch alert.runModal() { case .alertFirstButtonReturn: return save(); case .alertSecondButtonReturn: return true; default: return false }
     }
     func open() {

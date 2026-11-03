@@ -633,17 +633,31 @@ extension AppDelegate {
         window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
         func verifyEnabled(_ enabled: Bool) throws {
             refresh()
-            let items = window.toolbar!.items.filter { ["open", "save"].contains($0.itemIdentifier.rawValue) }
-            try check(items.count == 2 && items.allSatisfy { $0.isEnabled == enabled && ($0.view as? NSControl)?.isEnabled == enabled }, "Titlebar Open/Save controls and toolbar items are \(enabled ? "enabled" : "disabled") together")
+            let controls = ["open", "save"].compactMap { projectFileButtons[$0] }
+            let group = window.toolbar!.items.first { $0.itemIdentifier.rawValue == "files" }
+            try check(controls.count == 2 && controls.allSatisfy { $0.isEnabled == enabled } && group?.autovalidates == false,
+                      "Grouped titlebar Open/Save controls stay \(enabled ? "enabled" : "disabled") without native autovalidation overriding them")
             let file = NSApp.mainMenu!.items.first { $0.title == "File" }!.submenu!
             file.update()
             let actions = file.items.filter { [#selector(openProject), #selector(saveProject), #selector(saveAs)].contains($0.action) }
             try check(actions.count == 3 && actions.allSatisfy { $0.isEnabled == enabled }, "File menu Open, Save and Save As follow transport availability")
         }
         try verifyEnabled(true)
+        let oldURL = editor.projectURL
+        defer { editor.projectURL = oldURL; refresh() }
+        let open = projectFileButtons["open"]!, save = projectFileButtons["save"]!, reveal = projectFileButtons["reveal"]!
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+        try check(open.superview === save.superview && save.superview === reveal.superview && abs(save.frame.minX - open.frame.minX - 38) < 0.1 && abs(reveal.frame.minX - save.frame.minX - 38) < 0.1,
+                  "Open, Save and Show in Finder use six-point icon spacing: open=\(open.frame), save=\(save.frame), reveal=\(reveal.frame)")
+        editor.projectURL = nil; refresh()
+        try check(!reveal.isEnabled, "Unsaved projects disable Show project in Finder")
+        revealProjectFiles()
+        editor.projectURL = URL(fileURLWithPath: "/tmp/Sounder-project-files-test.sounder"); refresh()
+        try check(reveal.isEnabled && reveal.action == #selector(revealProjectFiles), "Saved projects enable revealing their project file and sibling media folder in Finder")
         editor.seek(to: 1); editor.playPause()
         guard let playback = editor.player else { throw SounderError.message("File controls playback did not start") }
         try verifyEnabled(false)
+        try check(projectFileButtons["reveal"]?.isEnabled == true, "Project files remain accessible during playback or recording")
         openProject(); saveProject(); saveAs()
         try check(editor.player === playback && editor.isPlaying && NSApp.modalWindow == nil && !editor.save(), "Open/Save actions cannot show dialogs or interrupt playback")
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("SounderBusySave-" + UUID().uuidString + ".sounder")
@@ -655,6 +669,7 @@ extension AppDelegate {
         try recorder.start(); editor.activateRecording(recorder)
         recorder.writer.append(captureTestBuffer(format: input, start: 0, frames: 4096)); recorder.writer.waitForPendingWrites()
         try verifyEnabled(false)
+        try check(projectFileButtons["reveal"]?.isEnabled == true, "Project files remain accessible during playback or recording")
         openProject(); saveProject(); saveAs()
         try check(editor.isRecording && NSApp.modalWindow == nil && !editor.save(), "Open/Save stay disabled while recording without stopping capture")
         editor.stop(); try verifyEnabled(true)

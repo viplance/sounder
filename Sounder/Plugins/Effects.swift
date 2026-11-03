@@ -262,6 +262,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     var window: NSWindow!
     let table = NSTableView()
     let plugins = PluginPicker(frame: .zero)
+    let allEffects = PointerButton(title: "Activate all", target: nil, action: nil)
     private static let dragType = NSPasteboard.PasteboardType("enotix.Sounder.effect")
     var installed: [URL] = []
     var snapshotMode = false
@@ -279,16 +280,19 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         }
         snapshotMode = snapshot != nil
         editor.effectsWindows[trackID] = self
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 399), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 507, height: 399), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "FX · " + (trackID == Project.masterID ? "Master" : editor.project.tracks[index!].name); window.delegate = self; window.isReleasedWhenClosed = false
         let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
         window.level = .floating; window.hidesOnDeactivate = false
-        plugins.frame = NSRect(x: 22, y: 353, width: 498, height: 30); root.addSubview(plugins)
+        plugins.frame = NSRect(x: 16, y: 353, width: 221, height: 30); root.addSubview(plugins)
         plugins.onChoose = { [weak self] url in self?.add(url) }
-        let browse = PointerButton(title: "Browse…", target: self, action: #selector(browse)); browse.bezelStyle = .rounded; browse.frame = NSRect(x: 525, y: 352, width: 100, height: 32); root.addSubview(browse)
-        let rescan = PointerButton(title: "Rescan", target: self, action: #selector(scan)); rescan.bezelStyle = .rounded; rescan.frame = NSRect(x: 630, y: 352, width: 108, height: 32); root.addSubview(rescan)
-        let scroll = NSScrollView(frame: NSRect(x: 22, y: 16, width: 716, height: 326)); scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("effect")); column.width = 696
+        let browse = PointerButton(title: "Browse…", target: self, action: #selector(browse)); browse.bezelStyle = .rounded; browse.frame = NSRect(x: 243, y: 352, width: 78, height: 32); root.addSubview(browse)
+        let rescan = PointerButton(title: "Rescan", target: self, action: #selector(scan)); rescan.bezelStyle = .rounded; rescan.frame = NSRect(x: 327, y: 352, width: 66, height: 32); root.addSubview(rescan)
+        allEffects.target = self; allEffects.action = #selector(toggleAll)
+        allEffects.bezelStyle = .rounded; allEffects.font = .systemFont(ofSize: 11)
+        allEffects.frame = NSRect(x: 399, y: 352, width: 92, height: 32); root.addSubview(allEffects)
+        let scroll = NSScrollView(frame: NSRect(x: 16, y: 16, width: 475, height: 326)); scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("effect")); column.width = 455
         table.addTableColumn(column); table.headerView = nil; table.rowHeight = 40
         table.style = .plain; table.intercellSpacing = .zero
         table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
@@ -316,8 +320,11 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         if !plugins.popover.isShown { plugins.showPicker() }
         plugins.search.window?.makeFirstResponder(plugins.search)
     }
+    @objc func toggleAll() { editor.toggleAllEffects(for: trackID) }
     func reload(notifyEditor: Bool = true) {
         table.reloadData()
+        allEffects.title = effects.contains { !$0.bypassed } ? "Bypass all" : "Activate all"
+        allEffects.isEnabled = exists && !effects.isEmpty && editor.canEditEffects
         if let window, exists { window.title = "FX · " + (trackID == Project.masterID ? "Master" : editor.project.tracks[index!].name) }
         if notifyEditor { editor.update() }
     }

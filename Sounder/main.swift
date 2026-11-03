@@ -412,7 +412,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     let masterLabel = NSTextField(labelWithString: "MASTER")
     var masterGroup: NSStackView!
     private var titlebarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
-    private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("open"), NSToolbarItem.Identifier("save"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("quality"), NSToolbarItem.Identifier("export")]
+    private(set) var projectFileButtons: [String: NSButton] = [:]
+    private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("files"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("quality"), NSToolbarItem.Identifier("export")]
     var closingConfirmed = false
     var dialogAutomation: ((NSAlert) -> Void)?
     var fragmentDialogAutomation: ((FragmentSettingsDialog) -> Void)?
@@ -588,17 +589,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         masterVolumeControl.heightAnchor.constraint(equalToConstant: 26).isActive = true
         masterVolumeControl.slider.target = self; masterVolumeControl.slider.action = #selector(changeMasterVolume(_:))
         masterFXButton = MixerFXButton(title: "FX", target: nil, action: nil)
-        masterFXButton.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        masterFXButton.widthAnchor.constraint(equalToConstant: MixerFXButton.controlWidth).isActive = true
         masterFXButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
         masterLabel.font = .systemFont(ofSize: 10, weight: .semibold); masterLabel.textColor = .secondaryLabelColor
         masterGroup = NSStackView(views: [masterLabel, masterFXButton, masterVolumeControl])
         masterGroup.orientation = .horizontal; masterGroup.alignment = .centerY; masterGroup.spacing = 10
-        masterGroup.widthAnchor.constraint(equalToConstant: masterLabel.intrinsicContentSize.width + 46 + 200 + 20).isActive = true
+        masterGroup.widthAnchor.constraint(equalToConstant: masterLabel.intrinsicContentSize.width + MixerFXButton.controlWidth + 200 + 20).isActive = true
         masterGroup.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        let fileActions = [("open", "Open project", "folder", #selector(openProject)),
+                           ("save", "Save project", "square.and.arrow.down", #selector(saveProject)),
+                           ("reveal", "Show project in Finder", "folder.badge.gearshape", #selector(revealProjectFiles))]
+        let fileViews = fileActions.map { id, label, image, action -> NSButton in
+            let control = button(label, image, action); projectFileButtons[id] = control; return control
+        }
+        let files = NSStackView(views: fileViews); files.orientation = .horizontal; files.alignment = .centerY; files.spacing = 6
+        files.widthAnchor.constraint(equalToConstant: CGFloat(fileViews.count) * 32 + CGFloat(fileViews.count - 1) * 6).isActive = true
+        files.heightAnchor.constraint(equalToConstant: 28).isActive = true
         let controls: [(String, String, NSView)] = [
             ("project", "Project name", projectNameView),
-            ("open", "Open project", button("Open project", "folder", #selector(openProject))),
-            ("save", "Save project", button("Save project", "square.and.arrow.down", #selector(saveProject))),
+            ("files", "Project files", files),
             ("master", "Master", masterGroup),
             ("quality", "Project audio settings", qualityButton),
             ("export", "Export", export)
@@ -608,8 +617,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.label = label; item.toolTip = label; item.view = view
             // Custom toolbar views still receive the system glass bezel unless explicitly opted out.
-            if ["project", "master", "masterFX"].contains(id) { item.isBordered = false }
-            if ["open", "save", "export", "quality", "master", "masterFX"].contains(id) { item.autovalidates = false }
+            if ["project", "files", "master", "masterFX"].contains(id) { item.isBordered = false }
+            if ["files", "export", "quality", "master", "masterFX"].contains(id) { item.autovalidates = false }
             item.visibilityPriority = .high
             titlebarItems[identifier] = item
         }
@@ -1031,10 +1040,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isImporting; recordButton.isEnabled = editor.canRecord
         editButtons.forEach { $0.isEnabled = !editor.busy }
         for name in ["open", "save"] {
-            let item = titlebarItems[NSToolbarItem.Identifier(name)]
-            item?.isEnabled = !editor.busy
-            (item?.view as? NSControl)?.isEnabled = !editor.busy
+            projectFileButtons[name]?.isEnabled = !editor.busy
         }
+        projectFileButtons["reveal"]?.isEnabled = editor.projectURL != nil
         exportButton.isEnabled = editor.canExport
         masterVolumeControl.configure(track: editor.project.masterTrack, meter: editor.displayedTrackMeter(editor.project.masterTrack),
                                       active: editor.isPlaying || editor.isRecording, recording: false, enabled: editor.canAdjustTrackMix, showsPeaks: true)
@@ -1139,6 +1147,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
         }
         return false
+    }
+    @objc func revealProjectFiles() {
+        guard let url = editor.projectURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
     @objc func openProject() { editor.open() }
     private func finishNameEditing() { projectNameField.finish(commit: true); timeline.nameField.finish(commit: true) }

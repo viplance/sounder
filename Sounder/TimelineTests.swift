@@ -906,7 +906,7 @@ extension AppDelegate {
         let deadline = Date().addingTimeInterval(2)
         while !window.isKeyWindow && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
         try check(window.isKeyWindow, "Main window is active before testing hover feedback")
-        guard let icon = window.toolbar?.items.first(where: { $0.itemIdentifier.rawValue == "open" })?.view as? PointerButton else { throw SounderError.message("Open button missing") }
+        guard let icon = projectFileButtons["open"] as? PointerButton else { throw SounderError.message("Open button missing") }
         func event(_ type: NSEvent.EventType, point: NSPoint, view: NSView) -> NSEvent {
             let location = view.convert(point, to: nil)
             if type == .mouseEntered || type == .mouseExited {
@@ -1038,7 +1038,7 @@ extension AppDelegate {
         let first = timeline.rows[0].0.id
         guard let controls = timeline.mixerControls[first] else { throw SounderError.message("Track sliders were not installed") }
         guard controls.fx.target === controls.fx, masterFXButton.target === masterFXButton,
-              timeline.hitTest(controls.fx.convert(NSPoint(x: controls.fx.bounds.midX, y: controls.fx.bounds.midY), to: timeline.superview)) === controls.fx else { throw SounderError.message("Track FX must use the same self-contained native button as Master, including hit testing") }
+              timeline.hitTest(controls.fx.convert(NSPoint(x: controls.fx.bounds.midX, y: controls.fx.bounds.midY), to: timeline.superview)) === controls.fx else { throw SounderError.message("Track FX hit testing failed: track target=\(controls.fx.target === controls.fx), master target=\(masterFXButton.target === masterFXButton), frame=\(controls.fx.frame), power=\(controls.fx.power.frame), hit=\(String(describing: timeline.hitTest(controls.fx.convert(NSPoint(x: controls.fx.bounds.midX, y: controls.fx.bounds.midY), to: timeline.superview)))))") }
         controls.fx.performClick(nil)
         guard let rack = editor.effectsWindows[first], editor.selectedTrack == first else { throw SounderError.message("Shared track FX button did not open its own effect chain") }
         rack.done(); window.makeKeyAndOrderFront(nil)
@@ -1256,7 +1256,7 @@ extension AppDelegate {
             guard masterVolumeControl.window === window, !masterVolumeControl.isHiddenOrHasHiddenAncestor,
                   abs(group.midX - window.frame.width / 2) < 2, heading.maxX < fx.minX, fx.maxX < master.minX,
                   masterFXButton.title == "FX", masterFXButton.font?.pointSize == 10,
-                  abs(fx.width - 46) < 0.5, abs(fx.height - 20) < 0.5,
+                  abs(fx.width - MixerFXButton.controlWidth) < 0.5, abs(fx.height - 20) < 0.5,
                   masterVolumeControl.slider.cell is TrackVolumeMeterCell else { throw SounderError.message("Master group must stay centered in MASTER → FX → volume order, using the track FX dimensions/font: \(group), \(fx)") }
             let name = editor.project.name
             editor.project.name = String(repeating: "W", count: 100); refresh()
@@ -1349,6 +1349,7 @@ extension AppDelegate {
         }
         editor.showEffects(for: track)
         let rack = editor.effectsWindows[track]!
+        try check(!rack.allEffects.isEnabled && !timeline.mixerControls[track]!.fx.power.isEnabled, "Empty FX chains disable both bulk activation controls")
         try check(rack.effects.isEmpty && rack.plugins.popover.isShown && rack.plugins.search.currentEditor() != nil && rack.plugins.search.window?.firstResponder === rack.plugins.search.currentEditor(),
                   "Opening an empty FX chain immediately expands the picker and focuses Search plug-ins")
         rack.plugins.popover.close()
@@ -1413,6 +1414,36 @@ extension AppDelegate {
         action("Bypass", row: 0).performClick(nil)
         try check(!rack.effects[0].bypassed && action("Bypass", row: 0).state == .on && action("Bypass", row: 0).toolTip == "Выключить",
                   "Clicking again re-enables processing and restores the green power icon")
+        rack.bypass(id: second.id)
+        refresh()
+        let trackFX = timeline.mixerControls[track]!.fx
+        trackFX.layoutSubtreeIfNeeded()
+        try check(trackFX.power.isEnabled && trackFX.power.state == .on && rack.allEffects.title == "Bypass all",
+                  "A partially active FX chain offers Bypass all in both the track control and popup")
+        let power = trackFX.power
+        let powerPoint = power.convert(NSPoint(x: power.bounds.midX, y: power.bounds.midY), to: trackFX.superview)
+        try check(trackFX.hitTest(powerPoint) === power, "The FX power icon has its own mouse hit target")
+        let beforeAll = editor.undoStack.count
+        trackFX.power.performClick(nil)
+        try check(rack.effects.allSatisfy(\.bypassed) && editor.undoStack.count == beforeAll + 1 && rack.allEffects.title == "Activate all" && trackFX.power.state == .off,
+                  "The shared FX power button bypasses the entire chain with one Undo step")
+        rack.allEffects.performClick(nil)
+        try check(rack.effects.allSatisfy { !$0.bypassed } && rack.allEffects.title == "Bypass all" && trackFX.power.state == .on,
+                  "Popup Activate all enables every plug-in and synchronizes the track power icon")
+        try check(abs(rack.window.contentView!.bounds.width - 507) < 1 && rack.allEffects.frame.maxX <= rack.window.contentView!.bounds.maxX - 15,
+                  "FX window is one and a half times narrower with the bulk action at the right edge")
+        let savedMaster = editor.project.masterEffects
+        editor.project.masterEffects = rack.effects.map { effect in var effect = effect; effect.id = UUID(); return effect }
+        refresh(); masterFXButton.layoutSubtreeIfNeeded()
+        try check(type(of: masterFXButton!) == type(of: trackFX) && masterFXButton.power.action == trackFX.power.action && masterFXButton.power.state == .on,
+                  "MASTER and tracks reuse the exact same FX group and power action")
+        masterFXButton.power.performClick(nil)
+        try check(editor.project.masterEffects.allSatisfy(\.bypassed) && rack.effects.allSatisfy { !$0.bypassed },
+                  "MASTER FX power bypasses only the master chain")
+        masterFXButton.power.performClick(nil)
+        let restored = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(editor.project))
+        try check(restored.masterEffects.allSatisfy { !$0.bypassed }, "Bulk activation states persist in the project")
+        editor.project.masterEffects = savedMaster; refresh()
         let retainedBypass = action("Bypass", row: 1), history = editor.undoStack.count
         let writer = rack.tableView(rack.table, pasteboardWriterForRow: 0) as? NSPasteboardItem
         try check(writer?.string(forType: NSPasteboard.PasteboardType("enotix.Sounder.effect")) == first.id.uuidString,

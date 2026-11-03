@@ -37,7 +37,7 @@ Save your project before running `npm start`: at the user's request, this comman
 
 ## VST / VST3 effects (1.1)
 
-Click **FX** in a track header or choose **Track → Track Effects… (⌘F)**. The floating panel shows the selected track's serial effects chain and stays above the editor until closed. Project windows minimize and restore together with the editor. Notifications appear only in the main editor.
+Click **FX** in a track header or choose **Track → Track Effects… (⌘F)**. The floating panel shows the selected track's serial effects chain and stays above the editor until closed. The compact FX window includes **Bypass all / Activate all** beside Rescan; the same action is available from the power icon attached to the shared track/MASTER FX control. Project windows minimize and restore together with the editor. Notifications appear only in the main editor.
 
 - Selecting a result in the installed plug-in picker immediately adds that effect; **Browse…** lets you select a `.vst` / `.vst3` manually, with other file types excluded. Adding an effect immediately opens its native editor, falling back to generic parameter controls if it has no native interface. **Rescan** refreshes the list from `/Library/Audio/Plug-Ins` and `~/Library/Audio/Plug-Ins`. Scanning lists bundles without executing their code; a module is loaded when added.
 - Search installed effects by any part of their name in the plug-in picker. **VST3 only** is enabled by default; uncheck it to include legacy VST effects. Up/Down selects results, Enter chooses, and Escape closes the picker.
@@ -160,3 +160,5 @@ Timeline seeking during playback and starting/resuming Play ease horizontal cent
 Track volume is vertically centered with the neutral Pan position; MUTE/SOLO/FX sit below with a small bottom inset. Track and MASTER volume share the same longer rail, narrow transverse thumb and compact peak labels, with the channel suffix after the level (`-3.0 dB L`, `-4.2 dB R`).
 
 Track and MASTER peak readouts hold maxima for one second, then follow current levels. Silent channels have no numeric label. Stopping clears the rails immediately. Each channel’s numbers fade out over one second when its signal disappears or playback ends.
+
+The titlebar groups Open, Save and Show project in Finder with the same icon spacing as the editor toolbar. Show project in Finder reveals the saved project alongside its media folder; it is disabled until the project is saved.
