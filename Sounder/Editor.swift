@@ -12,6 +12,7 @@ final class Editor: NSObject {
     var range: ClosedRange<Double>? { didSet { updateLoop() } }
     var zoom = 70.0
     var changed: (() -> Void)?
+    var transportChanged: (() -> Void)?
     let notifications: ToastCenter
     var undoStack: [Project] = []
     var redoStack: [Project] = []
@@ -492,14 +493,23 @@ final class Editor: NSObject {
             cursor = player.currentTime
             updateTrackMeters(player.consumeTrackPeaks(at: cursor))
             if shuttleReleasing, player.returnReady, abs(player.currentSpeed - 1) < 1e-8 {
-                player.completeReturn(); shuttleReleasing = false; shuttleGesture = nil
+                player.completeReturn(); shuttleReleasing = false; shuttleGesture = nil; changed?()
             }
         } else if let shuttle { cursor = shuttle.currentTime }
         else if followsPausedCursor, let pausedPlayer {
             if pausedCursorIsCurrent { cursor = pausedPlayer.currentTime; pausedCursorSnapshot = cursor }
             else { followsPausedCursor = false; timer?.invalidate(); timer = nil }
         }
-        changed?()
+        if let transportChanged { transportChanged() } else { changed?() }
+    }
+    /// Read only the audible clock at display cadence; meter/capture work stays at 25 Hz.
+    func updateTransportFrame() {
+        guard recorder == nil else { return }
+        if let player { cursor = player.currentTime }
+        else if let shuttle { cursor = shuttle.currentTime }
+        else if pausedCursorIsCurrent, let pausedPlayer {
+            cursor = pausedPlayer.currentTime; pausedCursorSnapshot = cursor
+        }
     }
     func startTimer() {
         timer?.invalidate()

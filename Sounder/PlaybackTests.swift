@@ -1354,3 +1354,126 @@ extension AppDelegate {
         print("PASS: Loop starts and resumes at the cursor, plays the lead-in, wraps only at the right edge, preserves the start marker, and does not jump backward from after the period")
     }
 }
+
+
+extension AppDelegate {
+    /// Compare the same renderer with and without raster reuse, then exercise real display callbacks.
+    func verifyGraphicsUI() throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let saved = editor.project, savedCursor = editor.cursor, savedZoom = editor.zoom, savedSelection = editor.selection
+        defer {
+            editor.stop(); editor.project = saved; editor.cursor = savedCursor; editor.zoom = savedZoom
+            editor.selection = savedSelection; editor.selectedTrack = saved.tracks.first?.id
+            timeline.usesFragmentRasterCache = true; refresh()
+        }
+        let source = saved.tracks[0].clips[0].source
+        _ = try editor.audio.load(source)
+        editor.project.tracks = (0..<7).map { index in
+            var clip = Clip(name: "Graphics test \(index)", source: source, start: 0, duration: 8, order: index)
+            clip.fadeInMS = 1200; clip.fadeOutMS = 1700; clip.pan = Double(index - 3) * 15
+            return Track(name: "Track \(index)", clips: [clip])
+        }
+        editor.cursor = 2; editor.zoom = 160; editor.selection = [editor.project.tracks[0].clips[0].id]
+        refresh()
+        func render() throws -> NSBitmapImageRep {
+            let rect = timeline.visibleRect
+            let scale: CGFloat = 2
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(ceil(rect.width * scale)),
+                                               pixelsHigh: Int(ceil(rect.height * scale)), bitsPerSample: 8, samplesPerPixel: 4,
+                                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let graphics = NSGraphicsContext(bitmapImageRep: bitmap) else { throw SounderError.message("Cannot allocate graphics test surface") }
+            NSGraphicsContext.saveGraphicsState()
+            let context = graphics.cgContext
+            context.translateBy(x: 0, y: CGFloat(bitmap.pixelsHigh)); context.scaleBy(x: scale, y: -scale)
+            context.translateBy(x: -rect.minX, y: -rect.minY)
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+            NSBezierPath(rect: rect).addClip()
+            timeline.draw(rect)
+            NSGraphicsContext.restoreGraphicsState()
+            return bitmap
+        }
+        _ = try render()
+        let deadline = Date().addingTimeInterval(5)
+        while timeline.pendingGraphicsJobs > 0 && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02)); _ = try render()
+        }
+        try check(timeline.pendingGraphicsJobs == 0, "Audio decoding and processed waveform preparation finish outside drawing")
+        func comparePixels() throws {
+            timeline.usesFragmentRasterCache = false; let direct = try render()
+            timeline.usesFragmentRasterCache = true; let cached = try render()
+            let a = direct.bitmapData!, b = cached.bitmapData!
+            var error: Double = 0, changed = 0
+            for y in 0..<direct.pixelsHigh {
+                for x in 0..<(direct.pixelsWide * 4) {
+                    let difference = abs(Int(a[y * direct.bytesPerRow + x]) - Int(b[y * cached.bytesPerRow + x]))
+                    error += Double(difference); if difference > 12 { changed += 1 }
+                }
+            }
+            let mean = error / Double(direct.pixelsHigh * direct.pixelsWide * 4)
+            try direct.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "/tmp/sounder-graphics-direct.png"))
+            try cached.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "/tmp/sounder-graphics-cached.png"))
+            try check(mean < 2.5, "Cached fragment pixels preserve stereo waves, titles and fades (mean channel error \(String(format: "%.3f", mean)), changed \(changed))")
+        }
+        try comparePixels()
+        editor.audio.cache.removeValue(forKey: source)
+        _ = try render()
+        try check(editor.audio.cache[source] == nil && timeline.pendingGraphicsJobs > 0,
+                  "A cold source schedules decoding without reading the audio file inside draw")
+        let sourceDeadline = Date().addingTimeInterval(5)
+        while timeline.pendingGraphicsJobs > 0 && Date() < sourceDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02)); _ = try render()
+        }
+        try check(editor.audio.cache[source] != nil && timeline.pendingGraphicsJobs == 0,
+                  "Background decoding publishes source PCM and replaces placeholder graphics")
+        try comparePixels()
+        let builds = timeline.rasterBuildCount, hits = timeline.rasterHitCount
+        for _ in 0..<10 { _ = try render() }
+        try check(timeline.rasterBuildCount == builds && timeline.rasterHitCount > hits, "Repeated frames reuse raster tiles without rebuilding waveforms, titles or shadows")
+        func benchmark(cached: Bool) throws -> Double {
+            timeline.usesFragmentRasterCache = cached
+            let start = ProcessInfo.processInfo.systemUptime
+            for _ in 0..<24 { _ = try render() }
+            return (ProcessInfo.processInfo.systemUptime - start) * 1000 / 24
+        }
+        let directMS = try benchmark(cached: false), cachedMS = try benchmark(cached: true)
+        print(String(format: "GRAPHICS BENCHMARK: direct %.2f ms/frame, cached %.2f ms/frame, %.2fx faster (same viewport, seven stereo fragments)", directMS, cachedMS, directMS / max(0.0001, cachedMS)))
+        let previousBuilds = timeline.rasterBuildCount
+        editor.project.tracks[0].clips[0].volumeDB = -12
+        editor.project.tracks[0].clips[0].pan = 70
+        editor.project.tracks[0].clips[0].fadeInCurve = .exponential
+        editor.project.tracks[0].clips[0].fadeOutMS = 900
+        editor.project.tracks[0].clips[0].name = "Edited waveform"
+        refresh(); _ = try render()
+        while timeline.pendingGraphicsJobs > 0 && Date() < deadline.addingTimeInterval(5) {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02)); _ = try render()
+        }
+        try check(timeline.rasterBuildCount > previousBuilds, "Volume, pan, fade curve and title edits invalidate stale raster tiles")
+        try comparePixels()
+        editor.zoom = 250; editor.cursor = 4; refresh(); timeline.centerOnPlayhead(); _ = try render()
+        try comparePixels()
+        try check(abs(timeline.playheadFrame.midX - (timeline.header + editor.cursor * editor.zoom)) < 0.001 && !timeline.playheadIsHidden,
+                  "The independent playhead layer stays aligned with the audio position after zoom and scroll")
+        editor.seek(to: 2); editor.playPause()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        let player = editor.player, initialTime = editor.cursor
+        let full = fullRefreshCount, structures = timeline.structureRefreshCount, frames = transportFrameCount
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        try check(editor.player === player && editor.cursor > initialTime && transportFrameCount - frames >= 12,
+                  "Display-synchronized transport advances from the running audio clock above the old 25 Hz cadence")
+        try check(fullRefreshCount == full && timeline.structureRefreshCount == structures,
+                  "Playback frames and meter ticks never rebuild the project toolbar or track structure")
+        try check(abs(editor.cursor - (editor.player?.currentTime ?? 0)) < 0.06,
+                  "Display cursor remains synchronized with audible playback")
+        editor.beginShuttle(direction: -1)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+        let shuttleFull = fullRefreshCount
+        RunLoop.current.run(until: Date().addingTimeInterval(0.45))
+        try check(editor.player === player && fullRefreshCount == shuttleFull,
+                  "Reversing shuttle also uses display frames without restarting audio or refreshing project UI")
+        editor.stop(); RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        try check(transportDisplayIsPaused, "Display callbacks pause immediately when transport stops")
+        print("PASS: Graphics optimization integration")
+    }
+}

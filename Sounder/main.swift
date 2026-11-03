@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import QuartzCore
 
 /// Reject invalid edits before they enter the shared AppKit field editor.
 /// Keep the text representation so intermediate signs and decimal separators
@@ -416,6 +417,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var dialogAutomation: ((NSAlert) -> Void)?
     var fragmentDialogAutomation: ((FragmentSettingsDialog) -> Void)?
     private var shortcutMonitor: Any?
+    private var transportDisplayLink: CADisplayLink?
+    var transportDisplayIsPaused: Bool { transportDisplayLink?.isPaused ?? true }
+    private(set) var fullRefreshCount = 0
+    private(set) var transportFrameCount = 0
+    private func synchronizeDisplayLink() {
+        if transportDisplayLink == nil {
+            let link = window.displayLink(target: self, selector: #selector(displayTransportFrame(_:)))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+            link.add(to: .main, forMode: .common)
+            link.add(to: .main, forMode: .modalPanel)
+            transportDisplayLink = link
+        }
+        transportDisplayLink?.isPaused = editor.timer == nil || !window.isVisible || window.isMiniaturized || !window.occlusionState.contains(.visible)
+    }
+    @objc private func displayTransportFrame(_ link: CADisplayLink) {
+        guard editor.timer != nil else { link.isPaused = true; return }
+        editor.updateTransportFrame()
+        timeline.presentTransportFrame()
+        updatePositionLabel()
+        transportFrameCount += 1
+    }
+    func windowDidChangeOcclusionState(_ notification: Notification) { synchronizeDisplayLink() }
+    func windowDidMiniaturize(_ notification: Notification) { synchronizeDisplayLink() }
+    func windowDidDeminiaturize(_ notification: Notification) { synchronizeDisplayLink() }
+    private func updatePositionLabel() {
+        let time = editor.cursor
+        if editor.project.tempoMode {
+            let running = editor.isPlaying || editor.isRecording
+            let title = running ? TempoGrid.positionLabel(time: time, bpm: editor.project.tempo) : (editor.project.tempo.rounded() == editor.project.tempo ? String(Int(editor.project.tempo)) : String(format: "%.1f", editor.project.tempo)) + " BPM"
+            if bpmButton.title != title { bpmButton.title = title }
+        } else {
+            let text = String(format: "%02d:%02d.%03d", Int(time) / 60, Int(time) % 60, Int(time * 1000) % 1000)
+            if timeLabel.stringValue != text { timeLabel.stringValue = text }
+        }
+    }
+    private func refreshTransport() {
+        synchronizeDisplayLink()
+        guard window.isVisible, !window.isMiniaturized, window.occlusionState.contains(.visible) else { return }
+        // The polling tick can also publish a new cursor (notably capture and explicit test/seek polls).
+        // Present it atomically with its scroll position; Core Animation coalesces updates per display frame.
+        timeline.presentTransportFrame()
+        updatePositionLabel()
+        timeline.refreshTransportMeters()
+        let master = editor.project.masterTrack
+        masterVolumeControl.updateMeter(editor.displayedTrackMeter(master), active: editor.isPlaying || editor.isRecording, recording: false,
+                                        showsPeaks: true)
+        // Recording peaks arrive at 25 Hz. The display link moves only the transport.
+        timeline.invalidateRecordingPreview()
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         for app in NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "enotix.Sounder") where app.processIdentifier != ProcessInfo.processInfo.processIdentifier { app.terminate() }
         do { editor = Editor(store: try AudioStore()) }
@@ -478,6 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         timeline = Timeline(editor); scroll.documentView = timeline; timeline.installHeaderControls(timelineControls); add(scroll, to: stack)
         notificationOverlay = ToastOverlay.install(in: content, center: editor.notifications)
         editor.changed = { [weak self] in self?.refresh() }
+        editor.transportChanged = { [weak self] in self?.refreshTransport() }
         buildMenu()
         shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
@@ -571,6 +622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 editor.project.tracks[1].effects = [PluginEffect(name: host.pluginName, path: path, classID: host.classID, state: try host.saveState(), bypassed: true)]
             }
             refresh()
+            if CommandLine.arguments.contains("--graphics-ui-test") { try verifyGraphicsUI() }
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
             if CommandLine.arguments.contains("--button-hover-ui-test") { try verifyButtonHoverUI() }
             if CommandLine.arguments.contains("--project-file-controls-ui-test") { try verifyProjectFileControlsUI() }
@@ -918,6 +970,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let height { view.heightAnchor.constraint(equalToConstant: height).isActive = true }
     }
     func refresh() {
+        fullRefreshCount += 1
         timeline.refresh()
         let muted = editor.fragmentsAreMuted(editor.selection)
         fragmentMuteButton.toolTip = muted ? "Unmute selected fragments" : "Mute selected fragments"
@@ -967,6 +1020,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ])
         window.title = editor.projectName + " — Sounder"
         window.isDocumentEdited = editor.dirty
+        synchronizeDisplayLink()
     }
     private func updateProjectNameWidth() {
         guard let projectNameView, let qualityButton else { return }

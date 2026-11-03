@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 
 final class MixerFXButton: PointerButton {
     private weak var editor: Editor?
@@ -237,14 +238,28 @@ final class MixerVolumeControl: NSView {
         slider.frame = NSRect(x: 0, y: bounds.midY - 9, width: max(24, bounds.width - 62), height: 18)
     }
     func configure(track: Track, meter: StereoTrackLevelMeter, active: Bool, recording: Bool, enabled: Bool, showsPeaks: Bool) {
-        self.meter = meter; self.showsPeaks = showsPeaks
         if !slider.trackingGesture && slider.doubleValue != track.volumeDB { slider.doubleValue = track.volumeDB }
         if slider.isEnabled != enabled { slider.isEnabled = enabled }
         slider.setAccessibilityLabel("\(track.name) volume")
-        if let cell = slider.cell as? TrackVolumeMeterCell {
-            cell.recording = recording; cell.levels = active ? [meter.left.level, meter.right.level] : [0, 0]
+        slider.refreshValuePresentation()
+        updateMeter(meter, active: active, recording: recording, showsPeaks: showsPeaks)
+    }
+    func updateMeter(_ meter: StereoTrackLevelMeter, active: Bool, recording: Bool, showsPeaks: Bool) {
+        let oldLabels = [self.meter.left.peakText, self.meter.right.peakText]
+        func band(_ peak: Double) -> Int {
+            let db = TrackLevelMeter.decibels(peak)
+            return db >= -1 ? 2 : db >= -6 ? 1 : 0
         }
-        slider.refreshValuePresentation(); slider.needsDisplay = true; needsDisplay = true
+        let oldBands = [band(self.meter.left.peak), band(self.meter.right.peak)]
+        let oldPeaks = self.showsPeaks
+        self.meter = meter; self.showsPeaks = showsPeaks
+        if let cell = slider.cell as? TrackVolumeMeterCell {
+            let levels = active ? [meter.left.level, meter.right.level] : [0, 0]
+            if cell.recording != recording || cell.levels != levels {
+                cell.recording = recording; cell.levels = levels; slider.needsDisplay = true
+            }
+        }
+        if oldPeaks != showsPeaks || oldLabels != [meter.left.peakText, meter.right.peakText] || oldBands != [band(meter.left.peak), band(meter.right.peak)] { needsDisplay = true }
     }
     override func draw(_ dirtyRect: NSRect) {
         guard showsPeaks else { return }
@@ -398,7 +413,108 @@ final class InlineNameField: NSTextField, NSTextFieldDelegate {
     }
 }
 
+/// Only this narrow layer moves at display cadence; it never redraws audio content.
+private final class TransportPlayheadView: NSView {
+    private let stem = CALayer()
+    private let cap = CALayer()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.addSublayer(stem); layer?.addSublayer(cap)
+        cap.cornerRadius = 2
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    func present(x: CGFloat, viewport: NSRect, color: NSColor, visible: Bool) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        isHidden = !visible
+        let left = min(viewport.maxX, max(viewport.minX, x - 5))
+        let right = max(left, min(viewport.maxX, x + 5))
+        let next = NSRect(x: left, y: viewport.minY, width: right - left, height: viewport.height)
+        if frame != next { frame = next }
+        stem.frame = NSRect(x: x - left - 0.75, y: 0, width: 1.5, height: viewport.height)
+        cap.frame = NSRect(x: x - left - 4, y: 0, width: 8, height: 8)
+        stem.backgroundColor = color.cgColor; cap.backgroundColor = color.cgColor
+        CATransaction.commit()
+    }
+}
+
+/// Small, opaque pinned surfaces retain their backing images when only their origin moves.
+private final class TimelinePinnedSurface: NSView {
+    var paint: ((NSRect) -> Void)?
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { true }
+    override init(frame: NSRect) { super.init(frame: frame); wantsLayer = true }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.cgContext.translateBy(x: -frame.minX, y: -frame.minY)
+        paint?(dirtyRect.offsetBy(dx: frame.minX, dy: frame.minY))
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
 final class Timeline: NSView {
+    private let playheadView = TransportPlayheadView(frame: .zero)
+    private let sidebarSurface = TimelinePinnedSurface(frame: .zero)
+    private let rulerSurface = TimelinePinnedSurface(frame: .zero)
+    private var presentingTransport = false
+    private var previousRecordingRect: NSRect?
+    private(set) var structureRefreshCount = 0
+    private(set) var rasterBuildCount = 0
+    private(set) var rasterHitCount = 0
+    var usesFragmentRasterCache = true
+    var pendingGraphicsJobs: Int { sourceJobs.count + waveformJobs.count }
+    var playheadFrame: NSRect { playheadView.frame }
+    var playheadIsHidden: Bool { playheadView.isHidden }
+    private struct RasterStyle: Equatable {
+        let waveform: FragmentWaveformKey
+        let name: String
+        let zoom: Double
+        let height: CGFloat
+        let scale: CGFloat
+        let colorIndex: Int
+        let selected: Bool
+        let dimmed: Bool
+        let muted: Bool
+        let processed: Bool
+        let hasAudio: Bool
+    }
+    private var rasterStyles: [UUID: (RasterStyle, UUID)] = [:]
+    private let fragmentRasters: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.totalCostLimit = 64 * 1024 * 1024; cache.countLimit = 256
+        return cache
+    }()
+
+    private struct SourceDecodeKey: Hashable { let path: String; let rate: Double }
+    private var sourceJobs: [SourceDecodeKey: Progress] = [:]
+    private var failedSources = Set<SourceDecodeKey>()
+    private func preparedAudio(for clip: Clip) -> AudioData? {
+        if let data = editor.audio.cache[clip.source] { return data }
+        let key = SourceDecodeKey(path: clip.source, rate: editor.audio.sampleRate)
+        guard sourceJobs[key] == nil, !failedSources.contains(key) else { return nil }
+        let cancellation = Progress(totalUnitCount: 1)
+        sourceJobs[key] = cancellation
+        waveformQueue.async { [weak self] in
+            let result = Result { try AudioStore.decode(URL(fileURLWithPath: key.path), sampleRate: key.rate, isCancelled: { cancellation.isCancelled }) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.sourceJobs.removeValue(forKey: key) != nil, !cancellation.isCancelled,
+                      self.editor.audio.sampleRate == key.rate else { return }
+                switch result {
+                case .success(let data):
+                    self.editor.audio.cache[key.path] = data
+                    self.setNeedsDisplay(self.visibleRect)
+                case .failure(let error):
+                    self.failedSources.insert(key); self.editor.error(error)
+                }
+            }
+        }
+        return nil
+    }
     private var fragmentWaveforms: [UUID: (FragmentWaveformKey, [[Float]])] = [:]
     private var waveformJobs: [UUID: (FragmentWaveformKey, Progress)] = [:]
     private let waveformQueue = DispatchQueue(label: "Sounder.fragment-waveforms", qos: .userInitiated)
@@ -416,7 +532,13 @@ final class Timeline: NSView {
                     guard let self, !cancellation.isCancelled, self.waveformJobs[clip.id]?.0 == key else { return }
                     self.fragmentWaveforms[clip.id] = (key, peaks)
                     self.waveformJobs.removeValue(forKey: clip.id)
-                    self.needsDisplay = true
+                    for (row, item) in self.rows.enumerated() {
+                        guard let current = self.displayedClips(for: item.0).first(where: { $0.id == clip.id }) else { continue }
+                        let dirty = NSRect(x: self.header + current.start * self.editor.zoom - 4,
+                                           y: self.ruler + CGFloat(row) * self.rowHeight,
+                                           width: current.duration * self.editor.zoom + 8, height: self.rowHeight).intersection(self.visibleRect)
+                        if !dirty.isNull, !dirty.isEmpty { self.setNeedsDisplay(dirty) }
+                    }
                 }
             }
         }
@@ -470,7 +592,16 @@ final class Timeline: NSView {
     private var hoveredTrackControl: (id: UUID, kind: Int)?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    init(_ editor: Editor) { self.editor = editor; super.init(frame: .zero); addSubview(nameField); nameField.font = .systemFont(ofSize: 13, weight: .semibold); nameField.setAccessibilityLabel("Track name"); nameField.textChanged = { [weak self] in self?.layoutNameField() } }
+    init(_ editor: Editor) {
+        self.editor = editor; super.init(frame: .zero)
+        addSubview(sidebarSurface); addSubview(rulerSurface); addSubview(playheadView); addSubview(nameField)
+        sidebarSurface.paint = { [weak self] in self?.drawTrackHeaders(in: $0) }
+        rulerSurface.paint = { [weak self] in self?.drawRuler(in: $0) }
+        nameField.font = .systemFont(ofSize: 13, weight: .semibold)
+        nameField.setAccessibilityLabel("Track name")
+        nameField.textChanged = { [weak self] in self?.layoutNameField() }
+    }
+    override var isOpaque: Bool { true }
     required init?(coder: NSCoder) { fatalError() }
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
@@ -480,11 +611,14 @@ final class Timeline: NSView {
         clip.postsBoundsChangedNotifications = true
         scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
             guard let self else { return }
-            self.positionHeaderControls()
-            if let window = self.window { self.updateTrackControlHover(at: self.convert(window.mouseLocationOutsideOfEventStream, from: nil)) }
-            self.layoutNameField()
-            self.setNeedsDisplay(self.visibleRect)
-            self.window?.invalidateCursorRects(for: self)
+            self.positionPinnedSurfaces()
+            self.positionHeaderControls(updateConfiguration: false)
+            self.presentPlayhead()
+            if !self.presentingTransport {
+                if let window = self.window { self.updateTrackControlHover(at: self.convert(window.mouseLocationOutsideOfEventStream, from: nil)) }
+                self.layoutNameField()
+                self.window?.invalidateCursorRects(for: self)
+            }
         }
     }
     override func updateTrackingAreas() {
@@ -505,7 +639,7 @@ final class Timeline: NSView {
                 if let index = rects.firstIndex(where: { $0.contains(point) }) { next = (track.id, index) }
             }
         }
-        if next?.id != hoveredTrackControl?.id || next?.kind != hoveredTrackControl?.kind { hoveredTrackControl = next; needsDisplay = true }
+        if next?.id != hoveredTrackControl?.id || next?.kind != hoveredTrackControl?.kind { hoveredTrackControl = next; sidebarSurface.needsDisplay = true }
     }
     override func mouseMoved(with event: NSEvent) { updateTrackControlHover(at: convert(event.locationInWindow, from: nil)) }
     override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
@@ -523,11 +657,21 @@ final class Timeline: NSView {
         addSubview(view)
         positionHeaderControls()
     }
-    private func positionHeaderControls() {
-        headerControls?.frame = NSRect(x: pinnedHeaderX, y: pinnedRulerRect.minY, width: header, height: ruler)
-        positionMixerControls()
+    private func positionPinnedSurfaces() {
+        let visible = visibleRect
+        let sidebar = NSRect(x: pinnedHeaderX, y: pinnedRulerRect.maxY, width: header, height: max(0, visible.height - ruler))
+        let oldSidebar = sidebarSurface.frame
+        if sidebar != oldSidebar { sidebarSurface.frame = sidebar }
+        if sidebar.minY != oldSidebar.minY || sidebar.size != oldSidebar.size { sidebarSurface.needsDisplay = true }
+        let rulerFrame = NSRect(x: visible.minX, y: visible.minY, width: visible.width, height: ruler)
+        if rulerSurface.frame != rulerFrame { rulerSurface.frame = rulerFrame; rulerSurface.needsDisplay = true }
     }
-    private func positionMixerControls() {
+    private func positionHeaderControls(updateConfiguration: Bool = true) {
+        let rect = NSRect(x: pinnedHeaderX, y: pinnedRulerRect.minY, width: header, height: ruler)
+        if headerControls?.frame != rect { headerControls?.frame = rect }
+        positionMixerControls(updateConfiguration: updateConfiguration)
+    }
+    private func positionMixerControls(updateConfiguration: Bool) {
         let ids = Set(rows.map { $0.0.id })
         for id in Array(mixerControls.keys) where !ids.contains(id) { mixerControls.removeValue(forKey: id)?.removeFromSuperview() }
         for (row, item) in rows.enumerated() {
@@ -539,18 +683,24 @@ final class Timeline: NSView {
                 .intersection(NSRect(x: pinnedHeaderX, y: pinnedRulerRect.maxY, width: header, height: max(0, visibleRect.maxY - pinnedRulerRect.maxY)))
             control.isHidden = rect.isEmpty || rect.isNull
             guard !control.isHidden else { continue }
-            control.frame = rect
-            let offset = y - rect.minY
-            let first = trackMuteRect(row: row, depth: depth)
-            control.volumeControl.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + 54, width: trackMeterReadoutRect(row: row, channel: 0).maxX - first.minX, height: 22)
-            control.volumeControl.layoutSubtreeIfNeeded()
-            control.pan.frame = NSRect(x: header - 24, y: offset + 4, width: 20, height: rowHeight - 8)
-            let fxRect = trackFXRect(row: row, depth: depth)
-            control.fx.frame = NSRect(x: fxRect.minX - pinnedHeaderX, y: offset + 34, width: fxRect.width, height: fxRect.height)
-            control.configure(track, color: trackColors[row % trackColors.count])
+            let needsLayout = updateConfiguration || control.frame.size != rect.size || control.frame.minY != rect.minY
+            if control.frame != rect { control.frame = rect }
+            if needsLayout {
+                let offset = y - rect.minY
+                let first = trackMuteRect(row: row, depth: depth)
+                control.volumeControl.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + 54, width: trackMeterReadoutRect(row: row, channel: 0).maxX - first.minX, height: 22)
+                control.volumeControl.layoutSubtreeIfNeeded()
+                control.pan.frame = NSRect(x: header - 24, y: offset + 4, width: 20, height: rowHeight - 8)
+                let fxRect = trackFXRect(row: row, depth: depth)
+                control.fx.frame = NSRect(x: fxRect.minX - pinnedHeaderX, y: offset + 34, width: fxRect.width, height: fxRect.height)
+            }
+            if updateConfiguration { control.configure(track, color: trackColors[row % trackColors.count]) }
         }
     }
-    deinit { if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) } }
+    deinit {
+        if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
+        waveformJobs.values.forEach { $0.1.cancel() }; sourceJobs.values.forEach { $0.cancel() }
+    }
     var pinnedRulerRect: NSRect { NSRect(x: 0, y: max(0, visibleRect.minY), width: bounds.width, height: ruler) }
     var pinnedHeaderX: CGFloat { max(0, visibleRect.minX) }
     var fragmentLeft: CGFloat { pinnedHeaderX + header }
@@ -619,16 +769,25 @@ final class Timeline: NSView {
         refresh()
     }
     func refresh() {
+        structureRefreshCount += 1
         rows = orderedRows(trackPreview ?? editor.project.tracks)
         let retained = Set(editor.project.tracks.flatMap(\.clips).map(\.id)).union(fragmentCopyPreviews.values.map(\.id))
         fragmentWaveforms = fragmentWaveforms.filter { retained.contains($0.key) }
+        rasterStyles = rasterStyles.filter { retained.contains($0.key) }
+        let sources = Set(editor.project.tracks.flatMap(\.clips).map(\.source))
+        for key in Array(sourceJobs.keys) where key.rate != editor.audio.sampleRate || !sources.contains(key.path) {
+            sourceJobs.removeValue(forKey: key)?.cancel()
+        }
+        failedSources = failedSources.filter { $0.rate == editor.audio.sampleRate && sources.contains($0.path) }
         for id in Array(waveformJobs.keys) where !retained.contains(id) { waveformJobs.removeValue(forKey: id)?.1.cancel() }
         window?.invalidateCursorRects(for: self)
         let visible = viewportSize
         editor.zoom = max(minimumZoom, editor.zoom)
         let width = editor.zoom <= minimumZoom ? visible.width : max(visible.width, header + timelineDuration * editor.zoom)
         frame.size = NSSize(width: width, height: max(visible.height, ruler + CGFloat(rows.count) * rowHeight + 110))
+        positionPinnedSurfaces()
         positionHeaderControls()
+        sidebarSurface.needsDisplay = true; rulerSurface.needsDisplay = true
         layoutNameField()
         if let window, window.isKeyWindow { updateTrackControlHover(at: convert(window.mouseLocationOutsideOfEventStream, from: nil)) }
         else { updateTrackControlHover(at: nil) }
@@ -643,6 +802,48 @@ final class Timeline: NSView {
                 scroll.reflectScrolledClipView(scroll.contentView)
             }
         }
+        presentPlayhead()
+    }
+    func refreshTransportMeters() {
+        for (track, _) in rows {
+            guard let control = mixerControls[track.id], !control.isHidden else { continue }
+            control.volumeControl.updateMeter(editor.displayedTrackMeter(track), active: editor.isPlaying || editor.isRecording,
+                                              recording: editor.recordingTrack == track.id && editor.isRecording,
+                                              showsPeaks: editor.showsTrackMeter(track.id))
+        }
+    }
+    func invalidateRecordingPreview() {
+        guard editor.isRecording, let row = rows.firstIndex(where: { $0.0.id == editor.recordingTrack }) else { previousRecordingRect = nil; return }
+        let rect = NSRect(x: header + editor.recordingStart * editor.zoom - 2, y: ruler + CGFloat(row) * rowHeight,
+                          width: max(14, (editor.recordingEnd - editor.recordingStart) * editor.zoom + 4), height: rowHeight)
+        let dirty = (previousRecordingRect.map { $0.union(rect) } ?? rect).intersection(visibleRect)
+        if !dirty.isNull, !dirty.isEmpty { setNeedsDisplay(dirty) }
+        previousRecordingRect = rect
+    }
+    private func presentPlayhead() {
+        let x = header + editor.cursor * editor.zoom
+        playheadView.present(x: x, viewport: visibleFragmentRect, color: editor.isRecording ? .systemRed : accent,
+                             visible: x >= fragmentLeft && x <= visibleRect.maxX)
+    }
+    func presentTransportFrame() {
+        presentingTransport = true
+        defer { presentingTransport = false }
+        if editor.isPlaying || editor.isShuttling || editor.isRecording {
+            // Grow in coarse chunks only when recording/shuttle actually reaches the document end.
+            if header + (editor.cursor + 2) * editor.zoom > frame.width {
+                frame.size.width = max(frame.width, header + (editor.cursor + 15) * editor.zoom)
+            }
+            if editor.isRecording {
+                if let scroll = enclosingScrollView {
+                    let visible = scroll.documentVisibleRect, x = header + editor.cursor * editor.zoom
+                    if x > visible.maxX - 40 {
+                        scroll.contentView.scroll(to: NSPoint(x: max(0, x - visible.width + 80), y: visible.minY))
+                        scroll.reflectScrolledClipView(scroll.contentView)
+                    }
+                }
+            } else { centerOnPlayhead() }
+        }
+        presentPlayhead()
     }
     func clipRect(_ clip: Clip, row: Int, layer: Int) -> NSRect {
         NSRect(x: header + clip.start * editor.zoom, y: ruler + CGFloat(row) * rowHeight + 8 + CGFloat(min(layer, 4)) * 2, width: max(2, clip.duration * editor.zoom), height: rowHeight - 16 - CGFloat(min(layer, 4)) * 2)
@@ -928,12 +1129,13 @@ final class Timeline: NSView {
         guard !editor.busy, let index = editor.project.tracks.firstIndex(where: { $0.id == id }) else { return }
         nameField.finish(commit: true)
         renamingTrack = id
+        sidebarSurface.needsDisplay = true
         layoutNameField()
         guard renamingTrack != nil else { return }
         nameField.begin(editor.project.tracks[index].name, commit: { [weak self] name in
             guard let self, let index = self.editor.project.tracks.firstIndex(where: { $0.id == id }), self.editor.project.tracks[index].name != name else { return }
             self.editor.checkpoint(); self.editor.project.tracks[index].name = name; self.editor.update("Track renamed")
-        }, end: { [weak self] in self?.renamingTrack = nil; self?.needsDisplay = true })
+        }, end: { [weak self] in self?.renamingTrack = nil; self?.sidebarSurface.needsDisplay = true })
     }
     private func layoutNameField() {
         guard let id = renamingTrack else { return }
@@ -1021,28 +1223,18 @@ final class Timeline: NSView {
             let track = item.0; let y = ruler + CGFloat(index) * rowHeight
             let trackDimmed = dimmed.contains(track.id)
             if !NSRect(x: 0, y: y, width: bounds.width, height: rowHeight).intersects(dirtyRect) { continue }
-            let color = trackColors[index % trackColors.count]
             line(NSPoint(x: 0, y: y + rowHeight), NSPoint(x: bounds.width, y: y + rowHeight), .white.withAlphaComponent(0.065))
             let clips = displayedClips(for: track)
             for (layer, clip) in clips.enumerated() {
-                let overlaps = clips.prefix(layer).filter { $0.start < clip.end && $0.end > clip.start }.count
-                let rect = clipRect(clip, row: index, layer: overlaps)
-                guard rect.intersects(dirtyRect) else { continue }
-                fill(rect.offsetBy(dx: 0, dy: 3), .black.withAlphaComponent(0.4), radius: 6)
-                fill(rect, color.blended(withFraction: trackDimmed || clip.muted ? 0.92 : 0.78, of: background)!, radius: 6)
-                let outline = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6); outline.lineWidth = editor.selection.contains(clip.id) ? 2 : 1
-                (editor.selection.contains(clip.id) ? color : color.withAlphaComponent(0.45)).setStroke(); outline.stroke()
-                NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
-                if let data = try? editor.audio.load(clip.source) {
-                    if let peaks = processedWaveform(clip, audio: data) {
-                        drawChannelWaveforms(peaks, sampleRate: editor.audio.sampleRate, offset: 0, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(trackDimmed || clip.muted ? 0.25 : 0.9))
-                    } else {
-                        drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, gain: clip.volumeGain, fragment: clip, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(trackDimmed || clip.muted ? 0.25 : 0.9))
-                    }
+                guard clipRect(clip, row: index, layer: 0).insetBy(dx: -4, dy: -4).intersects(dirtyRect) else { continue }
+                // Only the visible fragments need overlap geometry; the display caps it at four levels.
+                var overlaps = 0
+                for prior in clips.prefix(layer) where prior.start < clip.end && prior.end > clip.start {
+                    overlaps += 1; if overlaps == 4 { break }
                 }
-                if editor.selection.contains(clip.id) { drawFragmentFades(clip, in: rect) }
-                drawFragmentTitle(clip.name, in: rect, color: trackDimmed || clip.muted ? .secondaryLabelColor : color)
-                NSGraphicsContext.restoreGraphicsState()
+                let rect = clipRect(clip, row: index, layer: overlaps)
+                guard rect.insetBy(dx: -4, dy: -4).intersects(dirtyRect) else { continue }
+                drawFragmentRaster(clip, in: rect, dirtyRect: dirtyRect, colorIndex: index % trackColors.count, dimmed: trackDimmed)
             }
             if editor.isRecording && editor.recordingTrack == track.id {
                 let rect = NSRect(x: header + editor.recordingStart * editor.zoom, y: y + 8, width: max(10, (editor.recordingEnd - editor.recordingStart) * editor.zoom), height: rowHeight - 16)
@@ -1056,8 +1248,6 @@ final class Timeline: NSView {
         if let range = editor.range {
             fill(NSRect(x: header + range.lowerBound * editor.zoom, y: ruler, width: (range.upperBound - range.lowerBound) * editor.zoom, height: bounds.height - ruler), accent.withAlphaComponent(0.09))
         }
-        let playX = header + editor.cursor * editor.zoom
-        line(NSPoint(x: playX, y: ruler), NSPoint(x: playX, y: bounds.height), editor.isRecording ? .systemRed : accent, width: 1.5)
         if let fragmentSnapTime {
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(rect: visibleFragmentRect.intersection(visibleTrackRect)).addClip()
@@ -1076,8 +1266,80 @@ final class Timeline: NSView {
             let outline = NSBezierPath(rect: rect); outline.lineWidth = 1; outline.stroke()
             NSGraphicsContext.restoreGraphicsState()
         }
-        drawTrackHeaders(in: dirtyRect)
-        drawRuler(in: dirtyRect)
+    }
+    private func paintFragment(_ clip: Clip, in rect: NSRect, dirtyRect: NSRect, color: NSColor, dimmed: Bool,
+                       data: AudioData?, preparedPeaks: [[Float]]?) {
+        fill(rect.offsetBy(dx: 0, dy: 3), .black.withAlphaComponent(0.4), radius: 6)
+        fill(rect, color.blended(withFraction: dimmed || clip.muted ? 0.92 : 0.78, of: background)!, radius: 6)
+        let outline = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6); outline.lineWidth = editor.selection.contains(clip.id) ? 2 : 1
+        (editor.selection.contains(clip.id) ? color : color.withAlphaComponent(0.45)).setStroke(); outline.stroke()
+        NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
+        if let data {
+            if let peaks = preparedPeaks {
+                drawChannelWaveforms(peaks, sampleRate: editor.audio.sampleRate, offset: 0, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(dimmed || clip.muted ? 0.25 : 0.9))
+            } else {
+                drawChannelWaveforms(data.channelPeaks, sampleRate: editor.audio.sampleRate, offset: clip.offset, gain: clip.volumeGain, fragment: clip, in: rect, dirtyRect: dirtyRect, color: color.withAlphaComponent(dimmed || clip.muted ? 0.25 : 0.9))
+            }
+        }
+        if editor.selection.contains(clip.id) { drawFragmentFades(clip, in: rect) }
+        drawFragmentTitle(clip.name, in: rect, color: dimmed || clip.muted ? .secondaryLabelColor : color)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    private func drawFragmentRaster(_ clip: Clip, in rect: NSRect, dirtyRect: NSRect, colorIndex: Int, dimmed: Bool) {
+        let data = preparedAudio(for: clip)
+        let peaks = data.flatMap { processedWaveform(clip, audio: $0) }
+        let color = trackColors[colorIndex]
+        guard usesFragmentRasterCache else {
+            paintFragment(clip, in: rect, dirtyRect: dirtyRect, color: color, dimmed: dimmed, data: data, preparedPeaks: peaks)
+            return
+        }
+        let scale = window?.backingScaleFactor ?? 2
+        let style = RasterStyle(waveform: FragmentWaveformKey(clip, rate: editor.audio.sampleRate, channels: editor.project.audioFormat.channels),
+                                name: clip.name, zoom: editor.zoom, height: rect.height, scale: scale, colorIndex: colorIndex,
+                                selected: editor.selection.contains(clip.id), dimmed: dimmed, muted: clip.muted, processed: peaks != nil, hasAudio: data != nil)
+        if rasterStyles[clip.id]?.0 != style { rasterStyles[clip.id] = (style, UUID()) }
+        let generation = rasterStyles[clip.id]!.1
+        // Tiles have stable fragment-local coordinates, so scrolling and moving reuse pixels.
+        // Limit allocation to visible tiles, never the full width of a long recording.
+        let extent = rect.insetBy(dx: -4, dy: -4)
+        let visible = extent.intersection(dirtyRect)
+        guard !visible.isEmpty else { return }
+        let tileWidth: CGFloat = 512
+        let first = max(0, Int(floor((visible.minX - extent.minX) / tileWidth)))
+        let last = max(first, Int(floor((visible.maxX - extent.minX) / tileWidth)))
+        for tile in first...last {
+            let localX = CGFloat(tile) * tileWidth
+            let width = min(tileWidth, extent.width - localX)
+            guard width > 0 else { continue }
+            let key = "\(generation):\(tile)" as NSString
+            let image: NSImage
+            if let cached = fragmentRasters.object(forKey: key) {
+                image = cached; rasterHitCount += 1
+            } else {
+                let pixelsWide = max(1, Int(ceil(width * scale))), pixelsHigh = max(1, Int(ceil(extent.height * scale)))
+                guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixelsWide, pixelsHigh: pixelsHigh,
+                                                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                      let graphics = NSGraphicsContext(bitmapImageRep: bitmap) else { continue }
+                bitmap.size = NSSize(width: width, height: extent.height)
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current = graphics
+                let context = graphics.cgContext
+                context.translateBy(x: 0, y: CGFloat(pixelsHigh))
+                context.scaleBy(x: scale, y: -scale)
+                NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+                let tileRect = NSRect(x: 0, y: 0, width: width, height: extent.height)
+                NSBezierPath(rect: tileRect).addClip()
+                let localRect = NSRect(x: 4 - localX, y: 4, width: rect.width, height: rect.height)
+                paintFragment(clip, in: localRect, dirtyRect: tileRect, color: color, dimmed: dimmed, data: data, preparedPeaks: peaks)
+                NSGraphicsContext.restoreGraphicsState()
+                image = NSImage(size: bitmap.size); image.addRepresentation(bitmap)
+                fragmentRasters.setObject(image, forKey: key, cost: pixelsWide * pixelsHigh * 4)
+                rasterBuildCount += 1
+            }
+            image.draw(in: NSRect(x: extent.minX + localX, y: extent.minY, width: width, height: extent.height),
+                       from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.none])
+        }
     }
     private func drawTrackHeaders(in dirtyRect: NSRect) {
         let dimmed = dimmedTrackIDs()
@@ -1141,9 +1403,6 @@ final class Timeline: NSView {
                 fill(NSRect(x: x - 3, y: top + ruler / 2 - 6, width: 6, height: 12), accent, radius: 2)
             }
         }
-        let playX = header + editor.cursor * editor.zoom
-        line(NSPoint(x: playX, y: top), NSPoint(x: playX, y: rect.maxY), editor.isRecording ? .systemRed : accent, width: 1.5)
-        fill(NSRect(x: playX - 4, y: top, width: 8, height: 8), editor.isRecording ? .systemRed : accent, radius: 2)
         if let start = editor.lastPlaybackStart {
             let x = header + start * editor.zoom
             line(NSPoint(x: x, y: rect.maxY - 15), NSPoint(x: x, y: rect.maxY), .systemOrange, width: 2)
@@ -1447,6 +1706,7 @@ final class Timeline: NSView {
         let x = header + editor.cursor * editor.zoom
         var origin = x - header - (width - header) / 2
         origin = min(max(0, frame.width - width), max(0, origin))
+        guard abs(scroll.contentView.bounds.minX - origin) > 0.001 else { return }
         scroll.contentView.scroll(to: NSPoint(x: origin, y: scroll.contentView.bounds.minY))
         scroll.reflectScrolledClipView(scroll.contentView)
     }
