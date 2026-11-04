@@ -144,6 +144,14 @@ final class TrackVolumeMeterCell: NSSliderCell {
     }
 }
 
+/// The pan thumb mirrors the volume thumb's 8×14 pt proportions, rotated.
+/// Native geometry still supplies tracking, animation and accessibility.
+final class TrackPanSliderCell: NSSliderCell {
+    override func drawKnob(_ knobRect: NSRect) {
+        super.drawKnob(NSRect(x: knobRect.midX - 7, y: knobRect.midY - 4, width: 14, height: 8))
+    }
+}
+
 final class TrackMixerSlider: NSSlider {
     private(set) var trackingGesture = false
     var checkpointed = false
@@ -377,6 +385,8 @@ final class TrackMixerControls: NSView {
         super.init(frame: .zero)
         wantsLayer = true; layer?.masksToBounds = true
         addSubview(volumeControl); addSubview(pan); addSubview(fx)
+        let panCell = TrackPanSliderCell(); panCell.minValue = -90; panCell.maxValue = 90; panCell.doubleValue = 0
+        pan.cell = panCell
         pan.controlSize = .mini; pan.isContinuous = true; pan.target = self; pan.trackFillColor = accent
         volume.target = self
         volume.action = #selector(changeVolume); pan.action = #selector(changePan)

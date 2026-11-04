@@ -65,12 +65,12 @@ func runLiveRecordingTests() throws {
     try session.start(); editor.activateRecording(session)
     session.writer.append(captureTestBuffer(format: mono, start: 0, frames: 22_050)); session.writer.waitForPendingWrites()
     editor.updateRecordingWaveform()
-    try check(editor.isRecording && !editor.recordingPeaks.isEmpty && editor.cursor > 1.25 && editor.project.tracks[0].clips.isEmpty, "Editor displays live waveform and sample-accurate playhead while take is still recording")
+    try check(editor.isRecording && editor.recordingChannelPeaks.count == 1 && !editor.recordingPeaks.isEmpty && editor.cursor > 1.25 && editor.project.tracks[0].clips.isEmpty, "Editor displays live waveform and sample-accurate playhead while take is still recording")
     editor.stop()
     let clips = editor.project.tracks[0].clips
     try check(!editor.isRecording && editor.recordingPeaks.isEmpty && clips.count == 1 && abs(clips[0].start - 1.25) < 0.000001 && abs(clips[0].duration - 0.5) < 0.000001, "Stop replaces the live preview with one independent saved fragment")
     let recorded = try store.load(clips[0].source)
-    try check(recorded.channels.count == 2 && recorded.channels[0] == recorded.channels[1], "Mono input records to the project's Stereo format without losing either channel")
+    try check(recorded.channels.count == 1 && session.format.channels == 1 && editor.project.audioFormat.channels == 2, "Mono input saves a mono take while the project remains Stereo")
     try check(clips[0].name == "Audio 01 1", "First take uses the track name and its own take number")
     func recordTake() throws {
         let session = try LiveRecorder(url: store.freshURL(), format: editor.project.audioFormat, inputFormat: mono)

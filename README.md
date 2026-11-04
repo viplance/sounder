@@ -25,7 +25,7 @@ A native audio recorder and editor for macOS 14+ (Apple Silicon), built with App
 
 ## Audio input and output
 
-Click **In | Out** immediately before Export. The Default row selects the project input and the mixed output independently. Each device offers automatic routing, individual physical channels and stereo pairs. Tracks reuse the same input picker and inherit **Default input** unless overridden. Device UIDs and channel selections are saved in the project and support Undo. Disconnected selections remain visible; starting with an unavailable selected device reports an error instead of switching to another microphone. Routing controls are disabled during playback, recording and other busy operations. Input is converted directly to the project format with maximum-quality Mastering resampling; hardware output routing does not change exported files.
+Click **In | Out** immediately before Export. The Default row selects the project input and the mixed output independently. Each device offers automatic routing, individual physical channels and stereo pairs. Tracks reuse the same input picker and inherit **Default input** unless overridden. Device UIDs and channel selections are saved in the project and support Undo. Disconnected selections remain visible; starting with an unavailable selected device reports an error instead of switching to another microphone. Routing controls are disabled during playback, recording and other busy operations. Mono inputs save true mono takes, including loop recordings, even in Stereo projects. Mono is expanded only during mixing. Capture retains the project sample rate and bit depth with maximum-quality Mastering resampling; hardware output routing does not change exported files.
 
 ## Audio model
 

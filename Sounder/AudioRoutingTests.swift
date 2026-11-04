@@ -35,17 +35,26 @@ func runAudioRoutingTests() throws {
     }
     for selection in [[2, 3], [3]] {
         for rate in [48_000.0, 44_100.0] {
-            let url = store.freshURL(), format = ProjectAudioFormat(sampleRate: rate, channels: 2, bitDepth: 32)
-            let writer = try RecordingWriter(url: url, format: format, inputFormat: input, inputChannels: selection)
-            writer.append(buffer)
-            if let failure = writer.finish() { throw failure }
-            store.configure(format)
-            let signal = try store.load(url.path)
-            try check(abs(signal.frameCount - Int(rate)) <= 1, "Selected-channel capture preserves duration at \(rate) Hz")
-            for channel in 0..<2 {
-                let physical = selection[min(channel, selection.count - 1)]
-                let rms = sqrt(signal.channels[channel].dropFirst(512).dropLast(512).reduce(0.0) { $0 + Double($1 * $1) } / Double(signal.frameCount - 1024))
-                try check(abs(rms - Double(physical + 1) * 0.1 / sqrt(2)) < 0.001, "Capture routes physical input \(physical + 1) to project channel \(channel + 1) without adjacent input leakage")
+            for depth in [16, 24, 32] {
+                for loop in [false, true] {
+                    let url = store.freshURL(), format = ProjectAudioFormat(sampleRate: rate, channels: 2, bitDepth: depth)
+                    let session = try LiveRecorder(url: url, format: format, inputFormat: input, input: AudioEndpoint(channels: selection))
+                    if loop { try session.configureLoop(0..<1, start: 0) }
+                    try session.start(); session.writer.append(buffer); session.writer.waitForPendingWrites()
+                    let preview = session.writer.consumeUpdate()
+                    try check(session.format.channels == selection.count && preview.channelPeaks.count == selection.count, "Capture and live waveform preserve the selected mono/stereo input")
+                    if loop { try check(!FileManager.default.fileExists(atPath: url.path), "Mono/stereo loop capture remains in RAM until Stop") }
+                    if let failure = session.stop() { throw failure }
+                    store.configure(format)
+                    let signal = try store.load(url.path), file = try AVAudioFile(forReading: url)
+                    try check(abs(signal.frameCount - Int(rate)) <= 1 && signal.channels.count == selection.count && Int(file.fileFormat.channelCount) == selection.count && file.fileFormat.streamDescription.pointee.mBitsPerChannel == depth,
+                              "\(loop ? "Loop" : "Ordinary") capture saves true \(selection.count)-channel \(depth)-bit PCM at \(rate) Hz")
+                    for channel in signal.channels.indices {
+                        let physical = selection[channel]
+                        let rms = sqrt(signal.channels[channel].dropFirst(512).dropLast(512).reduce(0.0) { $0 + Double($1 * $1) } / Double(signal.frameCount - 1024))
+                        try check(abs(rms - Double(physical + 1) * 0.1 / sqrt(2)) < 0.001, "Capture routes physical input \(physical + 1) to file channel \(channel + 1) without adjacent input leakage")
+                    }
+                }
             }
         }
     }
@@ -79,7 +88,7 @@ func runAudioRoutingTests() throws {
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         if let failure = recorder.stop() { throw failure }
         let file = try AVAudioFile(forReading: recorder.url)
-        try check(file.length > 0, "Native capture starts with independent explicit input/output device selections")
+        try check(file.length > 0 && file.fileFormat.channelCount == 1, "Native mono capture saves one channel with independent input/output devices")
     } else { print("SKIP: native routed capture requires existing microphone permission and input/output hardware") }
 }
 
