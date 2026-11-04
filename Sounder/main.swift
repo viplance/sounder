@@ -404,6 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var playButton: NSButton!
     var recordButton: NSButton!
     var loopButton: NSButton!
+    var audioRoutingWindow: AudioRoutingWindow?
     var exportButton: NSButton!
     var editButtons: [NSButton] = []
     var fragmentMuteButton: NSButton!
@@ -413,7 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var masterGroup: NSStackView!
     private var titlebarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     private(set) var projectFileButtons: [String: NSButton] = [:]
-    private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("files"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("quality"), NSToolbarItem.Identifier("export")]
+    private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("files"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("quality"), NSToolbarItem.Identifier("io"), NSToolbarItem.Identifier("export")]
     var closingConfirmed = false
     var dialogAutomation: ((NSAlert) -> Void)?
     var fragmentDialogAutomation: ((FragmentSettingsDialog) -> Void)?
@@ -445,7 +446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var projectAuxiliaryWindows: [NSWindow] {
         Array(editor.effectsWindows.values).compactMap { $0.window } +
         Array(editor.pluginWindows.values).compactMap { $0.window } +
-        [editor.importer?.window].compactMap { $0 }
+        [editor.importer?.window, audioRoutingWindow?.window].compactMap { $0 }
     }
     func windowWillMiniaturize(_ notification: Notification) {
         guard notification.object as? NSWindow === window else { return }
@@ -585,6 +586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let export = PointerButton(title: "Export", target: self, action: #selector(exportAudio)); export.bezelStyle = .rounded
         export.widthAnchor.constraint(equalToConstant: export.intrinsicContentSize.width + 16).isActive = true
         exportButton = export
+        let io = PointerButton(title: "In | Out", target: self, action: #selector(showAudioRouting)); io.bezelStyle = .rounded
         masterVolumeControl.widthAnchor.constraint(equalToConstant: 200).isActive = true
         masterVolumeControl.heightAnchor.constraint(equalToConstant: 26).isActive = true
         masterVolumeControl.slider.target = self; masterVolumeControl.slider.action = #selector(changeMasterVolume(_:))
@@ -610,6 +612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             ("files", "Project files", files),
             ("master", "Master", masterGroup),
             ("quality", "Project audio settings", qualityButton),
+            ("io", "Audio inputs and output", io),
             ("export", "Export", export)
         ]
         for (id, label, view) in controls {
@@ -618,7 +621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             item.label = label; item.toolTip = label; item.view = view
             // Custom toolbar views still receive the system glass bezel unless explicitly opted out.
             if ["project", "files", "master", "masterFX"].contains(id) { item.isBordered = false }
-            if ["files", "export", "quality", "master", "masterFX"].contains(id) { item.autovalidates = false }
+            if ["files", "export", "io", "quality", "master", "masterFX"].contains(id) { item.autovalidates = false }
             item.visibilityPriority = .high
             titlebarItems[identifier] = item
         }
@@ -660,6 +663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--graphics-ui-test") { try verifyGraphicsUI() }
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
             if CommandLine.arguments.contains("--button-hover-ui-test") { try verifyButtonHoverUI() }
+            if CommandLine.arguments.contains("--audio-routing-ui-test") { try verifyAudioRoutingUI() }
             if CommandLine.arguments.contains("--project-file-controls-ui-test") { try verifyProjectFileControlsUI() }
             if CommandLine.arguments.contains("--fragments-system-menu-ui-test") { try verifyFragmentsSystemMenuUI() }
             if CommandLine.arguments.contains("--fragment-fades-ui-test") { try verifyFragmentFadesUI() }
@@ -974,6 +978,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func editTempo() {
         if let bpm = TempoDialog(bpm: editor.project.tempo).runModal() { editor.setTempo(bpm) }
     }
+    @objc func showAudioRouting() {
+        if let audioRoutingWindow { audioRoutingWindow.show(); return }
+        let panel = AudioRoutingWindow(editor: editor)
+        audioRoutingWindow = panel
+        panel.closed = { [weak self] in self?.audioRoutingWindow = nil }
+        panel.show()
+    }
     @objc func audioSettings() {
         guard !editor.busy else { return }
         let alert = CompactSettingsAlert(); alert.messageText = "Audio settings"
@@ -1010,6 +1021,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let height { view.heightAnchor.constraint(equalToConstant: height).isActive = true }
     }
     func refresh() {
+        audioRoutingWindow?.refresh()
         fullRefreshCount += 1
         timeline.refresh()
         let muted = editor.fragmentsAreMuted(editor.selection)
@@ -1075,6 +1087,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if editor.isRecording { editor.stop() }
         closingConfirmed = editor.confirmDiscard()
         if closingConfirmed {
+            if let panel = audioRoutingWindow { _ = panel.windowShouldClose(panel.window) }
             editor.stop(); editor.closePluginWindows(capture: false)
             for panel in Array(editor.effectsWindows.values) { panel.done() }
         }

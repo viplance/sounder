@@ -43,7 +43,7 @@ final class Editor: NSObject {
     }
     var isShuttling: Bool { shuttleGesture != nil }
     private(set) var trackMeters: [UUID: StereoTrackLevelMeter] = [:]
-    private let makeRecorder: (URL, ProjectAudioFormat) throws -> LiveRecorder
+    private let makeRecorder: ((URL, ProjectAudioFormat) throws -> LiveRecorder)?
     private let makePlayback: (StreamingGraph, ProjectAudioFormat, Double) throws -> LivePlayback
     var pluginHosts: [UUID: SNPluginHost] = [:]
     var pluginWindows: [UUID: PluginEditorWindow] = [:]
@@ -75,7 +75,7 @@ final class Editor: NSObject {
     var suggestedFilename: String { projectName.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-") + ".sounder" }
     var selectedIndex: Int? { project.tracks.firstIndex { $0.id == selectedTrack } }
     init(store: AudioStore, notifications: ToastCenter = ToastCenter(),
-         makeRecorder: @escaping (URL, ProjectAudioFormat) throws -> LiveRecorder = { try LiveRecorder(url: $0, format: $1) },
+         makeRecorder: ((URL, ProjectAudioFormat) throws -> LiveRecorder)? = nil,
          makePlayback: @escaping (StreamingGraph, ProjectAudioFormat, Double) throws -> LivePlayback = { LivePlayback(graph: $0, format: $1, start: $2) }) {
         audio = store; self.notifications = notifications; self.makeRecorder = makeRecorder; self.makePlayback = makePlayback
         super.init()
@@ -88,6 +88,26 @@ final class Editor: NSObject {
     }
     func hint(_ key: UXHint, _ text: String) { notifications.hint(key, text) }
     func error(_ error: Error) { notifications.show(error.localizedDescription, style: .error); changed?() }
+    func setAudioInput(_ input: AudioEndpoint?, trackID: UUID? = nil) {
+        guard !busy else { return }
+        do {
+            try input?.validate()
+            if let trackID {
+                guard let index = project.tracks.firstIndex(where: { $0.id == trackID }), project.tracks[index].input != input else { return }
+                checkpoint(); project.tracks[index].input = input
+            } else {
+                let route = input ?? AudioEndpoint()
+                guard project.defaultInput != route else { return }
+                checkpoint(); project.defaultInput = route
+            }
+            update()
+        } catch { self.error(error) }
+    }
+    func setAudioOutput(_ output: AudioEndpoint) {
+        guard !busy, project.defaultOutput != output else { return }
+        do { try output.validate(); checkpoint(); project.defaultOutput = output; update() }
+        catch { self.error(error) }
+    }
     func checkpoint() { invalidateMixCache(); undoStack.append(project); if undoStack.count > 50 { undoStack.removeFirst() }; redoStack = []; dirty = true }
     func undo() { guard !busy else { return }; flushPluginEdits(); guard let previous = undoStack.popLast() else { return }; redoStack.append(project); project = previous; dirty = true; reconcile(); update("Undo") }
     func redo() { guard !busy else { return }; flushPluginEdits(); guard let next = redoStack.popLast() else { return }; undoStack.append(project); project = next; dirty = true; reconcile(); update("Redo") }
@@ -379,7 +399,8 @@ final class Editor: NSObject {
             if let player { try player.prepareForRecording() }
             else { startPlayback(forRecording: true) }
             guard let player else { throw SounderError.message("Cannot start recording playback") }
-            let recorder = try makeRecorder(url, project.audioFormat)
+            let input = project.tracks.first(where: { $0.id == selectedTrack })?.input ?? project.defaultInput
+            let recorder = try makeRecorder?(url, project.audioFormat) ?? LiveRecorder(url: url, format: project.audioFormat, input: input)
             let origin = position ?? (wasPlaying ? player.currentTime : player.start)
             if let loopRange { try recorder.configureLoop(loopRange, start: origin) }
             recorder.metronome.configure(bpm: project.tempo, enabled: false, start: origin)
@@ -739,6 +760,7 @@ final class Editor: NSObject {
                 cursor = player.currentTime
             } else {
                 let playback = ShuttlePlayback(source: source, start: cursor, direction: direction)
+                try playback.configureOutput(project.defaultOutput)
                 shuttle = playback
                 playback.finished = { [weak self, weak playback] failure in
                     guard let self, let playback, self.shuttle === playback else { return }
@@ -813,6 +835,7 @@ final class Editor: NSObject {
             guard forRecording || loopRange.map({ start <= $0.upperBound }) == true || start < Double(graph.totalFrames) / audio.sampleRate else { update(); return }
             cursor = start
             let playback = try makePlayback(graph, project.audioFormat, start)
+            try playback.configureOutput(project.defaultOutput)
             playback.finished = { [weak self, weak playback] failure in
                 guard let self, let playback, self.player === playback else { return }
                 if self.isRecording {

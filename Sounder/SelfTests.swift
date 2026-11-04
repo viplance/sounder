@@ -207,6 +207,7 @@ func runAudioTests() throws {
     }
     try runRecordedMediaMoveTests()
     try runProjectStorageTests()
+    try runAudioRoutingTests()
     try runTrackMeterTests()
     try runStreamingGraphTests()
     try runShuttleAudioTests()

@@ -155,6 +155,7 @@ struct Track: Codable, Identifiable {
     var solo = false
     var clips: [Clip] = []
     var effects: [PluginEffect] = []
+    var input: AudioEndpoint? = nil
     var nextTakeNumber = 1
     var volumeDB = 0.0
     var pan = 0.0
@@ -235,11 +236,13 @@ enum TrackHierarchy {
 }
 // Keep projects saved before effects and per-track take numbering readable.
 extension Track {
-    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, clips, effects, nextTakeNumber, volumeDB, pan }
+    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, clips, effects, nextTakeNumber, volumeDB, pan, input }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
+        input = try values.decodeIfPresent(AudioEndpoint.self, forKey: .input)
+        try input?.validate()
         parent = try values.decodeIfPresent(UUID.self, forKey: .parent)
         muted = try values.decodeIfPresent(Bool.self, forKey: .muted) ?? false
         solo = try values.decodeIfPresent(Bool.self, forKey: .solo) ?? false
@@ -309,6 +312,8 @@ struct Project: Codable {
     var tempoMode = false
     var metronomeEnabled = false
     var loopEnabled = false
+    var defaultInput = AudioEndpoint()
+    var defaultOutput = AudioEndpoint()
     var normalizationLevel = -1.0
     var defaultExportSettings: ExportSettings {
         if exportSettingsConfirmed, let exportSettings { return exportSettings }
@@ -316,7 +321,7 @@ struct Project: Codable {
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel }
+    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel, defaultInput, defaultOutput }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
@@ -337,6 +342,9 @@ extension Project {
         tempoMode = try values.decodeIfPresent(Bool.self, forKey: .tempoMode) ?? false
         metronomeEnabled = try values.decodeIfPresent(Bool.self, forKey: .metronomeEnabled) ?? false
         loopEnabled = try values.decodeIfPresent(Bool.self, forKey: .loopEnabled) ?? false
+        defaultInput = try values.decodeIfPresent(AudioEndpoint.self, forKey: .defaultInput) ?? AudioEndpoint()
+        defaultOutput = try values.decodeIfPresent(AudioEndpoint.self, forKey: .defaultOutput) ?? AudioEndpoint()
+        try defaultInput.validate(); try defaultOutput.validate()
         normalizationLevel = try values.decodeIfPresent(Double.self, forKey: .normalizationLevel) ?? -1
         try FragmentNormalization.validate(normalizationLevel)
         guard tempo.isFinite && (20...300).contains(tempo) else { throw SounderError.message("Tempo must be between 20 and 300 BPM") }

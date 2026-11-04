@@ -138,6 +138,8 @@ final class RecordingWriter {
     private let gate = NSLock()
     private let publication = NSLock()
     private var accepting = true
+    private let captureFormat: AVAudioFormat
+    private let inputChannels: [Int]
     private let sourceFormat: AVAudioFormat
     private let converter: AVAudioConverter
     private let pull: AVAudioPCMBuffer
@@ -160,20 +162,24 @@ final class RecordingWriter {
     private var publishedFrames = 0
     private var publishedFailure: Error?
 
-    init(url: URL, format: ProjectAudioFormat, inputFormat: AVAudioFormat) throws {
+    init(url: URL, format: ProjectAudioFormat, inputFormat: AVAudioFormat, inputChannels: [Int]? = nil) throws {
         try format.validate()
         self.url = url; projectFormat = format
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
               inputFormat.commonFormat == .pcmFormatFloat32, !inputFormat.isInterleaved else {
             throw SounderError.message("The audio input has no supported PCM format. Check the input device in System Settings → Sound.")
         }
-        sourceFormat = inputFormat
+        let selected = inputChannels ?? Array(0..<min(2, Int(inputFormat.channelCount)))
+        guard !selected.isEmpty, selected.count <= 2, Set(selected).count == selected.count,
+              selected.allSatisfy({ $0 >= 0 && $0 < Int(inputFormat.channelCount) }) else { throw SounderError.message("Invalid recording channels") }
+        captureFormat = inputFormat; self.inputChannels = selected
+        sourceFormat = AVAudioFormat(standardFormatWithSampleRate: inputFormat.sampleRate, channels: AVAudioChannelCount(selected.count))!
         partialPeaks = Array(repeating: 0, count: format.channels)
         pendingPeaks = Array(repeating: [], count: format.channels)
         publishedPartial = Array(repeating: nil, count: format.channels)
         let target = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
-        guard let converter = AVAudioConverter(from: inputFormat, to: target),
-              let pull = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 4096),
+        guard let converter = AVAudioConverter(from: sourceFormat, to: target),
+              let pull = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: 4096),
               let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: 4096) else {
             throw SounderError.message("Cannot configure recording conversion")
         }
@@ -181,8 +187,8 @@ final class RecordingWriter {
         converter.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Mastering
         converter.sampleRateConverterQuality = AVAudioQuality.max.rawValue
         converter.primeMethod = .normal
-        if inputFormat.channelCount == 1 && format.channels == 2 { converter.channelMap = [0, 0] }
-        else if inputFormat.channelCount > format.channels { converter.downmix = true }
+        if sourceFormat.channelCount == 1 && format.channels == 2 { converter.channelMap = [0, 0] }
+        else if sourceFormat.channelCount > format.channels { converter.downmix = true }
         // Open ordinary capture lazily on its first output buffer. Loop capture
         // does not create any audio file until its final Stop.
     }
@@ -204,14 +210,14 @@ final class RecordingWriter {
     func append(_ buffer: AVAudioPCMBuffer) {
         guard buffer.frameLength > 0 else { return }
         // Audio taps may reuse their buffers after the callback returns.
-        guard buffer.format == sourceFormat, let source = buffer.floatChannelData,
+        guard buffer.format == captureFormat, let source = buffer.floatChannelData,
               let copy = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: buffer.frameLength),
               let destination = copy.floatChannelData else {
             enqueueFailure(SounderError.message("Audio input format changed during recording")); return
         }
         copy.frameLength = buffer.frameLength
         for channel in 0..<Int(sourceFormat.channelCount) {
-            destination[channel].update(from: source[channel], count: Int(buffer.frameLength))
+            destination[channel].update(from: source[inputChannels[channel]], count: Int(buffer.frameLength))
         }
         // Enqueue under the same gate used by finish, so Stop cannot overtake an
         // accepted buffer, including when a tap callback is already in flight.
@@ -223,6 +229,7 @@ final class RecordingWriter {
             catch { fail(error) }
         }
     }
+    func inputFailed(_ status: OSStatus) { enqueueFailure(SounderError.message("Audio input failed (audio error \(status)).")) }
     private func enqueueFailure(_ error: Error) {
         gate.lock(); defer { gate.unlock() }
         guard accepting else { return }
@@ -333,41 +340,36 @@ final class LiveRecorder {
     let format: ProjectAudioFormat
     let writer: RecordingWriter
     let metronome: MetronomeVoice
-    private var engine: AVAudioEngine?
+    private var capture: HardwareAudioCapture?
     private var stopped = false
     private var started = false
     private var lastFailure: Error?
     /// Supplying an input format creates a stream-only session for automated
     /// tests; microphone sessions always take the actual device's PCM format.
-    init(url: URL, format: ProjectAudioFormat, inputFormat: AVAudioFormat? = nil) throws {
+    init(url: URL, format: ProjectAudioFormat, inputFormat: AVAudioFormat? = nil, input: AudioEndpoint = AudioEndpoint()) throws {
         self.url = url; self.format = format
         metronome = MetronomeVoice(sampleRate: format.sampleRate)
         if let inputFormat { writer = try RecordingWriter(url: url, format: format, inputFormat: inputFormat) }
         else {
-            let engine = AVAudioEngine()
-            writer = try RecordingWriter(url: url, format: format, inputFormat: engine.inputNode.outputFormat(forBus: 0))
-            let outputFormat = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
-            let source = metronome.source(format: outputFormat)
-            engine.attach(source); engine.connect(source, to: engine.mainMixerNode, format: outputFormat)
-            self.engine = engine
+            let capture = try HardwareAudioCapture(input: input)
+            writer = try RecordingWriter(url: url, format: format, inputFormat: capture.format, inputChannels: input.channels)
+            capture.received = { [writer] in writer.append($0) }
+            capture.failed = { [writer] in writer.inputFailed($0) }
+            self.capture = capture
         }
     }
     func start() throws {
         guard !started, !stopped else { return }
-        if let engine {
-            let input = engine.inputNode
-            input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buffer, _ in self?.writer.append(buffer) }
-            started = true
-            do { engine.prepare(); try engine.start() }
-            catch { _ = stop(save: false); throw error }
-        } else { started = true }
+        started = true
+        do { try capture?.start() }
+        catch { _ = stop(save: false); throw error }
     }
     func configureLoop(_ range: Range<Double>, start: Double) throws { try writer.configureLoop(range, start: start) }
     @discardableResult func stop(save: Bool = true) -> Error? {
         guard !stopped else { return lastFailure }
         stopped = true
-        if let engine, started { engine.inputNode.removeTap(onBus: 0); engine.stop() }
-        lastFailure = writer.finish(save: save); engine = nil
+        capture?.stop()
+        lastFailure = writer.finish(save: save); capture = nil
         return lastFailure
     }
     deinit { _ = stop(save: started) }

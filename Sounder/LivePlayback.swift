@@ -309,6 +309,7 @@ final class StreamingGraph {
 /// Device presentation callbacks are reserved for the final buffer: they arrive
 /// too late to drive a continuous stream on outputs with presentation latency.
 final class LivePlayback {
+    func configureOutput(_ endpoint: AudioEndpoint) throws { try AudioDevices.configureOutput(endpoint, engine: engine, projectChannels: format.channels) }
     let engine = AVAudioEngine()
     let node = AVAudioPlayerNode()
     private(set) var graph: StreamingGraph
@@ -1032,6 +1033,7 @@ final class DryShuttleSource {
 }
 
 final class ShuttlePlayback {
+    func configureOutput(_ endpoint: AudioEndpoint) throws { try AudioDevices.configureOutput(endpoint, engine: engine, projectChannels: format.channels) }
     let engine = AVAudioEngine()
     let node = AVAudioPlayerNode()
     let queue = DispatchQueue(label: "Sounder.shuttle", qos: .userInteractive)
