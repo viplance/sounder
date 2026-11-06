@@ -350,6 +350,21 @@ struct Engine {
     for (int i = 0; i < count; ++i) for (int ch = 0; ch < channels; ++ch) result[i * channels + ch] = std::isfinite(output[ch][i]) ? output[ch][i] : 0;
     return [NSData dataWithBytes:result.data() length:result.size() * sizeof(float)];
 }
+- (NSDictionary<NSString *, id> *)editorSnapshotSinceRevision:(uint64_t)revision parameterValues:(NSArray<NSNumber *> *)values {
+    std::unique_lock<std::recursive_mutex> lock(_engine->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return nil;
+    NSMutableArray<NSNumber *> *current = [NSMutableArray array];
+    for (NSDictionary *parameter in self.parameters) [current addObject:parameter[@"value"]];
+    uint64_t edited = self.editRevision;
+    NSMutableDictionary *snapshot = [@{@"values": current, @"revision": @(edited), @"latency": @(self.latency)} mutableCopy];
+    if (edited != revision || ![values isEqualToArray:current]) {
+        NSError *error = nil;
+        NSData *state = [self saveState:&error];
+        if (state) snapshot[@"state"] = state;
+        else if (error) snapshot[@"error"] = error.localizedDescription;
+    }
+    return snapshot;
+}
 - (NSArray<NSDictionary<NSString *, id> *> *)parameters {
     std::lock_guard<std::recursive_mutex> lock(_engine->mutex);
     NSMutableArray *params = [NSMutableArray array];

@@ -15,6 +15,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable NSData *)processMono:(NSData *)audio error:(NSError **)error;
 - (nullable NSData *)saveState:(NSError **)error;
 - (NSArray<NSDictionary<NSString *, id> *> *)parameters;
+// UI polling must never wait on a slow processBlock/setupProcessing call.
+- (nullable NSDictionary<NSString *, id> *)editorSnapshotSinceRevision:(uint64_t)revision parameterValues:(NSArray<NSNumber *> *)values NS_SWIFT_NAME(editorSnapshot(revision:values:));
 - (void)setParameter:(NSInteger)index value:(double)value;
 - (double)parameterValue:(NSInteger)index;
 - (BOOL)attachEditor:(NSView *)parent;

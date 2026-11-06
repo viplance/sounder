@@ -91,20 +91,19 @@ final class PluginEditorWindow: NSObject, NSWindowDelegate {
     }
     func parameterValues() -> [Double] { host.parameters().map { ($0["value"] as? NSNumber)?.doubleValue ?? 0 } }
     func captureChanges() {
-        let parameters = parameterValues(), revision = host.editRevision
-        if host.latency != lastLatency { lastLatency = host.latency; editor.effectsChanged() }
-        guard parameters != lastParameters || revision != lastRevision else { return }
+        guard let snapshot = host.editorSnapshot(revision: lastRevision, values: lastParameters.map { NSNumber(value: $0) }) else { return }
+        if let message = snapshot["error"] as? String { editor.error(SounderError.message(message)); return }
+        let parameters = (snapshot["values"] as? [NSNumber] ?? []).map(\.doubleValue)
+        let revision = (snapshot["revision"] as? NSNumber)?.uint64Value ?? lastRevision
+        let latency = (snapshot["latency"] as? NSNumber)?.intValue ?? lastLatency
+        if latency != lastLatency { lastLatency = latency; editor.effectsChanged() }
+        defer { lastParameters = parameters; lastRevision = revision }
+        guard let state = snapshot["state"] as? Data,
+              let effect = editor.project.allEffects.first(where: { $0.id == effectID }), state != effect.state else { return }
         editor.invalidateMixCache()
-        guard let effect = editor.project.allEffects.first(where: { $0.id == effectID }) else { return }
-        do {
-            let state = try host.saveState()
-            if state != effect.state {
-                if !editor.dirty || Date().timeIntervalSince(lastChange) > 0.5 { editor.checkpoint() }
-                editor.setEffectState(state, effectID: effectID)
-                lastChange = Date(); editor.update()
-            }
-            lastParameters = parameters; lastRevision = revision
-        } catch { editor.error(error) }
+        if !editor.dirty || Date().timeIntervalSince(lastChange) > 0.5 { editor.checkpoint() }
+        editor.setEffectState(state, effectID: effectID)
+        lastChange = Date(); editor.update()
     }
     @objc func changeParameter(_ sender: NSSlider) { host.setParameter(sender.tag, value: sender.doubleValue); captureChanges() }
     func close(capture: Bool = true) {

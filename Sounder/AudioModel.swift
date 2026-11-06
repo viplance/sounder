@@ -516,7 +516,7 @@ final class AudioStore {
     func render(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil) throws -> [Float] {
         try renderAudio(project, range: range, onlyTrack: onlyTrack).mono
     }
-    func renderAudio(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil, sourceFrames: Range<Int>? = nil) throws -> AudioSignal {
+    func renderAudio(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil, sourceFrames: Range<Int>? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }) throws -> AudioSignal {
         try project.audioFormat.validate()
         configure(project.audioFormat)
         let channelCount = project.audioFormat.channels
@@ -539,6 +539,10 @@ final class AudioStore {
                 let (fadeIn, fadeOut) = clip.fadeLengths(frames: clipLast - clipFirst, sampleRate: sampleRate)
                 let gains = (0..<channelCount).map { clip.volumeGain * clip.panGain(channel: $0, channels: channelCount) }
                 for frame in first..<last {
+                    if (frame - first) % 4096 == 0 {
+                        if cancelled() { throw CancellationError() }
+                        if frame > first { preparationProgress(4096) }
+                    }
                     let sourceFrame = sourceFrames.map { Int((clip.offset - clip.start) * sampleRate) + $0.lowerBound + frame } ?? (Int((region.lowerBound - clip.start + clip.offset) * sampleRate) + frame)
                     let incoming = fadeIn == 0 ? 1 : clip.fadeInCurve.value(Double(frame - clipFirst) / fadeIn)
                     let outgoing = fadeOut == 0 ? 1 : clip.fadeOutCurve.value(Double(clipLast - 1 - frame) / fadeOut)
@@ -553,6 +557,7 @@ final class AudioStore {
                         lane.channels[channel][frame] = Float(Double(lane.channels[channel][frame]) * (1 - weight) + Double(sample) * gains[channel] * sourceWeight)
                     }
                 }
+                preparationProgress((last - first - 1) % 4096 + 1)
             }
             return lane
         }

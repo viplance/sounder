@@ -102,6 +102,16 @@ final class ProcessedMixCache {
             return first < last ? first..<last : nil
         }
     }
+    /// Readiness of retained PCM plus the requested next window. Moving the
+    /// marker may add missing work, but never erases already calculated ranges.
+    func retainedReadiness(in range: Range<Int>) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        let retained = regions.reduce(0) { $0 + $1.count }
+        guard retained > 0 else { return 0 }
+        let ready = regions.reduce(0) { $0 + max(0, min($1.upperBound, range.upperBound) - max($1.lowerBound, range.lowerBound)) }
+        let missing = max(0, range.count - ready)
+        return Double(retained) / Double(retained + missing) * 100
+    }
     init(channels: Int) throws {
         self.channels = channels
         url = FileManager.default.temporaryDirectory.appendingPathComponent("Sounder-mix-" + UUID().uuidString + ".pcm")
@@ -228,26 +238,35 @@ final class StreamingGraph {
     let latency: Int
     let totalFrames: Int
     let outputCache: ProcessedMixCache
+    var needsHistory: Bool { tracks.contains { $0.effects.contains { !$0.bypassed } } }
     private(set) var position = 0
-    init(project: Project, store: AudioStore, dryGraph: StreamingGraph? = nil, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
+    init(project: Project, store: AudioStore, dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
         let processingTracks = project.processingTracks
         tracks = processingTracks
         parents = Dictionary(uniqueKeysWithValues: processingTracks.compactMap { track in track.parent.map { (track.id, $0) } })
         channels = project.audioFormat.channels
-        outputCache = try ProcessedMixCache(channels: channels)
+        outputCache = try processedCache ?? ProcessedMixCache(channels: channels)
         let channelCount = channels
         var visited = Set<UUID>()
         var trackBuses: [UUID: Bus] = [:]
         func bus(_ track: Track) throws -> Bus {
+            if cancelled() { throw CancellationError() }
             guard visited.insert(track.id).inserted else { throw SounderError.message("Invalid track hierarchy") }
             let dry: [Float]
             if track.id == Project.masterID { dry = [] }
             else if let previous = dryGraph?.buses[track.id], previous.channels == channelCount {
                 dry = previous.dry // Immutable PCM is shared; no full-project remix on release.
             } else {
-                let raw = try store.renderAudio(project, onlyTrack: track.id)
+                let raw = try store.renderAudio(project, onlyTrack: track.id, preparationProgress: preparationProgress, cancelled: cancelled)
                 var samples = [Float](repeating: 0, count: raw.frameCount * channelCount)
-                for frame in 0..<raw.frameCount { for ch in 0..<channelCount { samples[frame * channelCount + ch] = raw.channels[ch][frame] } }
+                for frame in 0..<raw.frameCount {
+                    if frame % 4096 == 0 {
+                        if cancelled() { throw CancellationError() }
+                        if frame > 0 { preparationProgress(4096) }
+                    }
+                    for ch in 0..<channelCount { samples[frame * channelCount + ch] = raw.channels[ch][frame] }
+                }
+                if raw.frameCount > 0 { preparationProgress((raw.frameCount - 1) % 4096 + 1) }
                 dry = samples
             }
             let children = try processingTracks.filter { $0.parent == track.id }.map { try bus($0) }
@@ -259,6 +278,7 @@ final class StreamingGraph {
         roots = try processingTracks.filter { $0.parent == nil }.map { try bus($0) }
         buses = trackBuses
         latency = roots.map(\.latency).max() ?? 0
+        if let processedCache, dryGraph?.latency != latency { processedCache.invalidate() }
         for bus in buses.values { bus.meterDelay = SampleDelay(frames: max(0, latency - bus.latency), channels: channelCount) }
         let masterLatency = latency
         delays = roots.map { SampleDelay(frames: masterLatency - $0.latency, channels: channelCount) }
@@ -309,6 +329,7 @@ final class StreamingGraph {
 /// Device presentation callbacks are reserved for the final buffer: they arrive
 /// too late to drive a continuous stream on outputs with presentation latency.
 final class LivePlayback {
+    let bufferFill = AudioBufferFill()
     func configureOutput(_ endpoint: AudioEndpoint) throws { try AudioDevices.configureOutput(endpoint, engine: engine, projectChannels: format.channels) }
     let engine = AVAudioEngine()
     let node = AVAudioPlayerNode()
@@ -431,16 +452,25 @@ final class LivePlayback {
             }
         }
     }
-    func startPlayback(playImmediately: Bool = true) throws {
+    func startPlayback(playImmediately: Bool = true, cancelled: () -> Bool = { false }, progress: (Int) -> Void = { _ in }) throws {
         let pcmFormat = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
         // Warm effects from project zero and discard compensated latency when seeking.
         try queue.sync {
             resetLoopPosition(nextFrame)
             let skip = nextFrame + graph.latency
-            while graph.position < skip { _ = try graph.render(frames: min(512, skip - graph.position)) }
+            if !graph.needsHistory { try graph.seek(to: nextFrame) }
+            while graph.position < skip {
+                if cancelled() { throw CancellationError() }
+                let count = min(512, skip - graph.position)
+                _ = try graph.render(frames: count); progress(count)
+            }
             running = true
             let buffers = max(3, Int(ceil(format.sampleRate / 48_000 * 3)))
-            for _ in 0..<buffers { try enqueue(format: pcmFormat) }
+            for _ in 0..<buffers {
+                if cancelled() { throw CancellationError() }
+                try enqueue(format: pcmFormat)
+                progress(512)
+            }
         }
         engine.prepare(); try engine.start()
         if playImmediately { node.play() }
@@ -492,6 +522,7 @@ final class LivePlayback {
         // A quick second Space can arrive before the fade-out is audible.
         // Queue the fade-in immediately after it; do not wait for presentation
         // and restart the node, which would introduce a gap or lose the seek.
+        bufferFill.reset()
         streamGeneration += 1; scheduled = 0; pausing = false; pauseComplete = false
         if shuttleRenderer != nil || graph.position != frame + graph.latency { try graph.seek(to: frame) }
         shuttleRenderer = nil; renderingNormal = true; nextFrame = frame
@@ -507,6 +538,7 @@ final class LivePlayback {
     private func restartPausedNode(at frame: Int) throws {
         // A genuine pause has already reached silence. Flush obsolete queued
         // callbacks and reset the node clock, without restarting audio hardware.
+        bufferFill.reset()
         streamGeneration += 1; pauseComplete = false
         node.stop(); scheduled = 0
         if shuttleRenderer != nil || graph.position != frame + graph.latency { try graph.seek(to: frame) }
@@ -763,12 +795,16 @@ final class LivePlayback {
         schedule(buffer, last: !recordingPlayback && loop == nil && nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal)
     }
     private func schedule(_ buffer: AVAudioPCMBuffer, last: Bool, format pcmFormat: AVAudioFormat, pauseFinal: Bool = false) {
+        let bufferFrames = Int(buffer.frameLength)
+        let bufferGeneration = bufferFill.enqueue(frames: bufferFrames, capacity: max(3, Int(ceil(format.sampleRate / 48_000 * 3))) * 512)
         let generation = streamGeneration
         let completionType: AVAudioPlayerNodeCompletionCallbackType = last || pauseFinal
             ? (engine.isInManualRenderingMode ? .dataRendered : .dataPlayedBack)
             : .dataConsumed
         node.scheduleBuffer(buffer, completionCallbackType: completionType) { [weak self] _ in
             guard let self else { return }
+            // Consumption comes from the audio node, before waiting for DSP.
+            self.bufferFill.consumed(frames: bufferFrames, generation: bufferGeneration)
             self.queue.async {
                 guard self.running, self.streamGeneration == generation else { return }
                 self.scheduled -= 1
@@ -825,6 +861,7 @@ final class LivePlayback {
     func setSolo(_ ids: Set<UUID>) { queue.async { self.graph.setSolo(ids) } }
     func setTrackMix(_ track: Track) { queue.async { self.graph.setTrackMix(track) } }
     func stop() {
+        bufferFill.reset()
         cancelReturn(); queue.sync { running = false; streamGeneration += 1; pausing = false }
         node.stop(); engine.stop()
         // Releasing hands processors to this worker. Drain a cancelled block
@@ -1033,6 +1070,7 @@ final class DryShuttleSource {
 }
 
 final class ShuttlePlayback {
+    let bufferFill = AudioBufferFill()
     func configureOutput(_ endpoint: AudioEndpoint) throws { try AudioDevices.configureOutput(endpoint, engine: engine, projectChannels: format.channels) }
     let engine = AVAudioEngine()
     let node = AVAudioPlayerNode()
@@ -1191,10 +1229,13 @@ final class ShuttlePlayback {
             return
         }
         scheduled += 1
+        let bufferFrames = Int(buffer.frameLength)
+        let bufferGeneration = bufferFill.enqueue(frames: bufferFrames, capacity: 8 * 512)
         let last = reachedEnd
         let completion: AVAudioPlayerNodeCompletionCallbackType = last ? (engine.isInManualRenderingMode ? .dataRendered : .dataPlayedBack) : .dataConsumed
         node.scheduleBuffer(buffer, completionCallbackType: completion) { [weak self] _ in
             guard let self else { return }
+            self.bufferFill.consumed(frames: bufferFrames, generation: bufferGeneration)
             self.queue.async {
                 guard !self.isCancelled else { return }
                 self.scheduled -= 1
@@ -1212,6 +1253,7 @@ final class ShuttlePlayback {
         }
     }
     func stop() {
+        bufferFill.reset()
         cancellation.lock(); cancelled = true; cancellation.unlock()
         node.stop(); engine.stop()
         // Each gesture owns its source snapshot and no plug-ins. Cancellation

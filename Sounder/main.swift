@@ -405,6 +405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var recordButton: NSButton!
     var loopButton: NSButton!
     var audioRoutingWindow: AudioRoutingWindow?
+    let performanceIndicators = PerformanceIndicators()
     var exportButton: NSButton!
     var editButtons: [NSButton] = []
     var fragmentMuteButton: NSButton!
@@ -494,7 +495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         for app in NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "enotix.Sounder") where app.processIdentifier != ProcessInfo.processInfo.processIdentifier { app.terminate() }
-        do { editor = Editor(store: try AudioStore()) }
+        do { editor = Editor(store: try AudioStore()); editor.preparesPlaybackInBackground = !CommandLine.arguments.contains("--ui-test") }
         catch { NSAlert(error: error).runModal(); NSApp.terminate(nil); return }
         NSApp.appearance = NSAppearance(named: .darkAqua)
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 790), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
@@ -521,6 +522,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toolbar.addArrangedSubview(section("TRACKS", [addTrack, nest, removeTrack])); editButtons = [split, trim, delete, join, normalize, fragmentMuteButton, addTrack, nest, removeTrack, importButton]
         toolbar.addArrangedSubview(section("VIEW", [button("Zoom out", "minus.magnifyingglass", #selector(zoomOut)), button("Zoom in", "plus.magnifyingglass", #selector(zoomIn))]))
         let spacer2 = NSView(); spacer2.setContentHuggingPriority(.defaultLow, for: .horizontal); toolbar.addArrangedSubview(spacer2)
+        performanceIndicators.bufferValue = { [weak self] in self?.editor.bufferPercent ?? 0 }
+        performanceIndicators.bufferDescription = { [weak self] in self?.editor.bufferDescription ?? "" }
+        toolbar.addArrangedSubview(performanceIndicators)
         metronomeButton = PointerButton(image: NSImage(systemSymbolName: "metronome", accessibilityDescription: "Metronome")!, target: self, action: #selector(toggleMetronome))
         metronomeButton.setButtonType(.pushOnPushOff); metronomeButton.isBordered = false; metronomeButton.imagePosition = .imageOnly
         metronomeButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
@@ -663,6 +667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--graphics-ui-test") { try verifyGraphicsUI() }
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
             if CommandLine.arguments.contains("--button-hover-ui-test") { try verifyButtonHoverUI() }
+            if CommandLine.arguments.contains("--performance-ui-test") { try verifyPerformanceUI() }
             if CommandLine.arguments.contains("--audio-routing-ui-test") { try verifyAudioRoutingUI() }
             if CommandLine.arguments.contains("--project-file-controls-ui-test") { try verifyProjectFileControlsUI() }
             if CommandLine.arguments.contains("--fragments-system-menu-ui-test") { try verifyFragmentsSystemMenuUI() }
@@ -1048,7 +1053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         loopButton.contentTintColor = editor.project.loopEnabled ? accent : .labelColor
         loopButton.toolTip = editor.project.loopEnabled ? "Loop on" : "Loop off"
         loopButton.isEnabled = editor.canToggleLoop
-        playButton.image = NSImage(systemSymbolName: editor.isPlaying ? "pause.fill" : "play.fill", accessibilityDescription: "Play / pause")
+        playButton.image = NSImage(systemSymbolName: (editor.isPlaying || editor.isPreparingPlayback) ? "pause.fill" : "play.fill", accessibilityDescription: "Play / pause")
         playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isImporting; recordButton.isEnabled = editor.canRecord
         editButtons.forEach { $0.isEnabled = !editor.busy }
         for name in ["open", "save"] {
