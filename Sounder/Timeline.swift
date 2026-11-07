@@ -182,8 +182,16 @@ final class MixerMeterRail: NSView {
 /// The pan thumb mirrors the volume thumb's 8×14 pt proportions, rotated.
 /// Native geometry still supplies tracking, animation and accessibility.
 final class TrackPanSliderCell: NSSliderCell {
+    private static let thumbSize = NSSize(width: 14, height: 8)
+    override func drawBar(inside rect: NSRect, flipped: Bool) {
+        // Native travel reserves space for a taller thumb. Trim only the
+        // painted rail to the visible thumb's endpoints, preserving tracking.
+        let inset = max(0, (knobRect(flipped: flipped).height - Self.thumbSize.height) / 2)
+        super.drawBar(inside: rect.insetBy(dx: 0, dy: inset), flipped: flipped)
+    }
     override func drawKnob(_ knobRect: NSRect) {
-        super.drawKnob(NSRect(x: knobRect.midX - 7, y: knobRect.midY - 4, width: 14, height: 8))
+        super.drawKnob(NSRect(x: knobRect.midX - Self.thumbSize.width / 2, y: knobRect.midY - Self.thumbSize.height / 2,
+                             width: Self.thumbSize.width, height: Self.thumbSize.height))
     }
 }
 
