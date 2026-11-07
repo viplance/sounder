@@ -1535,6 +1535,24 @@ extension AppDelegate {
                   "Playhead animation keeps its AppKit view stationary instead of rebuilding cursor tracking regions")
         try check(timeline.isPresentingScroll && timeline.enclosingScrollView!.contentView.bounds == nativeBounds && abs(timeline.viewportRect.minX - viewportOrigin) > 1 && mixer.frame == mixerFrame,
                   "Playback scroll moves layer pixels while native clip bounds and mixer frames stay fixed")
+        var hoverKeepsPresentation = true
+        for step in 0..<24 {
+            let point = NSPoint(x: timeline.viewportRect.minX + timeline.header + 20 + CGFloat(step * 3),
+                                y: timeline.viewportRect.minY + timeline.ruler + 20)
+            let location = timeline.convertDocumentPoint(point, to: nil)
+            let event = NSEvent.mouseEvent(with: .mouseMoved, location: location, modifierFlags: [],
+                                          timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                          context: nil, eventNumber: step, clickCount: 0, pressure: 0)!
+            window.sendEvent(event)
+            timeline.mouseMoved(with: event)
+            let hit = timeline.documentPoint(fromWindow: location)
+            hoverKeepsPresentation = hoverKeepsPresentation && timeline.isPresentingScroll
+                && timeline.enclosingScrollView!.contentView.bounds == nativeBounds && mixer.frame == mixerFrame
+                && abs(hit.x - point.x) < 0.001 && abs(hit.y - point.y) < 0.001
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        try check(hoverKeepsPresentation,
+                  "Mouse movement preserves layer scrolling and native geometry while hit-testing displayed document coordinates")
         let presented = timeline.viewportRect.minX
         timeline.synchronizeScrollPresentation()
         try check(!timeline.isPresentingScroll && abs(timeline.viewportRect.minX - presented) <= 0.5,

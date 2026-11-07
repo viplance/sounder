@@ -63,7 +63,7 @@ final class EditorWindow: NSWindow {
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseDragged,
-             .rightMouseDragged, .otherMouseDragged, .mouseMoved, .scrollWheel:
+             .rightMouseDragged, .otherMouseDragged, .scrollWheel:
             prepareForPointerEvent?()
         default: break
         }

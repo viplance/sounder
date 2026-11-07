@@ -825,6 +825,12 @@ final class Timeline: NSView {
         convert(NSPoint(x: point.x - viewportRect.minX + super.visibleRect.minX,
                         y: point.y - viewportRect.minY + super.visibleRect.minY), to: view)
     }
+    /// Hit-test the displayed pixels without committing layer scrolling to AppKit.
+    func documentPoint(fromWindow point: NSPoint) -> NSPoint {
+        let native = convert(point, from: nil)
+        return NSPoint(x: native.x + viewportRect.minX - super.visibleRect.minX,
+                       y: native.y + viewportRect.minY - super.visibleRect.minY)
+    }
     /// Commit at interaction boundaries, not at display cadence. Native controls
     /// and AppKit drag/autoscroll then use the same coordinates as the pixels.
     func synchronizeScrollPresentation() {
@@ -885,8 +891,7 @@ final class Timeline: NSView {
         if next?.id != hoveredTrackControl?.id || next?.kind != hoveredTrackControl?.kind { hoveredTrackControl = next; sidebarSurface.needsDisplay = true }
     }
     override func mouseMoved(with event: NSEvent) {
-        synchronizeScrollPresentation()
-        updateTrackControlHover(at: convert(event.locationInWindow, from: nil))
+        updateTrackControlHover(at: documentPoint(fromWindow: event.locationInWindow))
     }
     override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
     override func mouseExited(with event: NSEvent) { updateTrackControlHover(at: nil) }
@@ -1410,9 +1415,7 @@ final class Timeline: NSView {
     }
     var presentationCursor: NSCursor? {
         guard isPresentingScroll, let window, window.isKeyWindow else { return nil }
-        let native = convert(window.mouseLocationOutsideOfEventStream, from: nil)
-        let point = NSPoint(x: native.x + viewportRect.minX - super.visibleRect.minX,
-                            y: native.y + viewportRect.minY - super.visibleRect.minY)
+        let point = documentPoint(fromWindow: window.mouseLocationOutsideOfEventStream)
         guard visibleFragmentRect.contains(point) else { return nil }
         if editor.busy {
             return canSelectRange && rangeHandleRects().contains(where: { $0.contains(point) }) ? .resizeLeftRight : .arrow
