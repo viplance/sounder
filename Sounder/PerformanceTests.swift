@@ -2,6 +2,62 @@ import AppKit
 import AVFoundation
 
 extension AppDelegate {
+    func verifyCanvasCompositionUI() throws {
+        let content = window.contentView!
+        content.layoutSubtreeIfNeeded(); timeline.refresh(); content.displayIfNeeded()
+        let clip = timeline.clipRect(editor.project.tracks[0].clips[0], row: 0, layer: 0)
+        let point = timeline.convertDocumentPoint(NSPoint(x: clip.minX + 18, y: clip.midY + 5), to: content)
+        guard let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { throw SounderError.message("Cannot capture canvas composition") }
+        content.cacheDisplay(in: content.bounds, to: bitmap)
+        let scale = CGFloat(bitmap.pixelsWide) / content.bounds.width
+        let y = content.isFlipped ? point.y : content.bounds.maxY - point.y
+        let color = bitmap.colorAt(x: Int(point.x * scale), y: Int(y * scale))!.usingColorSpace(.deviceRGB)!
+        guard color.greenComponent - color.redComponent > 0.04 else { throw SounderError.message("Pinned overlay covers the stopped fragment canvas: \(color)") }
+        print("PASS: The stopped window composites fragment pixels through the pinned overlay")
+    }
+
+    func verifyScrollTilesUI() throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let surface = TimelineScrollSurface(frame: NSRect(x: 0, y: 0, width: 900, height: 200))
+        window.contentView!.addSubview(surface)
+        defer { surface.removeFromSuperview() }
+        var bodyColor = NSColor.blue
+        surface.paint = { rect, ruler in
+            fill(rect, ruler ? .green : bodyColor)
+            if !ruler {
+                fill(NSRect(x: 0, y: 142, width: 10_000, height: 16), .red)
+                fill(NSRect(x: 1300, y: 0, width: 16, height: 10_000), .white)
+            }
+        }
+        func present(_ x: CGFloat) { surface.present(viewport: NSRect(x: x, y: 100, width: 900, height: 200), headerWidth: 220, rulerHeight: 42) }
+        func pixel(_ point: NSPoint) throws -> NSColor {
+            let scale = window.backingScaleFactor
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(surface.bounds.width * scale), pixelsHigh: Int(surface.bounds.height * scale), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let graphics = NSGraphicsContext(bitmapImageRep: bitmap) else { throw SounderError.message("Cannot capture scroll tiles") }
+            graphics.cgContext.translateBy(x: 0, y: CGFloat(bitmap.pixelsHigh))
+            graphics.cgContext.scaleBy(x: scale, y: -scale)
+            surface.layer!.render(in: graphics.cgContext)
+            return bitmap.colorAt(x: Int(point.x * scale), y: Int(point.y * scale))!.usingColorSpace(.deviceRGB)!
+        }
+        present(900)
+        let top = try pixel(NSPoint(x: 450, y: 50)), bottom = try pixel(NSPoint(x: 450, y: 180))
+        let ruler = try pixel(NSPoint(x: 450, y: 20)), stripe = try pixel(NSPoint(x: 405, y: 100))
+        try check(top.redComponent > 0.9 && bottom.blueComponent > 0.9 && ruler.greenComponent > 0.9 && stripe.redComponent > 0.9 && stripe.greenComponent > 0.9,
+                  "Scroll tiles preserve vertical image orientation, ruler placement and document-to-viewport translation (\(top), \(bottom), \(ruler), \(stripe))")
+        let builds = surface.tileBuildCount
+        present(920)
+        try check(surface.tileBuildCount == builds, "Sub-tile scroll translates cached layers without repainting")
+        present(1150)
+        try check(surface.tileBuildCount == builds + 1 && surface.retainedTileCount <= 3,
+                  "Crossing a tile boundary renders only the entering tile and bounds retained memory")
+        bodyColor = .yellow; surface.invalidateTiles(); present(1150)
+        let updated = try pixel(NSPoint(x: 600, y: 100))
+        try check(updated.redComponent > 0.9 && updated.greenComponent > 0.9 && updated.blueComponent < 0.1,
+                  "Invalidation replaces stale scroll pixels after content changes (\(updated))")
+    }
+
     func verifyMeterLayersUI() throws {
         func check(_ condition: Bool, _ message: String) throws {
             guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
@@ -64,9 +120,10 @@ extension AppDelegate {
                       "Moving the playhead updates its visual position without moving the AppKit surface")
         }
         timeline.centerOnPlayhead(); timeline.presentTransportFrame()
-        let capRect = NSRect(x: timeline.playheadFrame.midX - 4, y: timeline.visibleRect.minY, width: 8, height: 8)
-        guard let capImage = timeline.bitmapImageRepForCachingDisplay(in: capRect) else { throw SounderError.message("Cannot render the playhead cap") }
-        timeline.cacheDisplay(in: capRect, to: capImage)
+        let capRect = NSRect(x: timeline.playheadFrame.midX - 4, y: timeline.viewportRect.minY, width: 8, height: 8)
+        let content = window.contentView!, crop = timeline.convert(capRect, to: window.contentView)
+        guard let capImage = content.bitmapImageRepForCachingDisplay(in: crop) else { throw SounderError.message("Cannot render the playhead cap") }
+        content.cacheDisplay(in: crop, to: capImage)
         let cap = capImage.colorAt(x: capImage.pixelsWide * 3 / 4, y: capImage.pixelsHigh / 4)!.usingColorSpace(.deviceRGB)!
         try check(cap.greenComponent > cap.redComponent + 0.1,
                   "The rendered playhead cap stays at the top of the timeline")
@@ -81,7 +138,9 @@ extension AppDelegate {
                 Clip(name: URL(fileURLWithPath: path).lastPathComponent, source: path, start: 0,
                      duration: Double(audio.frameCount) / editor.project.audioFormat.sampleRate, order: 1)
             ])])
-            editor.cursor = 0; refresh()
+            // Start within long recordings so the visible phase measures
+            // continuous follow, rather than mostly a stationary viewport.
+            editor.cursor = min(30, max(0, editor.duration - 12)); refresh(); timeline.centerOnPlayhead()
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window.level = .floating
             window.deminiaturize(nil); window.orderFrontRegardless(); NSApp.activate(ignoringOtherApps: true)

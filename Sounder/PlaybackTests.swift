@@ -116,7 +116,7 @@ extension AppDelegate {
             let rect = timeline.trackMuteRect(row: row, depth: timeline.rows[row].1)
             let point = NSPoint(x: rect.midX, y: rect.midY)
             for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-                let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+                let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
                 if type == .leftMouseDown { timeline.mouseDown(with: event) } else { timeline.mouseUp(with: event) }
             }
         }
@@ -154,7 +154,7 @@ extension AppDelegate {
             }
             for _ in 0..<40 { zoomOut() }
             try check(abs(timeline.frame.width - timeline.viewportSize.width) < 0.01, "Zoom out fits the full timeline to the viewport for \(duration) seconds")
-            try check(timeline.header + editor.duration * editor.zoom <= timeline.visibleRect.maxX + 0.01 && abs(timeline.visibleRect.minX) < 0.01, "All fragments fit onscreen from time zero")
+            try check(timeline.header + editor.duration * editor.zoom <= timeline.viewportRect.maxX + 0.01 && abs(timeline.viewportRect.minX) < 0.01, "All fragments fit onscreen from time zero")
             let minimum = editor.zoom; zoomOut()
             try check(editor.zoom == minimum && timeline.rulerStep * editor.zoom >= 79.99, "Zoom stops at viewport width with readable ruler labels")
             zoomIn()
@@ -172,7 +172,7 @@ extension AppDelegate {
         }
         func send(_ type: NSEvent.EventType, _ time: Double, clicks: Int = 1, y: CGFloat? = nil, shift: Bool = false) {
             let point = NSPoint(x: timeline.header + time * editor.zoom, y: y ?? timeline.ruler / 2)
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: shift ? [.shift] : [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: shift ? [.shift] : [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
             switch type {
             case .leftMouseDown: timeline.mouseDown(with: event)
             case .leftMouseDragged: timeline.mouseDragged(with: event)
@@ -264,7 +264,7 @@ extension AppDelegate {
         func click(time: Double, y: CGFloat) {
             let point = NSPoint(x: timeline.header + time * editor.zoom, y: y)
             func event(_ type: NSEvent.EventType) -> NSEvent {
-                NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+                NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             }
             timeline.mouseDown(with: event(.leftMouseDown)); timeline.mouseUp(with: event(.leftMouseUp))
         }
@@ -276,7 +276,7 @@ extension AppDelegate {
             if let scroll = timeline.enclosingScrollView {
                 scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
             }
-            try check(timeline.header + editor.cursor * editor.zoom > timeline.visibleRect.maxX, "Paused playhead is outside the currently visible timeline")
+            try check(timeline.header + editor.cursor * editor.zoom > timeline.viewportRect.maxX, "Paused playhead is outside the currently visible timeline")
         }
         editor.zoom = 240; refresh(); window.contentView?.layoutSubtreeIfNeeded()
         try pauseOffscreen()
@@ -295,7 +295,7 @@ extension AppDelegate {
         RunLoop.current.run(until: Date().addingTimeInterval(0.16))
         try check(editor.cursor >= stoppedAt && editor.cursor < stoppedAt + 0.4, "Cursor follows continued playback without jumping to the previous start")
         click(time: 2.5, y: timeline.ruler + timeline.rowHeight / 2)
-        try check(editor.isPlaying && editor.player?.start == 2.5 && !editor.selection.isEmpty, "Clicking a fragment seeks and keeps playback active (playing: \(editor.isPlaying), start: \(String(describing: editor.player?.start)), cursor: \(editor.cursor), selection: \(editor.selection.count), visible: \(timeline.visibleRect))")
+        try check(editor.isPlaying && editor.player?.start == 2.5 && !editor.selection.isEmpty, "Clicking a fragment seeks and keeps playback active (playing: \(editor.isPlaying), start: \(String(describing: editor.player?.start)), cursor: \(editor.cursor), selection: \(editor.selection.count), visible: \(timeline.viewportRect))")
         click(time: 1, y: timeline.ruler / 2)
         try check(editor.isPlaying && editor.player?.start == 1, "Clicking the ruler during playback immediately plays from the selected time")
         click(time: 3, y: timeline.ruler + timeline.rowHeight * 2.5)
@@ -867,15 +867,15 @@ extension AppDelegate {
             while !condition() && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
         }
         func centered() -> Bool {
-            let expected = min(max(0, timeline.frame.width - timeline.viewportSize.width), max(0, editor.cursor * editor.zoom - (timeline.viewportSize.width - timeline.header) / 2))
-            return abs(timeline.visibleRect.minX - expected) < 2
+            let expected = min(max(0, timeline.frame.width - timeline.viewportSize.width), max(0, timeline.playheadFrame.midX - timeline.header - (timeline.viewportSize.width - timeline.header) / 2))
+            return abs(timeline.viewportRect.minX - expected) < 2
         }
         window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline)
         editor.stop(); editor.zoom = 500; editor.seek(to: 5); refresh()
         let originalTempo = editor.project.tempoMode
         for tempo in [false, true] {
             editor.project.tempoMode = tempo; editor.seek(to: 5); refresh()
-            let step = (timeline.visibleRect.width - timeline.header) / editor.zoom * 0.01
+            let step = (timeline.viewportRect.width - timeline.header) / editor.zoom * 0.01
             let right = key(.keyDown, 124, flags: [])
             try check(!handleShuttleShortcut(right), "Plain arrows never enter shuttle (Tempo: \(tempo))")
             timeline.keyDown(with: right)
@@ -1418,6 +1418,8 @@ extension AppDelegate {
         func check(_ condition: Bool, _ message: String) throws {
             guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
         }
+        try verifyCanvasCompositionUI()
+        try verifyScrollTilesUI()
         try verifyMeterLayersUI()
         let saved = editor.project, savedCursor = editor.cursor, savedZoom = editor.zoom, savedSelection = editor.selection
         defer {
@@ -1435,7 +1437,7 @@ extension AppDelegate {
         editor.cursor = 2; editor.zoom = 160; editor.selection = [editor.project.tracks[0].clips[0].id]
         refresh()
         func render() throws -> NSBitmapImageRep {
-            let rect = timeline.visibleRect
+            let rect = timeline.viewportRect
             let scale: CGFloat = 2
             guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(ceil(rect.width * scale)),
                                                pixelsHigh: Int(ceil(rect.height * scale)), bitsPerSample: 8, samplesPerPixel: 4,
@@ -1513,17 +1515,30 @@ extension AppDelegate {
         try check(abs(timeline.playheadFrame.midX - (timeline.header + editor.cursor * editor.zoom)) < 0.001 && !timeline.playheadIsHidden,
                   "The independent playhead layer stays aligned with the audio position after zoom and scroll")
         editor.seek(to: 2); editor.playPause()
-        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        let initialFrames = transportFrameCount, readyBy = Date().addingTimeInterval(2)
+        while (transportFrameCount - initialFrames < 3 || !timeline.isPresentingScroll) && Date() < readyBy {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
         let player = editor.player, initialTime = editor.cursor
         let full = fullRefreshCount, structures = timeline.structureRefreshCount, frames = transportFrameCount
         let playheadSurface = timeline.playheadSurfaceFrame
+        let nativeBounds = timeline.enclosingScrollView!.contentView.bounds
+        let viewportOrigin = timeline.viewportRect.minX
+        let mixer = timeline.mixerControls[editor.project.tracks[0].id]!
+        let mixerFrame = mixer.frame
         RunLoop.current.run(until: Date().addingTimeInterval(0.4))
         try check(editor.player === player && editor.cursor > initialTime && transportFrameCount - frames >= 12,
-                  "Display-synchronized transport advances from the running audio clock above the old 25 Hz cadence")
+                  "Display-synchronized transport advances from the running audio clock above the old 25 Hz cadence (frames: \(transportFrameCount - frames), cursor: \(initialTime) → \(editor.cursor), occlusion: \(window.occlusionState.rawValue))")
         try check(fullRefreshCount == full && timeline.structureRefreshCount == structures,
                   "Playback frames and meter ticks never rebuild the project toolbar or track structure")
         try check(timeline.playheadSurfaceFrame == playheadSurface,
                   "Playhead animation keeps its AppKit view stationary instead of rebuilding cursor tracking regions")
+        try check(timeline.isPresentingScroll && timeline.enclosingScrollView!.contentView.bounds == nativeBounds && abs(timeline.viewportRect.minX - viewportOrigin) > 1 && mixer.frame == mixerFrame,
+                  "Playback scroll moves layer pixels while native clip bounds and mixer frames stay fixed")
+        let presented = timeline.viewportRect.minX
+        timeline.synchronizeScrollPresentation()
+        try check(!timeline.isPresentingScroll && abs(timeline.viewportRect.minX - presented) <= 0.5,
+                  "Pointer interaction commits the displayed scroll position without a viewport jump")
         try check(abs(editor.cursor - (editor.player?.currentTime ?? 0)) < 0.06,
                   "Display cursor remains synchronized with audible playback")
         editor.beginShuttle(direction: -1)
@@ -1562,70 +1577,70 @@ extension AppDelegate {
         scroll.contentView.scroll(to: .zero)
         func wait(_ seconds: Double) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
         func centered() -> Bool {
-            let target = min(max(0, timeline.frame.width - timeline.viewportSize.width), max(0, editor.cursor * editor.zoom - (timeline.viewportSize.width - timeline.header) / 2))
-            return abs(timeline.visibleRect.minX - target) < 2
+            let target = min(max(0, timeline.frame.width - timeline.viewportSize.width), max(0, timeline.playheadFrame.midX - timeline.header - (timeline.viewportSize.width - timeline.header) / 2))
+            return abs(timeline.viewportRect.minX - target) < 2
         }
         func click(_ time: Double) {
             let point = NSPoint(x: timeline.header + time * editor.zoom, y: timeline.pinnedRulerRect.midY)
             for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-                let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
                                               windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
                 if type == .leftMouseDown { timeline.mouseDown(with: event) } else { timeline.mouseUp(with: event) }
             }
         }
         wait(0.15) // Let the newly opened AppKit window complete its first display/occlusion update.
         click(2.5)
-        try check(editor.cursor == 2.5 && abs(timeline.visibleRect.minX) < 0.01, "Stopped timeline selection moves the marker without centering the viewport")
+        try check(editor.cursor == 2.5 && abs(timeline.viewportRect.minX) < 0.01, "Stopped timeline selection moves the marker without centering the viewport")
         let stoppedHistory = editor.undoStack.count
-        let beforeStep = editor.cursor, beforeOrigin = timeline.visibleRect.minX
+        let beforeStep = editor.cursor, beforeOrigin = timeline.viewportRect.minX
         timeline.movePlayhead(direction: 1)
         let step = (timeline.viewportSize.width - timeline.header) / editor.zoom * 0.01
-        try check(abs(editor.cursor - beforeStep - step) < 0.000001 && abs(timeline.visibleRect.minX - beforeOrigin) < 1 && timeline.isEasingPlaybackScroll,
+        try check(abs(editor.cursor - beforeStep - step) < 0.000001 && abs(timeline.viewportRect.minX - beforeOrigin) < 1 && timeline.isEasingPlaybackScroll,
                   "Paused Right moves the marker by one percent immediately and starts smooth scrolling without a viewport jump")
         wait(0.2)
-        let movingOrigin = timeline.visibleRect.minX
+        let movingOrigin = timeline.viewportRect.minX
         try check(movingOrigin > beforeOrigin && !centered() && editor.player == nil && !editor.isPlaying,
                   "Paused arrow centering animates using the display link without starting audio")
         for _ in 0..<5 { timeline.movePlayhead(direction: 1); wait(0.05) }
-        try check(timeline.visibleRect.minX > movingOrigin, "Held arrow repeats keep scrolling instead of restarting the animation on every key event")
+        try check(timeline.viewportRect.minX > movingOrigin, "Held arrow repeats keep scrolling instead of restarting the animation on every key event")
         wait(0.7)
         try check(centered() && !timeline.isEasingPlaybackScroll && transportDisplayIsPaused && editor.undoStack.count == stoppedHistory,
                   "Paused arrows reach the updated target in one second, then suspend display callbacks without editing history")
         timeline.movePlayhead(direction: -1)
         try check(timeline.isEasingPlaybackScroll, "Paused Left uses the same smooth centering")
         wait(1.1)
-        try check(centered() && transportDisplayIsPaused, "Paused Left also completes and stops its display link (origin: \(timeline.visibleRect.minX), cursor: \(editor.cursor), easing: \(timeline.isEasingPlaybackScroll), linkPaused: \(transportDisplayIsPaused), windowVisible: \(window.isVisible), occlusion: \(window.occlusionState.rawValue))")
+        try check(centered() && transportDisplayIsPaused, "Paused Left also completes and stops its display link (origin: \(timeline.viewportRect.minX), cursor: \(editor.cursor), easing: \(timeline.isEasingPlaybackScroll), linkPaused: \(transportDisplayIsPaused), windowVisible: \(window.isVisible), occlusion: \(window.occlusionState.rawValue))")
         click(2.5); scroll.contentView.scroll(to: .zero)
         editor.playPause()
-        try check(editor.isPlaying && timeline.isEasingPlaybackScroll && abs(timeline.visibleRect.minX) < 1,
+        try check(editor.isPlaying && timeline.isEasingPlaybackScroll && abs(timeline.viewportRect.minX) < 1,
                   "Play begins at the selected cursor without an instantaneous scroll jump")
         wait(0.25)
-        try check(timeline.visibleRect.minX > 0 && !centered(), "Initial playback scroll begins gradually instead of snapping to center (origin: \(timeline.visibleRect.minX), cursor: \(editor.cursor), easing: \(timeline.isEasingPlaybackScroll))")
+        try check(timeline.viewportRect.minX > 0 && !centered(), "Initial playback scroll begins gradually instead of snapping to center (origin: \(timeline.viewportRect.minX), cursor: \(editor.cursor), easing: \(timeline.isEasingPlaybackScroll))")
         wait(0.95)
-        try check(!timeline.isEasingPlaybackScroll && centered(), "After one second the viewport catches the moving playback cursor and resumes centered following")
-        let player = editor.player!, origin = timeline.visibleRect.minX, history = editor.undoStack.count
+        try check(!timeline.isEasingPlaybackScroll && centered(), "After one second the viewport catches the moving playback cursor and resumes centered following (viewport: \(timeline.viewportRect), cursor: \(editor.cursor), easing: \(timeline.isEasingPlaybackScroll), frames: \(transportFrameCount))")
+        let player = editor.player!, origin = timeline.viewportRect.minX, history = editor.undoStack.count
         click(4.75)
-        try check(editor.player === player && editor.isPlaying && abs(player.start - 4.75) < 0.001 && abs(timeline.visibleRect.minX - origin) < 2,
+        try check(editor.player === player && editor.isPlaying && abs(player.start - 4.75) < 0.001 && abs(timeline.viewportRect.minX - origin) < 2,
                   "A live timeline click seeks on the existing engine while the viewport initially stays in place")
         wait(0.12)
         try check(abs(editor.cursor - player.currentTime) < 0.06 && editor.cursor >= 4.75 && timeline.isEasingPlaybackScroll && !centered(),
                   "Audio and marker immediately follow the selected time independently of the one-second scroll")
-        let early = timeline.visibleRect.minX
+        let early = timeline.viewportRect.minX
         wait(0.3)
-        try check(timeline.visibleRect.minX > early && !centered(), "The viewport is still smoothly approaching the moving target midway through the transition")
+        try check(timeline.viewportRect.minX > early && !centered(), "The viewport is still smoothly approaching the moving target midway through the transition")
         wait(0.75)
         try check(centered() && !timeline.isEasingPlaybackScroll && editor.undoStack.count == history,
                   "Live seeking finishes centering after one second without editing project history")
         editor.seek(to: 2)
         wait(0.15)
-        let midway = timeline.visibleRect.minX
+        let midway = timeline.viewportRect.minX
         editor.seek(to: 5)
-        try check(abs(timeline.visibleRect.minX - midway) < 2 && timeline.isEasingPlaybackScroll,
+        try check(abs(timeline.viewportRect.minX - midway) < 2 && timeline.isEasingPlaybackScroll,
                   "Repeated seeking restarts easing from the current viewport without a jump")
         editor.playPause(); wait(0.1)
-        let paused = timeline.visibleRect.minX
+        let paused = timeline.viewportRect.minX
         wait(0.12)
-        try check(!timeline.isEasingPlaybackScroll && abs(timeline.visibleRect.minX - paused) < 0.1,
+        try check(!timeline.isEasingPlaybackScroll && abs(timeline.viewportRect.minX - paused) < 0.1,
                   "Pausing cancels the scroll transition and leaves the viewport at rest")
         editor.seek(to: 2); timeline.movePlayhead(direction: 1); wait(1.1)
         try check(centered() && !timeline.isEasingPlaybackScroll && transportDisplayIsPaused && !editor.isPlaying,

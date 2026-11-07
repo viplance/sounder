@@ -604,23 +604,48 @@ private final class TransportPlayheadView: NSView {
     }
 }
 
-/// Small, opaque pinned surfaces retain their backing images when only their origin moves.
+/// Transparent to the timeline except where it contains a native control.
+/// This is a sibling of the scroll view, so scrolling the document does not
+/// invalidate the geometry and tracking areas of every mixer control.
+private final class TimelineControlsOverlay: NSView {
+    override var isFlipped: Bool { true }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {}
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true; layer?.masksToBounds = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
+    }
+}
+
+/// Paint in document coordinates without moving the AppKit surface.
 private final class TimelinePinnedSurface: NSView {
     var paint: ((NSRect) -> Void)?
+    var documentOrigin = NSPoint.zero
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
     override init(frame: NSRect) { super.init(frame: frame); wantsLayer = true }
     required init?(coder: NSCoder) { fatalError() }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func draw(_ dirtyRect: NSRect) {
+        let dirty = dirtyRect.intersection(bounds)
+        guard !dirty.isEmpty, !dirty.isNull else { return }
         NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current?.cgContext.translateBy(x: -frame.minX, y: -frame.minY)
-        paint?(dirtyRect.offsetBy(dx: frame.minX, dy: frame.minY))
+        NSBezierPath(rect: bounds).addClip()
+        NSGraphicsContext.current?.cgContext.translateBy(x: -documentOrigin.x, y: -documentOrigin.y)
+        paint?(dirty.offsetBy(dx: documentOrigin.x, dy: documentOrigin.y))
         NSGraphicsContext.restoreGraphicsState()
     }
 }
 
 final class Timeline: NSView {
+    private let controlsOverlay = TimelineControlsOverlay(frame: .zero)
+    private let scrollSurface = TimelineScrollSurface(frame: .zero)
+    private var presentationOrigin: NSPoint?
     private let playheadView = TransportPlayheadView(frame: .zero)
     private let sidebarSurface = TimelinePinnedSurface(frame: .zero)
     private let rulerSurface = TimelinePinnedSurface(frame: .zero)
@@ -631,7 +656,7 @@ final class Timeline: NSView {
     private(set) var rasterHitCount = 0
     var usesFragmentRasterCache = true
     var pendingGraphicsJobs: Int { sourceJobs.count + waveformJobs.count }
-    var playheadFrame: NSRect { playheadView.markerFrame }
+    var playheadFrame: NSRect { playheadView.markerFrame.offsetBy(dx: viewportRect.minX, dy: viewportRect.minY) }
     var playheadSurfaceFrame: NSRect { playheadView.frame }
     var playheadIsHidden: Bool { playheadView.markerIsHidden }
     private struct RasterStyle: Equatable {
@@ -671,7 +696,8 @@ final class Timeline: NSView {
                 switch result {
                 case .success(let data):
                     self.editor.audio.cache[key.path] = data
-                    self.setNeedsDisplay(self.visibleRect)
+                    self.invalidateScrollTiles()
+                    self.setNeedsDisplay(self.viewportRect)
                 case .failure(let error):
                     self.failedSources.insert(key); self.editor.error(error)
                 }
@@ -696,11 +722,12 @@ final class Timeline: NSView {
                     guard let self, !cancellation.isCancelled, self.waveformJobs[clip.id]?.0 == key else { return }
                     self.fragmentWaveforms[clip.id] = (key, peaks)
                     self.waveformJobs.removeValue(forKey: clip.id)
+                    self.invalidateScrollTiles()
                     for (row, item) in self.rows.enumerated() {
                         guard let current = self.displayedClips(for: item.0).first(where: { $0.id == clip.id }) else { continue }
                         let dirty = NSRect(x: self.header + current.start * self.editor.zoom - 4,
                                            y: self.ruler + CGFloat(row) * self.rowHeight,
-                                           width: current.duration * self.editor.zoom + 8, height: self.rowHeight).intersection(self.visibleRect)
+                                           width: current.duration * self.editor.zoom + 8, height: self.rowHeight).intersection(self.viewportRect)
                         if !dirty.isNull, !dirty.isEmpty { self.setNeedsDisplay(dirty) }
                     }
                 }
@@ -752,6 +779,7 @@ final class Timeline: NSView {
     private(set) var renamingTrack: UUID?
     private(set) var headerControls: NSView?
     private var scrollObserver: NSObjectProtocol?
+    private var nativeViewportSize = NSSize.zero
     private var controlsTracking: NSTrackingArea?
     private(set) var mixerControls: [UUID: TrackMixerControls] = [:]
     private var followedPlayback = false
@@ -776,7 +804,12 @@ final class Timeline: NSView {
     override var acceptsFirstResponder: Bool { true }
     init(_ editor: Editor) {
         self.editor = editor; super.init(frame: .zero)
-        addSubview(sidebarSurface); addSubview(rulerSurface); addSubview(playheadView); addSubview(nameField)
+        controlsOverlay.addSubview(scrollSurface)
+        controlsOverlay.addSubview(sidebarSurface); controlsOverlay.addSubview(rulerSurface)
+        controlsOverlay.addSubview(playheadView); controlsOverlay.addSubview(nameField)
+        scrollSurface.paint = { [weak self] rect, ruler in
+            if ruler { self?.drawRulerContent(in: rect) } else { self?.draw(rect) }
+        }
         sidebarSurface.paint = { [weak self] in self?.drawTrackHeaders(in: $0) }
         rulerSurface.paint = { [weak self] in self?.drawRuler(in: $0) }
         nameField.font = .systemFont(ofSize: 13, weight: .semibold)
@@ -784,15 +817,43 @@ final class Timeline: NSView {
         nameField.textChanged = { [weak self] in self?.layoutNameField() }
     }
     override var isOpaque: Bool { true }
+    /// Displayed document coordinates; native visibleRect catches up on input.
+    var viewportRect: NSRect { NSRect(origin: presentationOrigin ?? super.visibleRect.origin, size: super.visibleRect.size) }
+    var isPresentingScroll: Bool { presentationOrigin != nil }
+    /// Convert a document point even while only the presentation layers scroll.
+    func convertDocumentPoint(_ point: NSPoint, to view: NSView?) -> NSPoint {
+        convert(NSPoint(x: point.x - viewportRect.minX + super.visibleRect.minX,
+                        y: point.y - viewportRect.minY + super.visibleRect.minY), to: view)
+    }
+    /// Commit at interaction boundaries, not at display cadence. Native controls
+    /// and AppKit drag/autoscroll then use the same coordinates as the pixels.
+    func synchronizeScrollPresentation() {
+        guard let origin = presentationOrigin, let scroll = enclosingScrollView else { return }
+        presentationOrigin = nil; scrollSurface.isHidden = true; rulerSurface.isHidden = false
+        scroll.contentView.scroll(to: origin)
+        scroll.reflectScrolledClipView(scroll.contentView)
+        positionPinnedSurfaces(); positionHeaderControls(updateConfiguration: false)
+        presentPlayhead()
+        window?.invalidateCursorRects(for: self)
+    }
+    private func invalidateScrollTiles() { scrollSurface.invalidateTiles() }
     required init?(coder: NSCoder) { fatalError() }
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
         scrollObserver = nil
-        guard let clip = enclosingScrollView?.contentView else { return }
+        controlsOverlay.removeFromSuperview()
+        guard let scroll = enclosingScrollView else { return }
+        let clip = scroll.contentView
+        nativeViewportSize = clip.bounds.size
         clip.postsBoundsChangedNotifications = true
-        scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
-            guard let self else { return }
+        scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self, weak clip] _ in
+            guard let self, let clip else { return }
+            if self.nativeViewportSize != clip.bounds.size {
+                self.nativeViewportSize = clip.bounds.size
+                self.synchronizeScrollPresentation()
+            }
+            self.presentationOrigin = nil; self.scrollSurface.isHidden = true; self.rulerSurface.isHidden = false
             self.positionPinnedSurfaces()
             self.positionHeaderControls(updateConfiguration: false)
             self.presentPlayhead()
@@ -823,7 +884,10 @@ final class Timeline: NSView {
         }
         if next?.id != hoveredTrackControl?.id || next?.kind != hoveredTrackControl?.kind { hoveredTrackControl = next; sidebarSurface.needsDisplay = true }
     }
-    override func mouseMoved(with event: NSEvent) { updateTrackControlHover(at: convert(event.locationInWindow, from: nil)) }
+    override func mouseMoved(with event: NSEvent) {
+        synchronizeScrollPresentation()
+        updateTrackControlHover(at: convert(event.locationInWindow, from: nil))
+    }
     override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
     override func mouseExited(with event: NSEvent) { updateTrackControlHover(at: nil) }
     private func drawTrackControlHover(_ id: UUID, kind: Int, rect: NSRect) {
@@ -836,20 +900,31 @@ final class Timeline: NSView {
     func installHeaderControls(_ view: NSView) {
         headerControls?.removeFromSuperview(); headerControls = view
         view.translatesAutoresizingMaskIntoConstraints = true
-        addSubview(view)
+        controlsOverlay.addSubview(view)
         positionHeaderControls()
     }
+    func installControlsOverlay(in container: NSView) {
+        container.addSubview(controlsOverlay)
+        positionPinnedSurfaces()
+    }
     private func positionPinnedSurfaces() {
-        let visible = visibleRect
-        let sidebar = NSRect(x: pinnedHeaderX, y: pinnedRulerRect.maxY, width: header, height: max(0, visible.height - ruler))
+        guard let scroll = enclosingScrollView, let container = controlsOverlay.superview else { return }
+        let visible = viewportRect
+        let overlayFrame = container.convert(scroll.contentView.bounds, from: scroll.contentView)
+        if controlsOverlay.frame != overlayFrame { controlsOverlay.frame = overlayFrame }
+        if scrollSurface.frame != controlsOverlay.bounds { scrollSurface.frame = controlsOverlay.bounds }
+        let sidebar = NSRect(x: 0, y: ruler, width: header, height: max(0, visible.height - ruler))
         let oldSidebar = sidebarSurface.frame
         if sidebar != oldSidebar { sidebarSurface.frame = sidebar }
-        if sidebar.minY != oldSidebar.minY || sidebar.size != oldSidebar.size { sidebarSurface.needsDisplay = true }
-        let rulerFrame = NSRect(x: visible.minX, y: visible.minY, width: visible.width, height: ruler)
+        let sidebarOrigin = NSPoint(x: visible.minX, y: visible.minY + ruler)
+        if sidebarSurface.documentOrigin.y != sidebarOrigin.y || sidebar.size != oldSidebar.size { sidebarSurface.needsDisplay = true }
+        sidebarSurface.documentOrigin = sidebarOrigin
+        let rulerFrame = NSRect(x: 0, y: 0, width: visible.width, height: ruler)
         if rulerSurface.frame != rulerFrame { rulerSurface.frame = rulerFrame; rulerSurface.needsDisplay = true }
+        if rulerSurface.documentOrigin != visible.origin { rulerSurface.documentOrigin = visible.origin; rulerSurface.needsDisplay = true }
     }
     private func positionHeaderControls(updateConfiguration: Bool = true) {
-        let rect = NSRect(x: pinnedHeaderX, y: pinnedRulerRect.minY, width: header, height: ruler)
+        let rect = NSRect(x: 0, y: 0, width: header, height: ruler)
         if headerControls?.frame != rect { headerControls?.frame = rect }
         positionMixerControls(updateConfiguration: updateConfiguration)
     }
@@ -859,14 +934,15 @@ final class Timeline: NSView {
         for (row, item) in rows.enumerated() {
             let (track, depth) = item
             let control = mixerControls[track.id] ?? TrackMixerControls(track: track, editor: editor)
-            if control.superview == nil { addSubview(control); mixerControls[track.id] = control }
+            if control.superview == nil { controlsOverlay.addSubview(control); mixerControls[track.id] = control }
             let y = ruler + CGFloat(row) * rowHeight
             let rect = NSRect(x: pinnedHeaderX, y: y, width: header, height: rowHeight)
-                .intersection(NSRect(x: pinnedHeaderX, y: pinnedRulerRect.maxY, width: header, height: max(0, visibleRect.maxY - pinnedRulerRect.maxY)))
+                .intersection(NSRect(x: pinnedHeaderX, y: pinnedRulerRect.maxY, width: header, height: max(0, viewportRect.maxY - pinnedRulerRect.maxY)))
             control.isHidden = rect.isEmpty || rect.isNull
             guard !control.isHidden else { continue }
-            let needsLayout = updateConfiguration || control.frame.size != rect.size || control.frame.minY != rect.minY
-            if control.frame != rect { control.frame = rect }
+            let localRect = rect.offsetBy(dx: -viewportRect.minX, dy: -viewportRect.minY)
+            let needsLayout = updateConfiguration || control.frame.size != localRect.size || control.frame.minY != localRect.minY
+            if control.frame != localRect { control.frame = localRect }
             if needsLayout {
                 let offset = y - rect.minY
                 let first = trackMuteRect(row: row, depth: depth)
@@ -883,15 +959,15 @@ final class Timeline: NSView {
         if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
         waveformJobs.values.forEach { $0.1.cancel() }; sourceJobs.values.forEach { $0.cancel() }
     }
-    var pinnedRulerRect: NSRect { NSRect(x: 0, y: max(0, visibleRect.minY), width: bounds.width, height: ruler) }
-    var pinnedHeaderX: CGFloat { max(0, visibleRect.minX) }
+    var pinnedRulerRect: NSRect { NSRect(x: 0, y: max(0, viewportRect.minY), width: bounds.width, height: ruler) }
+    var pinnedHeaderX: CGFloat { max(0, viewportRect.minX) }
     var fragmentLeft: CGFloat { pinnedHeaderX + header }
     var visibleFragmentRect: NSRect {
-        let visible = visibleRect
+        let visible = viewportRect
         return NSRect(x: fragmentLeft, y: visible.minY, width: max(0, visible.width - header), height: visible.height)
     }
     var visibleTrackRect: NSRect {
-        let visible = visibleRect, top = pinnedRulerRect.maxY
+        let visible = viewportRect, top = pinnedRulerRect.maxY
         return NSRect(x: visible.minX, y: top, width: visible.width, height: max(0, visible.maxY - top))
     }
     func isTrackPoint(_ point: NSPoint) -> Bool { point.y >= ruler && !pinnedRulerRect.contains(point) }
@@ -907,7 +983,7 @@ final class Timeline: NSView {
     private func previewTrackMove(at point: NSPoint) {
         guard let source = trackDrag, let baseline = trackDragRows else { return }
         trackPreview = nil
-        guard isTrackPoint(point), visibleRect.contains(point) else { refresh(); return }
+        guard isTrackPoint(point), viewportRect.contains(point) else { refresh(); return }
         let tracks = baseline.map { $0.0 }
         var movingIDs: Set<UUID> = [source]
         var count = 0
@@ -951,6 +1027,8 @@ final class Timeline: NSView {
         refresh()
     }
     func refresh() {
+        synchronizeScrollPresentation()
+        invalidateScrollTiles()
         structureRefreshCount += 1
         rows = orderedRows(trackPreview ?? editor.project.tracks)
         let retained = Set(editor.project.tracks.flatMap(\.clips).map(\.id)).union(fragmentCopyPreviews.values.map(\.id))
@@ -978,7 +1056,7 @@ final class Timeline: NSView {
         let requested = lastPlaybackScrollRequest != editor.playbackScrollRequest
         lastPlaybackScrollRequest = editor.playbackScrollRequest
         if requested, editor.isPlaying, !editor.isShuttling, !editor.isRecording {
-            playbackScroll = PlaybackScroll(startedAt: ProcessInfo.processInfo.systemUptime, origin: visibleRect.minX)
+            playbackScroll = PlaybackScroll(startedAt: ProcessInfo.processInfo.systemUptime, origin: viewportRect.minX)
         }
         if editor.isShuttling || editor.isRecording { playbackScroll = nil }
         if followsPlayback { pausedScrollCursor = nil; followPlayhead() }
@@ -1012,14 +1090,15 @@ final class Timeline: NSView {
         guard editor.isRecording, let row = rows.firstIndex(where: { $0.0.id == editor.recordingTrack }) else { previousRecordingRect = nil; return }
         let rect = NSRect(x: header + editor.recordingStart * editor.zoom - 2, y: ruler + CGFloat(row) * rowHeight,
                           width: max(14, (editor.recordingEnd - editor.recordingStart) * editor.zoom + 4), height: rowHeight)
-        let dirty = (previousRecordingRect.map { $0.union(rect) } ?? rect).intersection(visibleRect)
+        let dirty = (previousRecordingRect.map { $0.union(rect) } ?? rect).intersection(viewportRect)
         if !dirty.isNull, !dirty.isEmpty { setNeedsDisplay(dirty) }
         previousRecordingRect = rect
     }
     private func presentPlayhead() {
         let x = header + editor.cursor * editor.zoom
-        playheadView.present(x: x, viewport: visibleFragmentRect, color: editor.isRecording ? .systemRed : accent,
-                             visible: x >= fragmentLeft && x <= visibleRect.maxX)
+        let viewport = viewportRect
+        playheadView.present(x: x - viewport.minX, viewport: visibleFragmentRect.offsetBy(dx: -viewport.minX, dy: -viewport.minY), color: editor.isRecording ? .systemRed : accent,
+                             visible: x >= fragmentLeft && x <= viewportRect.maxX)
     }
     func presentTransportFrame() {
         presentingTransport = true
@@ -1039,7 +1118,12 @@ final class Timeline: NSView {
                 }
             } else { followPlayhead() }
         } else if playbackScroll != nil { followPlayhead() }
+        if isPresentingScroll {
+            sidebarSurface.documentOrigin.x = viewportRect.minX
+            scrollSurface.present(viewport: viewportRect, headerWidth: header, rulerHeight: ruler)
+        }
         presentPlayhead()
+        if let cursor = presentationCursor, NSCursor.current !== cursor { cursor.set() }
     }
     func clipRect(_ clip: Clip, row: Int, layer: Int) -> NSRect {
         NSRect(x: header + clip.start * editor.zoom, y: ruler + CGFloat(row) * rowHeight + 8 + CGFloat(min(layer, 4)) * 2, width: max(2, clip.duration * editor.zoom), height: rowHeight - 16 - CGFloat(min(layer, 4)) * 2)
@@ -1271,16 +1355,15 @@ final class Timeline: NSView {
         guard let range = editor.range else { return [] }
         return [range.lowerBound, range.upperBound].map {
             NSRect(x: header + $0 * editor.zoom - 5, y: pinnedRulerRect.minY, width: 10, height: ruler)
-                .intersection(NSRect(x: fragmentLeft, y: pinnedRulerRect.minY, width: max(0, visibleRect.width - header), height: ruler))
+                .intersection(NSRect(x: fragmentLeft, y: pinnedRulerRect.minY, width: max(0, viewportRect.width - header), height: ruler))
         }
     }
     var canSelectRange: Bool { !editor.isRecording && !editor.requestingMic && !editor.isImporting }
-    override func resetCursorRects() {
-        super.resetCursorRects()
+    private func enumerateCursorRects(_ add: (NSRect, NSCursor) -> Void) {
         if canSelectRange {
             for rect in rangeHandleRects() {
-                let visible = rect.intersection(visibleRect)
-                if !visible.isEmpty { addCursorRect(visible, cursor: .resizeLeftRight) }
+                let visible = rect.intersection(viewportRect)
+                if !visible.isEmpty { add(visible, .resizeLeftRight) }
             }
         }
         for (row, item) in rows.enumerated() {
@@ -1308,7 +1391,7 @@ final class Timeline: NSView {
                                     .filter { !$0.isEmpty }
                             }
                         }
-                        for rect in exposed where !rect.isEmpty { addCursorRect(rect, cursor: cursor) }
+                        for rect in exposed where !rect.isEmpty { add(rect, cursor) }
                     }
                 }
             }
@@ -1317,9 +1400,27 @@ final class Timeline: NSView {
                                    (trackMuteRect(row: row, depth: depth), NSCursor.arrow),
                                    (trackSoloRect(row: row, depth: depth), NSCursor.arrow)] {
                 let visible = rect.intersection(visibleTrackRect)
-                if !visible.isEmpty && (!editor.busy || ((rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isImporting)) { addCursorRect(visible, cursor: cursor) }
+                if !visible.isEmpty && (!editor.busy || ((rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isImporting)) { add(visible, cursor) }
             }
         }
+    }
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        enumerateCursorRects { addCursorRect($0, cursor: $1) }
+    }
+    var presentationCursor: NSCursor? {
+        guard isPresentingScroll, let window, window.isKeyWindow else { return nil }
+        let native = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        let point = NSPoint(x: native.x + viewportRect.minX - super.visibleRect.minX,
+                            y: native.y + viewportRect.minY - super.visibleRect.minY)
+        guard visibleFragmentRect.contains(point) else { return nil }
+        if editor.busy {
+            return canSelectRange && rangeHandleRects().contains(where: { $0.contains(point) }) ? .resizeLeftRight : .arrow
+        }
+        guard point.y < ruler + CGFloat(rows.count) * rowHeight || pinnedRulerRect.contains(point) else { return .arrow }
+        var cursor = NSCursor.arrow
+        enumerateCursorRects { rect, candidate in if rect.contains(point) { cursor = candidate } }
+        return cursor
     }
     func renameTrack(_ id: UUID) {
         guard !editor.busy, let index = editor.project.tracks.firstIndex(where: { $0.id == id }) else { return }
@@ -1345,7 +1446,7 @@ final class Timeline: NSView {
         guard visibleTrackRect.contains(frame) else {
             nameField.finish(commit: true); renamingTrack = nil; return
         }
-        nameField.frame = frame
+        nameField.frame = frame.offsetBy(dx: -viewportRect.minX, dy: -viewportRect.minY)
     }
     func drawWaveform(_ peaks: [Float], partialPeak: Float? = nil, sampleRate: Double, offset: Double, gain: Double = 1, fragment: Clip? = nil, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
         let top = rect.minY + 1, bottom = rect.maxY - 1
@@ -1449,7 +1550,7 @@ final class Timeline: NSView {
             NSBezierPath(rect: visibleFragmentRect.intersection(visibleTrackRect)).addClip()
             let x = header + fragmentSnapTime * editor.zoom
             let guide = NSBezierPath(); guide.move(to: NSPoint(x: x, y: pinnedRulerRect.maxY))
-            guide.line(to: NSPoint(x: x, y: visibleRect.maxY))
+            guide.line(to: NSPoint(x: x, y: viewportRect.maxY))
             guide.lineWidth = 1.5; guide.setLineDash([4, 4], count: 2, phase: 0)
             NSColor.white.withAlphaComponent(0.9).setStroke(); guide.stroke()
             NSGraphicsContext.restoreGraphicsState()
@@ -1567,6 +1668,7 @@ final class Timeline: NSView {
         line(NSPoint(x: fragmentLeft, y: ruler), NSPoint(x: fragmentLeft, y: bounds.height), .white.withAlphaComponent(0.10))
     }
     func rulerTicks(in rect: NSRect) -> [TempoTick] {
+        guard !rect.isEmpty, rect.minX.isFinite, rect.maxX.isFinite else { return [] }
         let start = max(0, (rect.minX - header) / editor.zoom)
         let end = max(start, (rect.maxX - header) / editor.zoom)
         if editor.project.tempoMode { return TempoGrid.ticks(from: start, to: end, zoom: editor.zoom, bpm: editor.project.tempo) }
@@ -1576,9 +1678,16 @@ final class Timeline: NSView {
         }
     }
     private func drawRuler(in dirtyRect: NSRect) {
-        let rect = pinnedRulerRect, top = rect.minY
+        let rect = pinnedRulerRect
         fill(rect, panelColor)
         NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: visibleFragmentRect).addClip()
+        drawRulerContent(in: dirtyRect)
+        NSGraphicsContext.restoreGraphicsState()
+        fill(NSRect(x: pinnedHeaderX, y: rect.minY, width: header, height: ruler), panelColor)
+    }
+    private func drawRulerContent(in dirtyRect: NSRect) {
+        let rect = pinnedRulerRect, top = rect.minY
+        fill(NSRect(x: dirtyRect.minX, y: top, width: dirtyRect.width, height: ruler), panelColor)
         if let range = editor.range {
             fill(NSRect(x: header + range.lowerBound * editor.zoom, y: top, width: (range.upperBound - range.lowerBound) * editor.zoom, height: ruler), accent.withAlphaComponent(0.09))
         }
@@ -1603,8 +1712,6 @@ final class Timeline: NSView {
             let x = header + start * editor.zoom
             line(NSPoint(x: x, y: rect.maxY - 15), NSPoint(x: x, y: rect.maxY), .systemOrange, width: 2)
         }
-        NSGraphicsContext.restoreGraphicsState()
-        fill(NSRect(x: pinnedHeaderX, y: top, width: header, height: ruler), panelColor)
     }
     private func timelineTime(at point: NSPoint, flags: NSEvent.ModifierFlags) -> Double {
         let time = max(0, (point.x - header) / editor.zoom)
@@ -1619,6 +1726,7 @@ final class Timeline: NSView {
         editor.update()
     }
     override func mouseDown(with event: NSEvent) {
+        synchronizeScrollPresentation()
         window?.makeFirstResponder(self)
         pendingFragmentClick = nil; pendingShiftFragmentClick = nil; lastFragmentDragPoint = nil; didResizeFragment = false
         let point = convert(event.locationInWindow, from: nil)
@@ -1747,12 +1855,13 @@ final class Timeline: NSView {
     }
     private func autoscrollRange(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let horizontalPoint = NSPoint(x: point.x, y: visibleRect.midY)
+        let horizontalPoint = NSPoint(x: point.x, y: viewportRect.midY)
         if let horizontalEvent = NSEvent.mouseEvent(with: .leftMouseDragged, location: convert(horizontalPoint, to: nil), modifierFlags: event.modifierFlags, timestamp: event.timestamp, windowNumber: event.windowNumber, context: nil, eventNumber: event.eventNumber, clickCount: event.clickCount, pressure: event.pressure) {
             autoscroll(with: horizontalEvent)
         }
     }
     override func mouseDragged(with event: NSEvent) {
+        synchronizeScrollPresentation()
         let p = convert(event.locationInWindow, from: nil)
         if fadeDrag != nil {
             guard !editor.busy else { cancelFragmentResize(); return }
@@ -1796,11 +1905,12 @@ final class Timeline: NSView {
             updateFragmentMove(at: p, flags: event.modifierFlags)
         }
         if trackDrag != nil {
-            let point = NSPoint(x: visibleRect.midX, y: p.y)
+            let point = NSPoint(x: viewportRect.midX, y: p.y)
             if let verticalEvent = NSEvent.mouseEvent(with: .leftMouseDragged, location: convert(point, to: nil), modifierFlags: event.modifierFlags, timestamp: event.timestamp, windowNumber: event.windowNumber, context: nil, eventNumber: event.eventNumber, clickCount: event.clickCount, pressure: event.pressure) { autoscroll(with: verticalEvent) }
         } else { autoscroll(with: event) }
     }
     override func mouseUp(with event: NSEvent) {
+        synchronizeScrollPresentation()
         let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
         if let drag = fadeDrag {
             if !editor.busy, didDragFade {
@@ -1903,7 +2013,16 @@ final class Timeline: NSView {
     private func scrollHorizontally(to requested: CGFloat) {
         guard let scroll = enclosingScrollView else { return }
         let origin = min(max(0, frame.width - scroll.contentSize.width), max(0, requested))
-        guard abs(scroll.contentView.bounds.minX - origin) > 0.001 else { return }
+        guard abs(viewportRect.minX - origin) > 0.001 else { return }
+        if presentingTransport && !editor.isRecording && !selectingRange && dragClip == nil && trackDrag == nil && marqueeAnchor == nil && renamingTrack == nil {
+            presentationOrigin = NSPoint(x: origin, y: viewportRect.minY)
+            if !rulerSurface.isHidden { rulerSurface.isHidden = true }
+            if frame.width > scroll.contentSize.width {
+                scroll.horizontalScroller?.doubleValue = Double(origin / (frame.width - scroll.contentSize.width))
+            }
+            return
+        }
+        synchronizeScrollPresentation()
         scroll.contentView.scroll(to: NSPoint(x: origin, y: scroll.contentView.bounds.minY))
         scroll.reflectScrolledClipView(scroll.contentView)
     }
@@ -1921,13 +2040,13 @@ final class Timeline: NSView {
     }
     func movePlayhead(direction: Double) {
         guard canSelectRange else { return }
-        let visible = visibleRect
+        let visible = viewportRect
         let fragmentWidth = max(0, visible.width - header)
         guard fragmentWidth > 0 else { return }
         let step = Double(fragmentWidth) / editor.zoom * 0.01
         let position = editor.player?.seekPosition ?? editor.cursor
         let paused = !editor.isPlaying && !editor.isShuttling
-        let origin = visibleRect.minX
+        let origin = viewportRect.minX
         steppingPausedCursor = paused
         editor.seek(to: position + direction * step)
         steppingPausedCursor = false
@@ -1971,6 +2090,7 @@ final class Timeline: NSView {
         if (NSApp.delegate as? AppDelegate)?.handleShuttleShortcut(event) != true { super.keyUp(with: event) }
     }
     override func menu(for event: NSEvent) -> NSMenu? {
+        synchronizeScrollPresentation()
         guard !editor.busy else { return nil }
         let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
         guard isTrackPoint(p), row >= 0 else { return nil }

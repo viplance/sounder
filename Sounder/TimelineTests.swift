@@ -50,7 +50,7 @@ extension AppDelegate {
             guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
         }
         func event(_ type: NSEvent.EventType, point: NSPoint) -> NSEvent {
-            NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
         }
         func send(_ type: NSEvent.EventType, time: Double) {
             let point = NSPoint(x: timeline.header + time * editor.zoom, y: timeline.pinnedRulerRect.midY)
@@ -66,16 +66,16 @@ extension AppDelegate {
         }
         editor.zoom = 140; refresh(); window.contentView?.layoutSubtreeIfNeeded()
         scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
-        let headerBefore = timeline.convert(timeline.trackMuteRect(row: 6, depth: 0).origin, to: window.contentView)
-        let before = timeline.convert(NSPoint(x: 0, y: timeline.pinnedRulerRect.minY), to: window.contentView)
-        let clipBefore = timeline.convert(NSPoint(x: 0, y: timeline.clipRect(source, row: 0, layer: 0).minY), to: window.contentView)
+        let headerBefore = timeline.convertDocumentPoint(timeline.trackMuteRect(row: 6, depth: 0).origin, to: window.contentView)
+        let before = timeline.convertDocumentPoint(NSPoint(x: 0, y: timeline.pinnedRulerRect.minY), to: window.contentView)
+        let clipBefore = timeline.convertDocumentPoint(NSPoint(x: 0, y: timeline.clipRect(source, row: 0, layer: 0).minY), to: window.contentView)
         let hiddenMute = timeline.trackMuteRect(row: 4, depth: 0)
         let scrollY = floor(hiddenMute.midY - timeline.ruler / 2)
         scroll.contentView.scroll(to: NSPoint(x: 0, y: scrollY)); scroll.reflectScrolledClipView(scroll.contentView)
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
-        let after = timeline.convert(NSPoint(x: 0, y: timeline.pinnedRulerRect.minY), to: window.contentView)
-        let clipAfter = timeline.convert(NSPoint(x: 0, y: timeline.clipRect(source, row: 0, layer: 0).minY), to: window.contentView)
-        print("Scroll geometry: ruler \(before.y) → \(after.y), fragment \(clipBefore.y) → \(clipAfter.y), bounds \(scroll.contentView.bounds), visible \(timeline.visibleRect)")
+        let after = timeline.convertDocumentPoint(NSPoint(x: 0, y: timeline.pinnedRulerRect.minY), to: window.contentView)
+        let clipAfter = timeline.convertDocumentPoint(NSPoint(x: 0, y: timeline.clipRect(source, row: 0, layer: 0).minY), to: window.contentView)
+        print("Scroll geometry: ruler \(before.y) → \(after.y), fragment \(clipBefore.y) → \(clipAfter.y), bounds \(scroll.contentView.bounds), visible \(timeline.viewportRect)")
         try check(abs(before.y - after.y) < 0.01 && abs(abs(clipBefore.y - clipAfter.y) - scrollY) < 0.01, "Vertical scrolling moves fragments while the ruler stays at the same window position")
         let mutedBefore = editor.project.tracks[4].muted
         let covered = NSPoint(x: hiddenMute.midX, y: timeline.pinnedRulerRect.midY)
@@ -86,16 +86,16 @@ extension AppDelegate {
         send(.leftMouseDown, time: 1); send(.leftMouseDragged, time: 3); send(.leftMouseUp, time: 3)
         try check(editor.range == 1...3 && editor.cursor == 2.5 && abs(scroll.contentView.bounds.minY - scrollY) < 0.01, "Pinned range selection preserves the cursor and does not vertically autoscroll")
         send(.leftMouseDown, time: 3); send(.leftMouseDragged, time: 4); send(.leftMouseUp, time: 4)
-        try check(editor.range == 1...4 && timeline.rangeHandleRects().allSatisfy { abs($0.minY - timeline.visibleRect.minY) < 0.01 }, "Range edges remain draggable on the pinned ruler")
+        try check(editor.range == 1...4 && timeline.rangeHandleRects().allSatisfy { abs($0.minY - timeline.viewportRect.minY) < 0.01 }, "Range edges remain draggable on the pinned ruler")
         scroll.contentView.scroll(to: NSPoint(x: 160, y: scrollY)); scroll.reflectScrolledClipView(scroll.contentView)
         send(.leftMouseDown, time: 5); send(.leftMouseUp, time: 5)
-        let rulerX = timeline.convert(NSPoint(x: timeline.header + source.start * editor.zoom, y: timeline.pinnedRulerRect.midY), to: window.contentView).x
-        let fragmentX = timeline.convert(NSPoint(x: timeline.clipRect(source, row: 0, layer: 0).minX, y: 0), to: window.contentView).x
+        let rulerX = timeline.convertDocumentPoint(NSPoint(x: timeline.header + source.start * editor.zoom, y: timeline.pinnedRulerRect.midY), to: window.contentView).x
+        let fragmentX = timeline.convertDocumentPoint(NSPoint(x: timeline.clipRect(source, row: 0, layer: 0).minX, y: 0), to: window.contentView).x
         try check(editor.cursor == 5 && abs(rulerX - fragmentX) < 0.01, "Horizontal scrolling keeps ruler times aligned with fragment positions")
         // Keep the sidebar fixed even after scrolling farther than its full width.
         scroll.contentView.scroll(to: NSPoint(x: 640, y: scrollY)); scroll.reflectScrolledClipView(scroll.contentView)
         let muteRect = timeline.trackMuteRect(row: 6, depth: 0)
-        let headerAfter = timeline.convert(muteRect.origin, to: window.contentView)
+        let headerAfter = timeline.convertDocumentPoint(muteRect.origin, to: window.contentView)
         try check(abs(headerBefore.x - headerAfter.x) < 0.01 && abs(abs(headerBefore.y - headerAfter.y) - scrollY) < 0.01, "Track controls stay fixed horizontally and follow tracks vertically")
         let oldCursor = editor.cursor, wasMuted = editor.project.tracks[6].muted
         let mutePoint = NSPoint(x: muteRect.midX, y: muteRect.midY)
@@ -110,12 +110,12 @@ extension AppDelegate {
         try check(timeline.menu(for: event(.rightMouseDown, point: blankPoint))?.items.first?.title == "Add track", "Blank pinned sidebar still offers Add track after horizontal scrolling")
         let cursorBeforeArrow = editor.cursor
         timeline.movePlayhead(direction: 1)
-        try check(abs(editor.cursor - cursorBeforeArrow - (timeline.visibleRect.width - timeline.header) / editor.zoom * 0.01) < 0.00001, "Arrow seeking measures only the visible fragment area beside the pinned sidebar")
+        try check(abs(editor.cursor - cursorBeforeArrow - (timeline.viewportRect.width - timeline.header) / editor.zoom * 0.01) < 0.00001, "Arrow seeking measures only the visible fragment area beside the pinned sidebar")
         editor.cursor = 10; timeline.centerOnPlayhead()
         let cursorX = timeline.header + editor.cursor * editor.zoom
         try check(abs(cursorX - timeline.visibleFragmentRect.midX) < 1, "Zoom centering accounts for the pinned sidebar after horizontal scrolling")
         editor.toggleTempoMode()
-        let ticks = timeline.rulerTicks(in: timeline.visibleRect)
+        let ticks = timeline.rulerTicks(in: timeline.viewportRect)
         try check(editor.project.tempoMode && ticks.contains { $0.isBar && !$0.label.isEmpty }, "Pinned ruler supports the 4/4 tempo grid after vertical and horizontal scrolling")
         editor.dirty = false; refresh()
     }
@@ -132,7 +132,7 @@ extension AppDelegate {
             NSPoint(x: timeline.pinnedHeaderX + 165, y: timeline.ruler + (CGFloat(row) + fraction) * timeline.rowHeight)
         }
         func send(_ type: NSEvent.EventType, _ point: NSPoint) {
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             if type == .leftMouseDown { timeline.mouseDown(with: event) }
             else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
             else { timeline.mouseUp(with: event) }
@@ -200,7 +200,7 @@ extension AppDelegate {
             NSPoint(x: timeline.header + time * editor.zoom, y: timeline.ruler + row * timeline.rowHeight + offset)
         }
         func send(_ type: NSEvent.EventType, _ p: NSPoint, shift: Bool = false) {
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(p, to: nil), modifierFlags: shift ? [.shift] : [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(p, to: nil), modifierFlags: shift ? [.shift] : [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             if type == .leftMouseDown { timeline.mouseDown(with: event) }
             else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
             else { timeline.mouseUp(with: event) }
@@ -262,7 +262,7 @@ extension AppDelegate {
         func current() -> Clip { editor.project.tracks[0].clips[0] }
         func send(_ type: NSEvent.EventType, x: CGFloat, y: CGFloat? = nil) {
             let point = NSPoint(x: x, y: y ?? timeline.clipRect(clip, row: 0, layer: 0).midY)
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             if type == .leftMouseDown { timeline.mouseDown(with: event) }
             else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
             else { timeline.mouseUp(with: event) }
@@ -315,14 +315,14 @@ extension AppDelegate {
         func send(_ type: NSEvent.EventType, proposed: Double, row: Int) {
             let point = NSPoint(x: timeline.header + (proposed + moving.duration / 2) * editor.zoom,
                                 y: timeline.ruler + CGFloat(row) * timeline.rowHeight + 30)
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             if type == .leftMouseDown { timeline.mouseDown(with: event) }
             else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
             else { timeline.mouseUp(with: event) }
         }
         func liveStart() -> Double { editor.project.tracks[0].clips[0].start }
         let tolerance = timeline.fragmentSnapTolerance
-        try check(abs(tolerance - (timeline.visibleRect.width - timeline.header) / editor.zoom * 0.01) < 1e-9, "Snap tolerance uses one percent of visible time excluding the pinned sidebar")
+        try check(abs(tolerance - (timeline.viewportRect.width - timeline.header) / editor.zoom * 0.01) < 1e-9, "Snap tolerance uses one percent of visible time excluding the pinned sidebar")
         let history = editor.undoStack.count
         send(.leftMouseDown, proposed: 2, row: 0)
         send(.leftMouseDragged, proposed: 2 + tolerance / 2, row: 1)
@@ -370,7 +370,7 @@ extension AppDelegate {
         func send(_ type: NSEvent.EventType, time: Double, row: Int, shift: Bool = false, command: Bool = false) {
             let point = NSPoint(x: timeline.header + time * editor.zoom, y: timeline.ruler + CGFloat(row) * timeline.rowHeight + 30)
             var flags: NSEvent.ModifierFlags = []; if shift { flags.insert(.shift) }; if command { flags.insert(.command) }
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             if type == .leftMouseDown { timeline.mouseDown(with: event) }
             else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
             else { timeline.mouseUp(with: event) }
@@ -441,7 +441,7 @@ extension AppDelegate {
         timeline.enclosingScrollView?.contentView.scroll(to: .zero)
         func menu(time: Double, y: CGFloat) -> NSMenu? {
             let point = NSPoint(x: timeline.header + time * editor.zoom, y: y)
-            let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             return timeline.menu(for: event)
         }
         func perform(_ item: NSMenuItem) { _ = NSApp.sendAction(item.action!, to: item.target, from: item) }
@@ -613,7 +613,7 @@ extension AppDelegate {
         editor.selection = [a.id, b.id]; refresh()
         func menu() throws -> NSMenu {
             let point = NSPoint(x: timeline.header + (a.start + 1) * editor.zoom, y: timeline.ruler + 30)
-            let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             guard let menu = timeline.menu(for: event) else { throw SounderError.message("No fragment context menu") }; return menu
         }
         let history = editor.undoStack.count, messages = editor.notifications.messages.count
@@ -649,7 +649,7 @@ extension AppDelegate {
         }
         let point = NSPoint(x: timeline.header + (clip.start + 1) * editor.zoom, y: timeline.ruler + 30)
         func event(_ type: NSEvent.EventType, clicks: Int) -> NSEvent {
-            NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
+            NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
         }
         timeline.mouseDown(with: event(.leftMouseDown, clicks: 1)); timeline.mouseUp(with: event(.leftMouseUp, clicks: 1))
         guard opened == 0 else { throw SounderError.message("A single click unexpectedly opened fragment settings") }
@@ -692,10 +692,10 @@ extension AppDelegate {
             let point = NSPoint(x: timeline.header + time * editor.zoom, y: timeline.ruler + 30)
             var flags: NSEvent.ModifierFlags = []; if shift { flags.insert(.shift) }; if command { flags.insert(.command) }
             if type == .flagsChanged {
-                let event = NSEvent.keyEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56)!
+                let event = NSEvent.keyEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 56)!
                 timeline.flagsChanged(with: event); return
             }
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             if type == .leftMouseDown { timeline.mouseDown(with: event) }
             else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
             else { timeline.mouseUp(with: event) }
@@ -756,7 +756,7 @@ extension AppDelegate {
             guard solo.minX > timeline.trackMuteRect(row: row, depth: row).maxX,
                   solo.maxX < timeline.trackFXRect(row: row, depth: row).minX,
                   timeline.trackFXRect(row: row, depth: row).maxX < timeline.fragmentLeft else { throw SounderError.message("Solo/Mute/FX overlap in nested headers") }
-            let point = timeline.convert(NSPoint(x: solo.midX, y: solo.midY), to: nil)
+            let point = timeline.convertDocumentPoint(NSPoint(x: solo.midX, y: solo.midY), to: nil)
             let event = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             timeline.mouseDown(with: event)
             guard editor.project.tracks[row].solo else { throw SounderError.message("Solo button did not activate") }
@@ -767,7 +767,7 @@ extension AppDelegate {
         let messages = editor.notifications.messages.count
         for row in 0..<3 {
             let rect = timeline.trackSoloRect(row: row, depth: row)
-            let event = NSEvent.mouseEvent(with: .leftMouseDown, location: timeline.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: .leftMouseDown, location: timeline.convertDocumentPoint(NSPoint(x: rect.midX, y: rect.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             timeline.mouseDown(with: event)
             guard !editor.project.tracks[row].solo, editor.isPlaying, editor.player === playback else { throw SounderError.message("Solo must toggle during playback without replacing the stream") }
         }
@@ -793,7 +793,7 @@ extension AppDelegate {
         scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
         func clip() -> Clip { editor.project.tracks[0].clips.first { $0.id == a.id }! }
         func send(_ type: NSEvent.EventType, _ point: NSPoint) {
-            let event = NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            let event = NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
             if type == .leftMouseDown { timeline.mouseDown(with: event) }
             else if type == .leftMouseDragged { timeline.mouseDragged(with: event) }
             else { timeline.mouseUp(with: event) }
@@ -848,7 +848,7 @@ extension AppDelegate {
         let rect = timeline.clipRect(clip(), row: 0, layer: 0)
         let area = timeline.fragmentFadeRects(clip(), in: rect)[0]
         let point = NSPoint(x: area.midX, y: area.midY)
-        let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let event = NSEvent.mouseEvent(with: .rightMouseDown, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
         guard let menu = timeline.menu(for: event) else { throw SounderError.message("Fade curve menu did not open") }
         try check(menu.items.count == 4 && menu.items.allSatisfy { $0.image != nil && $0.title.isEmpty && $0.state == .off }, "Right-click fade area shows only graphical icons without titles or selection checkmarks")
         menu.performActionForItem(at: 3)
@@ -1037,8 +1037,10 @@ extension AppDelegate {
         refresh()
         let first = timeline.rows[0].0.id
         guard let controls = timeline.mixerControls[first] else { throw SounderError.message("Track sliders were not installed") }
+        let content = window.contentView!
+        let fxHit = content.hitTest(controls.fx.convert(NSPoint(x: controls.fx.bounds.midX, y: controls.fx.bounds.midY), to: content.superview))
         guard controls.fx.target === controls.fx, masterFXButton.target === masterFXButton,
-              timeline.hitTest(controls.fx.convert(NSPoint(x: controls.fx.bounds.midX, y: controls.fx.bounds.midY), to: timeline.superview)) === controls.fx else { throw SounderError.message("Track FX hit testing failed: track target=\(controls.fx.target === controls.fx), master target=\(masterFXButton.target === masterFXButton), frame=\(controls.fx.frame), power=\(controls.fx.power.frame), hit=\(String(describing: timeline.hitTest(controls.fx.convert(NSPoint(x: controls.fx.bounds.midX, y: controls.fx.bounds.midY), to: timeline.superview)))))") }
+              fxHit === controls.fx else { throw SounderError.message("Track FX hit testing failed: \(String(describing: fxHit))") }
         controls.fx.performClick(nil)
         guard let rack = editor.effectsWindows[first], editor.selectedTrack == first else { throw SounderError.message("Shared track FX button did not open its own effect chain") }
         rack.done(); window.makeKeyAndOrderFront(nil)
@@ -1228,7 +1230,9 @@ extension AppDelegate {
         clipView.scroll(to: NSPoint(x: 0, y: contentY)); timeline.enclosingScrollView!.reflectScrolledClipView(clipView)
         refresh()
         for view in timeline.mixerControls.values where !view.isHidden {
-            guard view.frame.minY >= timeline.pinnedRulerRect.maxY else { throw SounderError.message("A track slider covers the pinned ruler") }
+            let corner = timeline.headerControls!
+            let rulerBottom = corner.convert(corner.bounds, to: view.superview).maxY
+            guard view.frame.minY >= rulerBottom else { throw SounderError.message("A track slider covers the pinned ruler") }
         }
         clipView.scroll(to: .zero); refresh()
         print("PASS: Native track sliders fit under MUTE/SOLO/FX, Pan is vertical, controls remain pinned and clipped, live changes retain transport, and dragging is one Undo")

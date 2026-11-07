@@ -48,6 +48,29 @@ final class NumericInputFormatter: Formatter {
     }
 }
 
+/// AppKit forwards unhandled cursor updates here, including updates caused by
+/// scrolling under a stationary mouse. Do not reinstall the default cursor.
+final class EditorContentView: NSView {
+    var canvasCursor: (() -> NSCursor?)?
+    override func cursorUpdate(with event: NSEvent) {
+        let cursor = canvasCursor?() ?? NSCursor.arrow
+        if NSCursor.current !== cursor { cursor.set() }
+    }
+}
+
+final class EditorWindow: NSWindow {
+    var prepareForPointerEvent: (() -> Void)?
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseDragged,
+             .rightMouseDragged, .otherMouseDragged, .mouseMoved, .scrollWheel:
+            prepareForPointerEvent?()
+        default: break
+        }
+        super.sendEvent(event)
+    }
+}
+
 class PointerButton: NSButton {
     private var pointerTracking: NSTrackingArea?
     private(set) var isHovering = false
@@ -507,9 +530,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         do { editor = Editor(store: try AudioStore()); editor.preparesPlaybackInBackground = !CommandLine.arguments.contains("--ui-test") }
         catch { NSAlert(error: error).runModal(); NSApp.terminate(nil); return }
         NSApp.appearance = NSAppearance(named: .darkAqua)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 790), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        let editorWindow = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 790), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        window = editorWindow
         window.title = "Sounder"; window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true; window.backgroundColor = panelColor; window.minSize = NSSize(width: 1000, height: 600); window.delegate = self
-        let content = NSView(); content.wantsLayer = true; content.layer?.backgroundColor = background.cgColor; window.contentView = content
+        let content = EditorContentView(); content.wantsLayer = true; content.layer?.backgroundColor = background.cgColor; window.contentView = content
         let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 0; stack.alignment = .leading; stack.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: content.leadingAnchor), stack.trailingAnchor.constraint(equalTo: content.trailingAnchor), stack.topAnchor.constraint(equalTo: content.safeAreaLayoutGuide.topAnchor), stack.bottomAnchor.constraint(equalTo: content.bottomAnchor)])
         installTitlebarControls()
@@ -564,7 +588,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ])
         add(toolbar, to: stack, height: 84 - (10 - toolbarTopInset))
         let scroll = NSScrollView(); scroll.hasHorizontalScroller = true; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
-        timeline = Timeline(editor); scroll.documentView = timeline; timeline.installHeaderControls(timelineControls); add(scroll, to: stack)
+        let viewport = NSView()
+        scroll.autoresizingMask = [.width, .height]; viewport.addSubview(scroll)
+        timeline = Timeline(editor); scroll.documentView = timeline; timeline.installHeaderControls(timelineControls)
+        timeline.installControlsOverlay(in: viewport); add(viewport, to: stack)
+        editorWindow.prepareForPointerEvent = { [weak self] in self?.timeline.synchronizeScrollPresentation() }
+        content.canvasCursor = { [weak self] in self?.timeline.presentationCursor }
         notificationOverlay = ToastOverlay.install(in: content, center: editor.notifications)
         timeline.scrollAnimationChanged = { [weak self] in self?.synchronizeDisplayLink() }
         editor.changed = { [weak self] in self?.refresh() }
@@ -816,7 +845,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func verifyTrackNameUI() throws {
         func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
-            NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
         }
         func type(_ text: String, into field: InlineNameField) {
             if let input = field.currentEditor() as? NSTextView { input.selectAll(nil); input.insertText(text, replacementRange: input.selectedRange()) }
@@ -824,10 +853,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         func nameInkRows() throws -> ClosedRange<Int> {
             let nameRect = timeline.trackNameHitRect(row: 0, depth: 0)
-            let crop = NSRect(x: nameRect.minX, y: nameRect.minY - 3, width: max(1, nameRect.width - 3), height: nameRect.height + 6)
-            timeline.displayIfNeeded()
-            guard let bitmap = timeline.bitmapImageRepForCachingDisplay(in: crop) else { throw SounderError.message("Could not capture the track name") }
-            timeline.cacheDisplay(in: crop, to: bitmap)
+            let view = window.contentView!
+            let crop = timeline.convert(NSRect(x: nameRect.minX, y: nameRect.minY - 3, width: max(1, nameRect.width - 3), height: nameRect.height + 6), to: view)
+            view.displayIfNeeded()
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: crop) else { throw SounderError.message("Could not capture the track name") }
+            view.cacheDisplay(in: crop, to: bitmap)
             var rows: [Int] = []
             for y in 0..<bitmap.pixelsHigh {
                 for x in 0..<bitmap.pixelsWide {
@@ -842,7 +872,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let inkBefore = try nameInkRows()
         let name = NSPoint(x: 45, y: timeline.ruler + 20)
         timeline.mouseDown(with: event(.leftMouseDown, name)); timeline.mouseUp(with: event(.leftMouseUp, name))
-        guard timeline.nameField.isRenaming, NSApp.modalWindow == nil else { throw SounderError.message("Track name did not open inline: track=\(String(describing: timeline.renamingTrack)), field=\(timeline.nameField.isRenaming), frame=\(timeline.nameField.frame), visible=\(timeline.visibleRect), name=\(timeline.trackNameHitRect(row: 0, depth: 0)), modal=\(String(describing: NSApp.modalWindow))") }
+        guard timeline.nameField.isRenaming, NSApp.modalWindow == nil else { throw SounderError.message("Track name did not open inline: track=\(String(describing: timeline.renamingTrack)), field=\(timeline.nameField.isRenaming), frame=\(timeline.nameField.frame), visible=\(timeline.viewportRect), name=\(timeline.trackNameHitRect(row: 0, depth: 0)), modal=\(String(describing: NSApp.modalWindow))") }
         let inkDuring = try nameInkRows()
         guard inkBefore == inkDuring else { throw SounderError.message("Track-name glyphs shift when editing begins: \(inkBefore) → \(inkDuring)") }
         print("PASS: Track-name glyphs retain identical vertical pixel bounds when editing begins")
@@ -867,7 +897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let scroll = timeline.enclosingScrollView {
             scroll.contentView.scroll(to: NSPoint(x: 400, y: 0)); scroll.reflectScrolledClipView(scroll.contentView)
             timeline.renameTrack(editor.project.tracks[0].id)
-            guard timeline.nameField.isRenaming, timeline.nameField.frame.minX >= timeline.visibleRect.minX else { throw SounderError.message("Inline editor does not follow pinned track column") }
+            guard timeline.nameField.isRenaming, timeline.nameField.convert(timeline.nameField.bounds, to: timeline).minX >= timeline.viewportRect.minX else { throw SounderError.message("Inline editor does not follow pinned track column") }
             timeline.nameField.finish(commit: false)
             scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
         }
@@ -881,7 +911,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func verifyNotificationInteractions() throws {
         func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
-            NSEvent.mouseEvent(with: type, location: timeline.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
         }
         let start = NSPoint(x: 190, y: timeline.ruler + 55)
         timeline.mouseDown(with: event(.leftMouseDown, start))
