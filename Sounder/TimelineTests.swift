@@ -1121,7 +1121,7 @@ extension AppDelegate {
                 NSEvent.enterExitEvent(with: type, location: control.convert(NSPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
             }
             movePointer(to: control); control.mouseEntered(with: hoverEvent(.mouseEntered))
-            guard control.visibleValueText == control.valueText?(control.doubleValue), let hoverFrame = control.visibleValueFrame, control.toolTip == nil else { throw SounderError.message("Slider hover must show its value synchronously without a native delayed tooltip") }
+            guard control.visibleValueText == control.valueText?(control.doubleValue), let hoverFrame = control.visibleValueFrame, control.toolTip == nil else { throw SounderError.message("Slider hover must show its value synchronously without a native delayed tooltip (vertical: \(control.isVertical), key: \(window.isKeyWindow), pointer: \(control.convert(window.mouseLocationOutsideOfEventStream, from: nil)), bounds: \(control.bounds), visible: \(control.visibleRect), value: \(String(describing: control.visibleValueText)))") }
             var sameReadout = false
             control.withTrackingGesture {
                 sameReadout = control.visibleValueFrame == hoverFrame

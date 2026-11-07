@@ -116,7 +116,8 @@ class PointerButton: NSButton {
     override func mouseExited(with event: NSEvent) { isHovering = false; needsDisplay = true }
     override func cursorUpdate(with event: NSEvent) {
         // Native toolbar tracking can supersede the custom view's cursor rectangles.
-        (isEnabled ? interactionCursor : NSCursor.arrow).set()
+        let cursor = isEnabled ? interactionCursor : NSCursor.arrow
+        if NSCursor.current !== cursor { cursor.set() }
     }
 }
 
@@ -468,7 +469,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         hiddenProjectWindows = []
         synchronizeDisplayLink()
     }
+    private var lastPositionLabelUpdate = -Double.infinity
     private func updatePositionLabel() {
+        // Text has no motion to interpolate. Avoid native text layout at display
+        // cadence; keep the moving playhead/viewport at the full display rate.
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastPositionLabelUpdate >= 1.0 / 25 else { return }
+        lastPositionLabelUpdate = now
         let time = editor.cursor
         if editor.project.tempoMode {
             let running = editor.isPlaying || editor.isRecording
@@ -482,10 +489,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func refreshTransport() {
         synchronizeDisplayLink()
         guard window.isVisible, !window.isMiniaturized, window.occlusionState.contains(.visible) else { return }
-        // The polling tick can also publish a new cursor (notably capture and explicit test/seek polls).
-        // Present it atomically with its scroll position; Core Animation coalesces updates per display frame.
-        timeline.presentTransportFrame()
-        updatePositionLabel()
+        // The display link presents cursor + viewport atomically. Meter polling
+        // must not add a second, unsynchronized scroll/position pass at 25 Hz.
+        if transportDisplayIsPaused {
+            timeline.presentTransportFrame()
+            updatePositionLabel()
+        }
         timeline.refreshTransportMeters()
         let master = editor.project.masterTrack
         masterVolumeControl.updateMeter(editor.displayedTrackMeter(master), active: editor.isPlaying || editor.isRecording, recording: false,
@@ -570,6 +579,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         NotificationCenter.default.addObserver(self, selector: #selector(cancelShuttle), name: NSWindow.didResignKeyNotification, object: window)
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refresh()
         if let index = CommandLine.arguments.firstIndex(of: "--import-ui-test"), index + 1 < CommandLine.arguments.count { importUITest(URL(fileURLWithPath: CommandLine.arguments[index + 1])); return }
+        if let index = CommandLine.arguments.firstIndex(of: "--playback-cpu-ui-test"), index + 1 < CommandLine.arguments.count {
+            let path = CommandLine.arguments[index + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.playbackCPUProfile(path: path) }; return
+        }
         if CommandLine.arguments.contains("--ui-test") { uiTest() }
     }
     private func installTitlebarControls() {
@@ -638,6 +651,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { titlebarOrder }
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? { titlebarItems[identifier] }
     func uiTest() {
+        if ["--graphics-ui-test", "--track-mix-ui-test", "--track-meters-ui-test", "--master-mix-ui-test", "--meter-layers-ui-test"].contains(where: CommandLine.arguments.contains) {
+            // These integration tests require visible frames and actual pointer
+            // hover; keep their editor above the app used to launch the tests.
+            window.level = .floating; window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
         do {
             let url = editor.audio.freshURL()
             let samples = (0..<384_000).map { i -> Float in
@@ -665,6 +684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             refresh()
             if CommandLine.arguments.contains("--playback-scroll-ui-test") { try verifyPlaybackScrollUI() }
             if CommandLine.arguments.contains("--graphics-ui-test") { try verifyGraphicsUI() }
+            if CommandLine.arguments.contains("--meter-layers-ui-test") { try verifyMeterLayersUI() }
             if CommandLine.arguments.contains("--live-recording-ui-test") { try liveRecordingUITest(originalURL: url); return }
             if CommandLine.arguments.contains("--button-hover-ui-test") { try verifyButtonHoverUI() }
             if CommandLine.arguments.contains("--performance-ui-test") { try verifyPerformanceUI() }

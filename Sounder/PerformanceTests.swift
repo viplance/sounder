@@ -1,6 +1,108 @@
 import AppKit
 import AVFoundation
 
+extension AppDelegate {
+    func verifyMeterLayersUI() throws {
+        func check(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        // Use an isolated real control: changing signal levels must not invalidate
+        // the native thumb, while changing the fader must still redraw it.
+        let meter = MixerVolumeControl(frame: NSRect(x: 20, y: 20, width: 200, height: 28))
+        window.contentView!.addSubview(meter)
+        meter.layoutSubtreeIfNeeded(); meter.displayIfNeeded()
+        func drawSlider() throws {
+            guard let image = meter.slider.bitmapImageRepForCachingDisplay(in: meter.slider.bounds) else { throw SounderError.message("Cannot render native volume thumb") }
+            meter.slider.cacheDisplay(in: meter.slider.bounds, to: image)
+        }
+        try drawSlider()
+        let cell = meter.slider.cell as! TrackVolumeMeterCell
+        let before = cell.knobDrawCount
+        let originalThumb = cell.displayedKnobRect(flipped: meter.slider.isFlipped)
+        for index in 1...25 {
+            var signal = StereoTrackLevelMeter()
+            signal.update(StereoLevels(left: Float(index) / 25, right: Float(index) / 50), at: Double(index))
+            meter.updateMeter(signal, active: true, recording: index > 20, showsPeaks: true)
+            meter.displayIfNeeded()
+        }
+        try check(cell.knobDrawCount == before && !meter.slider.needsDisplay,
+                  "Stereo playback/recording meter ticks do not redraw the native volume thumb")
+        meter.slider.doubleValue = -12; try drawSlider()
+        try check(before > 0 && cell.knobDrawCount > before && cell.displayedKnobRect(flipped: meter.slider.isFlipped).midX < originalThumb.midX,
+                  "Native volume thumb still redraws at the new position after a fader change")
+        var signal = StereoTrackLevelMeter()
+        signal.update(StereoLevels(left: 1, right: 0), at: 100)
+        meter.updateMeter(signal, active: true, recording: false, showsPeaks: true)
+        let rail = meter.subviews.compactMap { $0 as? MixerMeterRail }.first!
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(rail.bounds.width * 2), pixelsHigh: Int(rail.bounds.height * 2), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        let context = NSGraphicsContext(bitmapImageRep: bitmap)!.cgContext
+        context.scaleBy(x: 2, y: 2)
+        rail.layer!.render(in: context)
+        let bar = cell.barRect(flipped: meter.slider.isFlipped)
+        let x = Int(bar.midX * 2), top = Int((bar.midY - 1.75) * 2), bottom = Int((bar.midY + 1.75) * 2)
+        let left = bitmap.colorAt(x: x, y: top)!.usingColorSpace(.deviceRGB)!
+        let right = bitmap.colorAt(x: x, y: bottom)!.usingColorSpace(.deviceRGB)!
+        try check(left.greenComponent > left.redComponent + 0.1 && left.alphaComponent > 0.9 && right.alphaComponent < 0.3,
+                  "Rendered stereo layers put the turquoise left channel above the silent right channel")
+        meter.updateMeter(signal, active: true, recording: true, showsPeaks: true)
+        context.clear(rail.bounds); rail.layer!.render(in: context)
+        let recording = bitmap.colorAt(x: x, y: top)!.usingColorSpace(.deviceRGB)!
+        try check(recording.redComponent > recording.greenComponent + 0.2,
+                  "Recording uses the same proportional meter layer with red fill")
+        meter.updateMeter(signal, active: false, recording: false, showsPeaks: true)
+        context.clear(rail.bounds); rail.layer!.render(in: context)
+        try check(bitmap.colorAt(x: x, y: top)!.alphaComponent < 0.3 && bitmap.colorAt(x: x, y: bottom)!.alphaComponent < 0.3,
+                  "Stop clears both rendered meter fills without redrawing the native thumb")
+        meter.removeFromSuperview()
+        let cursor = editor.cursor
+        defer { editor.cursor = cursor; timeline.presentTransportFrame() }
+        timeline.presentTransportFrame()
+        let surface = timeline.playheadSurfaceFrame
+        for time in [0.25, 0.5, 1.0, 1.5] {
+            editor.cursor = time; timeline.presentTransportFrame()
+            try check(timeline.playheadSurfaceFrame == surface && abs(timeline.playheadFrame.midX - (timeline.header + time * editor.zoom)) < 0.001,
+                      "Moving the playhead updates its visual position without moving the AppKit surface")
+        }
+        timeline.centerOnPlayhead(); timeline.presentTransportFrame()
+        let capRect = NSRect(x: timeline.playheadFrame.midX - 4, y: timeline.visibleRect.minY, width: 8, height: 8)
+        guard let capImage = timeline.bitmapImageRepForCachingDisplay(in: capRect) else { throw SounderError.message("Cannot render the playhead cap") }
+        timeline.cacheDisplay(in: capRect, to: capImage)
+        let cap = capImage.colorAt(x: capImage.pixelsWide * 3 / 4, y: capImage.pixelsHigh / 4)!.usingColorSpace(.deviceRGB)!
+        try check(cap.greenComponent > cap.redComponent + 0.1,
+                  "The rendered playhead cap stays at the top of the timeline")
+    }
+
+    /// Reproducible real-device workload for sample/Instruments, excluding import/preparation.
+    func playbackCPUProfile(path: String) {
+        do {
+            let audio = try editor.audio.load(path)
+            editor.preparesPlaybackInBackground = false
+            editor.project = Project(tracks: [Track(name: "CPU reference", clips: [
+                Clip(name: URL(fileURLWithPath: path).lastPathComponent, source: path, start: 0,
+                     duration: Double(audio.frameCount) / editor.project.audioFormat.sampleRate, order: 1)
+            ])])
+            editor.cursor = 0; refresh()
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            window.level = .floating
+            window.deminiaturize(nil); window.orderFrontRegardless(); NSApp.activate(ignoringOtherApps: true)
+            editor.playPause()
+            var sampler = ProcessCPUSampler(); _ = sampler.sample()
+            var tick = 0
+            print("PROFILE BEGIN: visible playback"); fflush(stdout)
+            let timer = Timer(timeInterval: 1, repeats: true) { timer in
+                let phase = tick < 12 ? "visible playback" : tick < 24 ? "hidden playback" : "stopped"
+                print(String(format: "PROFILE %@ CPU %.2f%% cursor %.3f frames %d visible %d occlusion %lu paused %d", phase, sampler.sample(), self.editor.cursor, self.transportFrameCount, self.window.isVisible ? 1 : 0, self.window.occlusionState.rawValue, self.transportDisplayIsPaused ? 1 : 0)); fflush(stdout)
+                tick += 1
+                if tick == 12 { self.window.miniaturize(nil); print("PROFILE BEGIN: hidden playback") }
+                if tick == 24 { self.editor.stop(); self.window.deminiaturize(nil); self.window.makeKeyAndOrderFront(nil); print("PROFILE BEGIN: stopped") }
+                if tick == 36 { timer.invalidate(); self.editor.stop(); NSApp.terminate(nil) }
+                fflush(stdout)
+            }
+            RunLoop.main.add(timer, forMode: .common)
+        } catch { print("PROFILE FAILED: \(error)"); fflush(stdout); NSApp.terminate(nil) }
+    }
+}
+
 func runPerformanceTests() throws {
     func check(_ value: Bool, _ message: String) throws {
         guard value else { throw SounderError.message(message) }; print("PASS: \(message)")

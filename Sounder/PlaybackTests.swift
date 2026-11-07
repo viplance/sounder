@@ -1412,9 +1412,13 @@ extension AppDelegate {
 extension AppDelegate {
     /// Compare the same renderer with and without raster reuse, then exercise real display callbacks.
     func verifyGraphicsUI() throws {
+        let windowLevel = window.level
+        window.level = .floating; window.makeKeyAndOrderFront(nil)
+        defer { window.level = windowLevel }
         func check(_ condition: Bool, _ message: String) throws {
             guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
         }
+        try verifyMeterLayersUI()
         let saved = editor.project, savedCursor = editor.cursor, savedZoom = editor.zoom, savedSelection = editor.selection
         defer {
             editor.stop(); editor.project = saved; editor.cursor = savedCursor; editor.zoom = savedZoom
@@ -1512,11 +1516,14 @@ extension AppDelegate {
         RunLoop.current.run(until: Date().addingTimeInterval(0.15))
         let player = editor.player, initialTime = editor.cursor
         let full = fullRefreshCount, structures = timeline.structureRefreshCount, frames = transportFrameCount
+        let playheadSurface = timeline.playheadSurfaceFrame
         RunLoop.current.run(until: Date().addingTimeInterval(0.4))
         try check(editor.player === player && editor.cursor > initialTime && transportFrameCount - frames >= 12,
                   "Display-synchronized transport advances from the running audio clock above the old 25 Hz cadence")
         try check(fullRefreshCount == full && timeline.structureRefreshCount == structures,
                   "Playback frames and meter ticks never rebuild the project toolbar or track structure")
+        try check(timeline.playheadSurfaceFrame == playheadSurface,
+                  "Playhead animation keeps its AppKit view stationary instead of rebuilding cursor tracking regions")
         try check(abs(editor.cursor - (editor.player?.currentTime ?? 0)) < 0.06,
                   "Display cursor remains synchronized with audible playback")
         editor.beginShuttle(direction: -1)

@@ -76,6 +76,8 @@ final class MixerFXButton: PointerButton {
 final class TrackVolumeMeterCell: NSSliderCell {
     var levels = [0.0, 0.0]
     var recording = false
+    var usesLayerMeter = false
+    private(set) var knobDrawCount = 0
     private var animationFrom: Double?
     private var animationStart = 0.0
     private var animationTimer: Timer?
@@ -115,6 +117,7 @@ final class TrackVolumeMeterCell: NSSliderCell {
         return NSRect(x: x - 4, y: knobRect(flipped: flipped).midY - 7, width: 8, height: 14)
     }
     override func drawKnob(_ knobRect: NSRect) {
+        knobDrawCount += 1
         // Preserve native tracking and its generous hit target, but let the
         // narrow visible thumb reach both rail edges instead of retaining the
         // inset reserved for the much wider system thumb.
@@ -131,6 +134,7 @@ final class TrackVolumeMeterCell: NSSliderCell {
         return rect.minX + inset + max(0, rect.width - 2 * inset) * amount
     }
     override func drawBar(inside rect: NSRect, flipped: Bool) {
+        guard !usesLayerMeter else { return }
         let rail = NSRect(x: rect.minX, y: rect.midY - 3, width: rect.width, height: 6)
         fill(rail, NSColor.white.withAlphaComponent(0.16), radius: 3)
         NSGraphicsContext.saveGraphicsState()
@@ -141,6 +145,37 @@ final class TrackVolumeMeterCell: NSSliderCell {
             fill(NSRect(x: rail.minX, y: rail.minY + CGFloat(top) * 3.5, width: meterEndX(levels[channel], inside: rail, flipped: flipped) - rail.minX, height: 2.5), color)
         }
         NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
+/// Signal changes resize only these cheap layers, never redraw the native thumb.
+/// Kept behind the transparent slider so tracking, focus and accessibility stay native.
+final class MixerMeterRail: NSView {
+    private let rail = CALayer()
+    private let fills = [CALayer(), CALayer()]
+    override var isFlipped: Bool { true }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.addSublayer(rail)
+        rail.cornerRadius = 3; rail.masksToBounds = true; rail.isGeometryFlipped = true
+        rail.backgroundColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        fills.forEach { rail.addSublayer($0) }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    func update(cell: TrackVolumeMeterCell, flipped: Bool) {
+        let bar = cell.barRect(flipped: flipped)
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        rail.frame = NSRect(x: bar.minX, y: bar.midY - 3, width: bar.width, height: 6)
+        let color = (cell.recording ? NSColor.systemRed : accent).cgColor
+        for channel in 0..<2 {
+            fills[channel].backgroundColor = color
+            // The layer's coordinates are explicitly top-down: L above R.
+            fills[channel].frame = NSRect(x: 0, y: CGFloat(channel) * 3.5,
+                width: max(0, cell.meterEndX(cell.levels[channel], inside: bar, flipped: flipped) - bar.minX), height: 2.5)
+        }
+        CATransaction.commit()
     }
 }
 
@@ -280,18 +315,23 @@ final class MixerVolumeControl: NSView {
     private static let railReadoutGap: CGFloat = 2
     let slider = TrackMixerSlider(value: 0, minValue: -60, maxValue: 12, target: nil, action: nil)
     let peakReadout = MixerPeakReadout(frame: .zero)
+    private let meterRail = MixerMeterRail(frame: .zero)
     override var isFlipped: Bool { true }
     override init(frame: NSRect) {
         super.init(frame: frame)
         let cell = TrackVolumeMeterCell(); cell.minValue = -60; cell.maxValue = 12; cell.doubleValue = 0
+        cell.usesLayerMeter = true
         slider.cell = cell; slider.controlSize = .mini; slider.isContinuous = true
+        slider.wantsLayer = true
         slider.valueText = { $0 <= -60 ? "−∞ dB" : String(format: "%+.1f dB", $0) }
-        addSubview(slider); addSubview(peakReadout)
+        addSubview(meterRail); addSubview(slider); addSubview(peakReadout)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
         super.layout()
         slider.frame = NSRect(x: 0, y: bounds.midY - 9, width: max(24, bounds.width - Self.peakReadoutWidth - Self.railReadoutGap), height: 18)
+        meterRail.frame = slider.frame
+        if let cell = slider.cell as? TrackVolumeMeterCell { meterRail.update(cell: cell, flipped: slider.isFlipped) }
         peakReadout.frame = NSRect(x: bounds.maxX - Self.peakReadoutWidth, y: bounds.midY - 11, width: Self.peakReadoutWidth, height: 22)
     }
     func configure(track: Track, meter: StereoTrackLevelMeter, active: Bool, recording: Bool, enabled: Bool, showsPeaks: Bool) {
@@ -306,7 +346,8 @@ final class MixerVolumeControl: NSView {
         if let cell = slider.cell as? TrackVolumeMeterCell {
             let levels = active ? [meter.left.level, meter.right.level] : [0, 0]
             if cell.recording != recording || cell.levels != levels {
-                cell.recording = recording; cell.levels = levels; slider.needsDisplay = true
+                cell.recording = recording; cell.levels = levels
+                meterRail.update(cell: cell, flipped: slider.isFlipped)
             }
         }
     }
@@ -527,15 +568,24 @@ final class InlineNameField: NSTextField, NSTextFieldDelegate {
     }
 }
 
-/// Only this narrow layer moves at display cadence; it never redraws audio content.
+/// Keep AppKit geometry stationary. Only child layers move at display cadence;
+/// moving an NSView makes AppKit rebuild tracking regions and reset the cursor.
 private final class TransportPlayheadView: NSView {
+    private let viewportLayer = CALayer()
     private let stem = CALayer()
     private let cap = CALayer()
+    private(set) var markerFrame = NSRect.zero
+    var markerIsHidden: Bool { viewportLayer.isHidden }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {} // Layer-only surface: never allocate a document-sized bitmap.
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.masksToBounds = true
-        layer?.addSublayer(stem); layer?.addSublayer(cap)
+        layer?.isGeometryFlipped = true
+        layer?.addSublayer(viewportLayer)
+        viewportLayer.masksToBounds = true
+        viewportLayer.addSublayer(stem); viewportLayer.addSublayer(cap)
         cap.cornerRadius = 2
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -543,13 +593,12 @@ private final class TransportPlayheadView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     func present(x: CGFloat, viewport: NSRect, color: NSColor, visible: Bool) {
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        isHidden = !visible
-        let left = min(viewport.maxX, max(viewport.minX, x - 5))
-        let right = max(left, min(viewport.maxX, x + 5))
-        let next = NSRect(x: left, y: viewport.minY, width: right - left, height: viewport.height)
-        if frame != next { frame = next }
-        stem.frame = NSRect(x: x - left - 0.75, y: 0, width: 1.5, height: viewport.height)
-        cap.frame = NSRect(x: x - left - 4, y: 0, width: 8, height: 8)
+        if let document = superview, frame != document.bounds { frame = document.bounds }
+        viewportLayer.isHidden = !visible
+        viewportLayer.frame = viewport
+        markerFrame = NSRect(x: x - 5, y: viewport.minY, width: 10, height: viewport.height)
+        stem.frame = NSRect(x: x - viewport.minX - 0.75, y: 0, width: 1.5, height: viewport.height)
+        cap.frame = NSRect(x: x - viewport.minX - 4, y: 0, width: 8, height: 8)
         stem.backgroundColor = color.cgColor; cap.backgroundColor = color.cgColor
         CATransaction.commit()
     }
@@ -582,8 +631,9 @@ final class Timeline: NSView {
     private(set) var rasterHitCount = 0
     var usesFragmentRasterCache = true
     var pendingGraphicsJobs: Int { sourceJobs.count + waveformJobs.count }
-    var playheadFrame: NSRect { playheadView.frame }
-    var playheadIsHidden: Bool { playheadView.isHidden }
+    var playheadFrame: NSRect { playheadView.markerFrame }
+    var playheadSurfaceFrame: NSRect { playheadView.frame }
+    var playheadIsHidden: Bool { playheadView.markerIsHidden }
     private struct RasterStyle: Equatable {
         let waveform: FragmentWaveformKey
         let name: String
