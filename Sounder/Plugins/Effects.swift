@@ -387,7 +387,11 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         do {
             let host = try SNPluginHost(path: url.path, classID: "", state: nil, sampleRate: editor.project.audioFormat.sampleRate)
             let effect = PluginEffect(name: host.pluginName, path: url.path, classID: host.classID, state: try host.saveState())
-            editor.checkpoint(); effects.append(effect); editor.effectsChanged(); reload(); editor.notifications.show("Effect added", style: .success); table.selectRowIndexes(IndexSet(integer: effects.count - 1), byExtendingSelection: false)
+            editor.checkpoint()
+            // Register before effectsChanged can start background preparation.
+            // The native editor and the audio graph must share this processor.
+            editor.pluginHosts[effect.id] = host
+            effects.append(effect); editor.effectsChanged(); reload(); editor.notifications.show("Effect added", style: .success); table.selectRowIndexes(IndexSet(integer: effects.count - 1), byExtendingSelection: false)
         } catch { editor.error(error); return }
         configure()
     }

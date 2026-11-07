@@ -1041,6 +1041,18 @@ final class Editor: NSObject {
                     }
                     let autoplay = self.preparationAutoplay, recording = self.preparationRecording
                     let remember = self.preparationRememberStart, completion = self.preparationCompletion
+                    // A plug-in editor may have opened while this worker was
+                    // creating processors. Keep its host authoritative; never
+                    // publish a graph connected to a different instance.
+                    if readyHosts.contains(where: { id, host in
+                        self.pluginHosts[id].map { $0 !== host } ?? false
+                    }) {
+                        self.cancelPlaybackPreparation()
+                        self.preparationQueue.async { prepared.stop() }
+                        self.preparePlayback(rememberStart: remember, forRecording: recording,
+                                             speculative: !autoplay, completed: completion)
+                        return
+                    }
                     self.preparation = nil; self.preparationTarget = nil; self.preparationCompletion = nil
                     self.audio.cache.merge(readySources) { current, _ in current }
                     self.pluginHosts.merge(readyHosts) { _, prepared in prepared }

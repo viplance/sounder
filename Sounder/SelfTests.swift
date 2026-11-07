@@ -287,6 +287,45 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
     let quiet = try streamedLevel(0.15), loud = try streamedLevel(0.85)
     guard abs(quiet - loud) > 0.001 else { throw SounderError.message("Live parameter changes did not affect the streaming processor") }
     print("PASS: live VST parameter changes affect subsequent streaming blocks")
+    // Open an editor after its processor has been created on the preparation
+    // worker but before the ready transport is published on the main thread.
+    let raceDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderFXPreparation-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: raceDirectory) }
+    let raceStore = try AudioStore(directory: raceDirectory), raceSource = raceStore.freshURL()
+    try raceStore.write((0..<192_000).map { Float(sin(Double($0) * 2 * .pi * 440 / sampleRate) * 0.05) }, to: raceSource)
+    let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
+    var firstPreparation = true
+    let raceEditor = Editor(store: raceStore, makePlayback: { graph, format, start in
+        if firstPreparation {
+            firstPreparation = false; entered.signal()
+            guard gate.wait(timeout: .now() + 10) == .success else { throw SounderError.message("FX preparation test gate timed out") }
+        }
+        return LivePlayback(graph: graph, format: format, start: start)
+    })
+    defer { gate.signal(); raceEditor.preparesPlaybackInBackground = false; raceEditor.stop() }
+    let raceEffect = PluginEffect(name: host.pluginName, path: path, classID: host.classID, state: state)
+    raceEditor.project.tracks[0].clips = [Clip(name: "FX race", source: raceSource.path, start: 0, duration: 4, order: 1)]
+    raceEditor.project.tracks[0].effects = [raceEffect]
+    raceEditor.preparesPlaybackInBackground = true
+    raceEditor.playPause()
+    guard entered.wait(timeout: .now() + 10) == .success else { throw SounderError.message("FX worker did not reach the preparation gate") }
+    let editorHost = try raceEditor.pluginHost(raceEffect)
+    gate.signal()
+    let readyBy = Date().addingTimeInterval(10)
+    while !raceEditor.isPlaying && Date() < readyBy { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+    guard raceEditor.isPlaying, raceEditor.pluginHosts[raceEffect.id] === editorHost else {
+        throw SounderError.message("Background playback replaced the plug-in editor's processor with a disconnected instance")
+    }
+    func livePeak(_ value: Double) -> Float {
+        editorHost.setParameter(id, value: value)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        guard let playback = raceEditor.player else { return 0 }
+        return playback.queue.sync { playback.graph.trackPeaks[raceEditor.project.tracks[0].id]?.left ?? 0 }
+    }
+    let quietPeak = livePeak(0.15), loudPeak = livePeak(0.85)
+    guard abs(quietPeak - loudPeak) > 0.001 else { throw SounderError.message("Editor parameter changes do not reach the background-prepared track FX") }
+    print("PASS: Opening track FX during background preparation retains the editor processor and changes the actual live output")
+    raceEditor.preparesPlaybackInBackground = false; raceEditor.stop()
     if editorTest {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderLiveFX-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -324,11 +363,15 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
         guard editor.dirty else { throw SounderError.message("Editing after Save did not mark the project dirty") }
         let unchanged = try Data(contentsOf: projectURL)
         guard try JSONDecoder().decode(Project.self, from: unchanged).tracks[0].effects[0].state == saved.tracks[0].effects[0].state else { throw SounderError.message("Editing a plug-in wrote to disk without project Save") }
+        let pausedPlayback = editor.player!
         editor.playPause()
+        let pauseDeadline = Date().addingTimeInterval(2)
+        while !pausedPlayback.pauseComplete && Date() < pauseDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        editor.updateTransportFrame()
         let stoppedAt = editor.cursor
-        guard !editor.isPlaying && editor.player == nil else { throw SounderError.message("Live playback did not stop and release its stream") }
+        guard pausedPlayback.pauseComplete, !editor.isPlaying, editor.player == nil else { throw SounderError.message("Live playback did not finish its pause fade") }
         editor.playPause()
-        guard editor.isPlaying, editor.player?.start == stoppedAt else { throw SounderError.message("Live playback did not continue at the visible stopped cursor") }
+        guard editor.isPlaying, editor.player === pausedPlayback, abs(pausedPlayback.start - stoppedAt) <= 1 / sampleRate else { throw SounderError.message("Live playback did not continue at the visible stopped cursor") }
         panel.close()
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         guard editor.isPlaying else { throw SounderError.message("Closing the plug-in editor stopped playback") }

@@ -70,6 +70,7 @@
 
 - Plug-in editor windows (native VST/VST3 and generic parameter views) stay at the floating window level and do not hide on deactivation. Focusing the main editor or fragments must not cover them; explicit Close still detaches the plug-in UI and stops its idle timer.
 - Plug-in editors are nonmodal and have no Apply/Cancel controls. Parameter edits immediately affect the shared live processor; closing an editor retains changes in memory. Only project Save writes plug-in settings to disk.
+- Keep one authoritative processor per effect ID shared by its editor and playback. Register a newly added host before starting background preparation. If an editor creates a host while preparation is in flight, discard the graph with the conflicting host and prepare again using the editor's instance, preserving pending Play/Record intent. Background completion must never replace an open editor's host with a disconnected processor. Verify with real VST/VST3 `--plugin-test` coverage of this preparation race and live output changes.
 - Replenish queued playback buffers on consumption, not device presentation completion. Use presentation completion only for the final buffer, and retain a short render-ahead margin to prevent underruns.
 - Keep plug-in processing on the playback worker in short blocks, preserve child-to-parent routing and compensate parallel bus latency. Export uses current in-memory parameter state.
 - Opening an editor must not mark the project dirty; actual parameter changes do. Saving with an editor open must capture its latest settings.
