@@ -757,8 +757,17 @@ final class Editor: NSObject {
         cursor = stoppedPosition
     }
     func seek(to position: Double) {
-        guard !isPreparingPlayback, !isRecording, !requestingMic, !isExporting, !isImporting, position.isFinite else { return }
+        guard !isRecording, !requestingMic, !isExporting, !isImporting, position.isFinite else { return }
         let target = max(0, position)
+        if preparation != nil {
+            let autoplay = preparationAutoplay, recording = preparationRecording
+            let remember = preparationRememberStart, completion = preparationCompletion
+            cancelPlaybackPreparation()
+            cursor = target
+            preparePlayback(rememberStart: remember, forRecording: recording,
+                            speculative: !autoplay, completed: completion)
+            return
+        }
         if !isShuttling, let playback = player, playback.isPlaying {
             guard loopRange.map({ target <= $0.upperBound }) == true || target < Double(playback.graph.totalFrames) / audio.sampleRate else {
                 stopPlayback(at: target); update(); return
@@ -1044,6 +1053,7 @@ final class Editor: NSObject {
                     return
                 }
                 let prepared = try factory(graph, snapshot.audioFormat, start); playback = prepared
+                try job.check()
                 try prepared.configureBufferSize(snapshot.playbackBufferSize)
                 job.setPhase("Preparing playback audio")
                 try prepared.configureOutput(snapshot.defaultOutput)

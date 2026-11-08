@@ -387,6 +387,41 @@ func runPerformanceTests() throws {
     lock.lock(); let afterClick = heavyFactories; lock.unlock()
     try check(expensive.player === heavyReady && beforeClick == afterClick && ProcessInfo.processInfo.systemUptime - heavyClick < 0.1,
               "A truthful 100% starts the exact warmed heavy VST transport without any new factory or warm-up")
+    let seekGate = DispatchSemaphore(value: 0), seekEntered = DispatchSemaphore(value: 0)
+    let seeking = Editor(store: store, makePlayback: { graph, format, start in
+        if start == 0.25 { seekEntered.signal(); seekGate.wait() }
+        return LivePlayback(graph: graph, format: format, start: start)
+    })
+    seeking.project = editor.project; seeking.preparesPlaybackInBackground = true; seeking.cursor = 0.25
+    defer { seekGate.signal(); seeking.preparesPlaybackInBackground = false; seeking.stop() }
+    seeking.playPause()
+    var seekWorkerBlocked = false
+    try wait {
+        if !seekWorkerBlocked { seekWorkerBlocked = seekEntered.wait(timeout: .now()) == .success }
+        return seekWorkerBlocked
+    }
+    let seekStarted = ProcessInfo.processInfo.systemUptime
+    seeking.seek(to: 1); seeking.seek(to: 1.5)
+    try check(ProcessInfo.processInfo.systemUptime - seekStarted < 0.1 && seeking.cursor == 1.5 && seeking.isPreparingPlayback && seeking.player == nil,
+              "Seeking during buffer preparation immediately moves the cursor and replaces pending work without waiting")
+    seekGate.signal()
+    try wait { seeking.isPlaying }
+    try check(seeking.player?.start == 1.5 && seeking.lastPlaybackStart == 1.5,
+              "Repeated preparation seeks autoplay only the latest selected position, discarding cancelled results")
+    seeking.preparesPlaybackInBackground = false; seeking.stop()
+    seeking.preparesPlaybackInBackground = true; seeking.seek(to: 0.25)
+    var idleWorkerBlocked = false
+    try wait {
+        if !idleWorkerBlocked { idleWorkerBlocked = seekEntered.wait(timeout: .now()) == .success }
+        return idleWorkerBlocked
+    }
+    seeking.seek(to: 2)
+    try check(seeking.cursor == 2 && seeking.isPrebuffering && !seeking.isPreparingPlayback,
+              "Seeking during idle prebuffering replaces its target without enabling autoplay")
+    seekGate.signal()
+    try wait { seeking.bufferPercent == 100 }
+    try check(!seeking.isPlaying && seeking.cursor == 2, "Replacement idle preparation stays stopped at the newly selected cursor")
+    seeking.preparesPlaybackInBackground = false; seeking.stop()
     let failureEditor = Editor(store: store, makePlayback: { _, _, _ in throw SounderError.message("Expected preparation failure") })
     failureEditor.project = editor.project; failureEditor.preparesPlaybackInBackground = true
     failureEditor.playPause(); try wait { !failureEditor.isPreparingPlayback }
