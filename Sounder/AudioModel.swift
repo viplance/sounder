@@ -288,6 +288,27 @@ extension ProjectAudioFormat {
          AVLinearPCMIsFloatKey: bitDepth == 32, AVLinearPCMIsBigEndianKey: false]
     }
 }
+enum PlaybackBufferSize {
+    static let blockFrames = 512
+    static let minimum = 96
+    static let maximum = 32768
+    static let initialFrames = 1024
+    static func durationLabel(frames: Int, sampleRate: Double) -> String {
+        let milliseconds = (Double(frames) / sampleRate * 10_000).rounded() / 10
+        return milliseconds == milliseconds.rounded() ? "\(Int(milliseconds)) ms" : String(format: "%.1f ms", milliseconds)
+    }
+    /// Keep at least three queued blocks, with an exact total and no block
+    /// larger than the VST host's 512-frame processing limit.
+    static func blocks(frames: Int) -> [Int] {
+        let count = max(3, (frames + blockFrames - 1) / blockFrames)
+        return (0..<count).map { frames / count + ($0 < frames % count ? 1 : 0) }
+    }
+    static func validate(_ frames: Int) throws {
+        guard (minimum...maximum).contains(frames) else {
+            throw SounderError.message("Enter 96–32768 samples.")
+        }
+    }
+}
 struct Project: Codable {
     static let masterID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     var tracks: [Track] = [Track(name: "Audio 01")]
@@ -305,6 +326,8 @@ struct Project: Codable {
     var nextOrder = 1
     var name: String? = nil
     var audioFormat = ProjectAudioFormat()
+    var playbackBufferFrames: Int? = nil
+    var playbackBufferSize: Int { playbackBufferFrames ?? PlaybackBufferSize.initialFrames }
     var exportSettings: ExportSettings?
     var exportSettingsConfirmed = false
     var metadata = AudioMetadata()
@@ -321,10 +344,12 @@ struct Project: Codable {
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, nextOrder, name, audioFormat, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel, defaultInput, defaultOutput }
+    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel, defaultInput, defaultOutput }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
+        playbackBufferFrames = try values.decodeIfPresent(Int.self, forKey: .playbackBufferFrames)
+        if let playbackBufferFrames { try PlaybackBufferSize.validate(playbackBufferFrames) }
         masterVolumeDB = try values.decodeIfPresent(Double.self, forKey: .masterVolumeDB) ?? 0
         masterEffects = try values.decodeIfPresent([PluginEffect].self, forKey: .masterEffects) ?? []
         guard masterVolumeDB.isFinite, (-60...12).contains(masterVolumeDB) else { throw SounderError.message("Invalid master volume") }

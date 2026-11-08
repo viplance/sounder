@@ -13,7 +13,7 @@ struct ToastMessage: Identifiable {
 
 /// One instance per running app session. Project changes and Undo never reset hints.
 final class ToastCenter {
-    static let lifetime: TimeInterval = 5
+    static let lifetime: TimeInterval = 4
     private(set) var messages: [ToastMessage] = []
     private var shownHints = Set<UXHint>()
     private var observers: [UUID: () -> Void] = [:]
@@ -61,9 +61,9 @@ private final class ToastCard: NSView {
         super.init(frame: .zero)
         wantsLayer = true; layer?.cornerRadius = 5
         switch message.style {
-        case .success: layer?.backgroundColor = NSColor(calibratedRed: 0.12, green: 0.54, blue: 0.31, alpha: 1).cgColor
-        case .hint: layer?.backgroundColor = NSColor(calibratedRed: 0.98, green: 0.76, blue: 0.18, alpha: 1).cgColor
-        case .error: layer?.backgroundColor = NSColor(calibratedRed: 0.78, green: 0.17, blue: 0.20, alpha: 1).cgColor
+        case .success: layer?.backgroundColor = NSColor(calibratedRed: 0.12, green: 0.54, blue: 0.31, alpha: 0.8).cgColor
+        case .hint: layer?.backgroundColor = NSColor(calibratedRed: 0.98, green: 0.76, blue: 0.18, alpha: 0.8).cgColor
+        case .error: layer?.backgroundColor = NSColor(calibratedRed: 0.78, green: 0.17, blue: 0.20, alpha: 0.8).cgColor
         }
         text.stringValue = message.text
         text.font = .systemFont(ofSize: 12, weight: .medium)
@@ -114,7 +114,7 @@ final class ToastOverlay: NSView {
         for id in Array(cards.keys) where !ids.contains(id) {
             if let card = cards.removeValue(forKey: id) {
                 NSAnimationContext.runAnimationGroup({ context in
-                    context.duration = 0.18; card.animator().alphaValue = 0
+                    context.duration = 0.36; card.animator().alphaValue = 0
                 }, completionHandler: { card.removeFromSuperview() })
             }
         }

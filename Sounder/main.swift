@@ -527,7 +527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         for app in NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "enotix.Sounder") where app.processIdentifier != ProcessInfo.processInfo.processIdentifier { app.terminate() }
-        do { editor = Editor(store: try AudioStore()); editor.preparesPlaybackInBackground = !CommandLine.arguments.contains("--ui-test") }
+        do { editor = Editor(store: try AudioStore(), preferences: CommandLine.arguments.contains("--ui-test") ? nil : .standard); editor.preparesPlaybackInBackground = !CommandLine.arguments.contains("--ui-test") }
         catch { NSAlert(error: error).runModal(); NSApp.terminate(nil); return }
         NSApp.appearance = NSAppearance(named: .darkAqua)
         let editorWindow = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 790), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
@@ -557,6 +557,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let spacer2 = NSView(); spacer2.setContentHuggingPriority(.defaultLow, for: .horizontal); toolbar.addArrangedSubview(spacer2)
         performanceIndicators.bufferValue = { [weak self] in self?.editor.bufferPercent ?? 0 }
         performanceIndicators.bufferDescription = { [weak self] in self?.editor.bufferDescription ?? "" }
+        performanceIndicators.idleBufferText = { [weak self] in
+            guard let self, self.editor.canEditPlaybackBuffer else { return nil }
+            return self.editor.playbackBufferLabel
+        }
+        performanceIndicators.editBuffer = { [weak self] in self?.editPlaybackBuffer() }
         toolbar.addArrangedSubview(performanceIndicators)
         metronomeButton = PointerButton(image: NSImage(systemSymbolName: "metronome", accessibilityDescription: "Metronome")!, target: self, action: #selector(toggleMetronome))
         metronomeButton.setButtonType(.pushOnPushOff); metronomeButton.isBordered = false; metronomeButton.imagePosition = .imageOnly
@@ -949,14 +954,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             guard zip(frames, frames.dropFirst()).allSatisfy({ $0.maxY < $1.minY }) else { fputs("FAIL: Notifications overlap\n", stderr); exit(1) }
             snapshot()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.4) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.4) {
             let messages = self.editor.notifications.messages
             let frames = self.notificationOverlay.visibleFrames
             guard messages.count == 2, messages[0].style == .success, frames.count == 2, abs(frames[0].minY - 16) < 1 else { fputs("FAIL: Notifications did not expire independently and reflow upward\n", stderr); exit(1) }
             snapshot("reflow")
-            print("PASS: five-second timers expire earlier cards and move remaining cards upward")
+            print("PASS: four-second timers expire earlier cards and move remaining cards upward")
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.5) {
             guard self.editor.notifications.messages.isEmpty else { fputs("FAIL: Notifications did not expire\n", stderr); exit(1) }
             try? FileManager.default.removeItem(at: audioURL)
             self.editor.dirty = false; NSApp.terminate(nil)
@@ -1032,6 +1037,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func toggleMetronome() { editor.toggleMetronome() }
     @objc func editTempo() {
         if let bpm = TempoDialog(bpm: editor.project.tempo).runModal() { editor.setTempo(bpm) }
+    }
+    private func editPlaybackBuffer() {
+        do { try editor.editPlaybackBuffer { PlaybackBufferDialog(frames: $0, sampleRate: editor.project.audioFormat.sampleRate).runModal() } }
+        catch { editor.error(error) }
+        performanceIndicators.refresh()
     }
     @objc func showAudioRouting() {
         if let audioRoutingWindow { audioRoutingWindow.show(); return }

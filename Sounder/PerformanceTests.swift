@@ -196,6 +196,48 @@ func runPerformanceTests() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderPreparation-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try AudioStore(directory: directory), source = store.freshURL()
+    for rate in [44_100.0, 48_000, 96_000, 192_000] {
+        var project = Project(); project.audioFormat.sampleRate = rate
+        try check(project.playbackBufferSize == 1024, "Initial buffer is 1024 samples at \(Int(rate)) Hz")
+    }
+    for invalid in [-1, 0, 80, 95, 32769, Int.max] {
+        var rejected = false
+        do { try PlaybackBufferSize.validate(invalid) } catch { rejected = true }
+        try check(rejected, "Buffer rejects invalid size \(invalid)")
+    }
+    let bufferEditor = Editor(store: store)
+    var validPlans = true
+    for size in PlaybackBufferSize.minimum...PlaybackBufferSize.maximum {
+        let blocks = PlaybackBufferSize.blocks(frames: size)
+        validPlans = validPlans && blocks.count >= 3 && blocks.reduce(0, +) == size && blocks.allSatisfy { $0 > 0 && $0 <= 512 }
+    }
+    try check(validPlans, "Every integer buffer size has an exact queue plan without sample rounding")
+    for size in [96, 97, 511, 512, 1537, 4096, 32768] {
+        try bufferEditor.setPlaybackBufferSize(size)
+        let restored = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(bufferEditor.project))
+        try check(restored.playbackBufferSize == size, "Project round-trip retains \(size) playback buffer samples")
+    }
+    bufferEditor.undo()
+    try check(bufferEditor.project.playbackBufferSize == 4096, "Buffer edits support Undo")
+    let suite = "SounderBufferTests." + UUID().uuidString
+    let preferences = UserDefaults(suiteName: suite)!
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let savedDefault = Editor(store: store, preferences: preferences)
+    try check(savedDefault.project.playbackBufferSize == 1024, "New installations begin with a 1024-sample buffer")
+    try savedDefault.setPlaybackBufferSize(513)
+    try check(Editor(store: store, preferences: preferences).project.playbackBufferSize == 1024, "Unsaved project edits do not replace the saved default")
+    try savedDefault.save(to: directory.appendingPathComponent("Buffer.sounder"))
+    try check(Editor(store: store, preferences: preferences).project.playbackBufferSize == 513, "Successful project Save remembers an exact unaligned size for new projects")
+    var older = Project(); older.playbackBufferFrames = 1025
+    let olderURL = directory.appendingPathComponent("Older.sounder")
+    _ = try ProjectStorage.save(older, to: olderURL)
+    try savedDefault.open(from: olderURL)
+    try check(savedDefault.project.playbackBufferSize == 1025 && Editor(store: store, preferences: preferences).project.playbackBufferSize == 513,
+              "Opening an existing project restores its own buffer without overwriting the new-project default")
+    try savedDefault.setPlaybackBufferSize(1001)
+    var failedSave = false
+    do { try savedDefault.save(to: directory) } catch { failedSave = true }
+    try check(failedSave && Editor(store: store, preferences: preferences).project.playbackBufferSize == 513, "A failed project Save cannot change the remembered default")
     try store.write(AudioSignal(channels: [Array(repeating: 0.01, count: 144_000), Array(repeating: -0.01, count: 144_000)]), to: source)
     let gate = DispatchSemaphore(value: 0), entered = DispatchSemaphore(value: 0)
     let lock = NSLock(); var shouldWait = true, factoryRanOnMain = false
@@ -204,6 +246,7 @@ func runPerformanceTests() throws {
         if hold { entered.signal(); gate.wait() }
         return LivePlayback(graph: graph, format: format, start: start)
     })
+    try editor.setPlaybackBufferSize(96)
     editor.preparesPlaybackInBackground = true
     editor.project.tracks[0].clips = [Clip(name: "Prepared", source: source.path, start: 0, duration: 3, order: 1)]
     editor.cursor = 0.25
@@ -228,6 +271,7 @@ func runPerformanceTests() throws {
     editor.cursor = 0.5; editor.playPause()
     try wait { editor.isPlaying }
     try check(editor.player?.start == 0.5 && !editor.isPreparingPlayback && !factoryRanOnMain, "Only the newest prepared transport starts at the selected cursor")
+    try check(editor.player?.bufferFrameCount == 96, "Background playback applies the real two-millisecond queue size")
     try wait { editor.bufferPercent > 0 }
     try check(editor.bufferPercent <= 100, "Running playback publishes real buffer fill through a short snapshot lock")
     let player = editor.player
@@ -278,8 +322,10 @@ func runPerformanceTests() throws {
     _ = ahead.setTrackMix(ahead.project.tracks[0].id, volumeDB: -6)
     try wait { ahead.standbyPlayer?.start == 0 }
     guard let edited = ahead.standbyPlayer else { throw SounderError.message("Edited prebuffer is missing") }
-    let mixed = try edited.graph.outputCache.read(1000..<1001)
-    try check(edited.graph.outputCache !== retained && abs(mixed[0] - Float(0.01 * pow(10, -6.0 / 20))) < 0.00001 && !ahead.busy,
+    let probe = min(1000, edited.bufferFrameCount - 1)
+    let mixed = try edited.graph.outputCache.read(probe..<(probe + 1))
+    let original = try retained.read(probe..<(probe + 1))
+    try check(edited.graph.outputCache !== retained && abs(mixed[0] - original[0] * Float(pow(10, -6.0 / 20))) < 0.00001 && !ahead.busy,
               "Editing proactively rebuilds the buffer with the new actual gain, without autoplay or stale cache reuse")
     ahead.undo(); try wait { ahead.standbyPlayer?.start == 0 }
     ahead.seek(to: 0.25); ahead.seek(to: 1.5); ahead.seek(to: 2.25)
@@ -397,12 +443,43 @@ extension AppDelegate {
         editor.stopAndReturnToStart()
         while editor.standbyPlayer?.start != editor.cursor, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
         performanceIndicators.refresh()
-        guard performanceIndicators.buffer.stringValue == "100%" else { throw SounderError.message("BUFFER lost cached readiness after Stop: label=\(performanceIndicators.buffer.stringValue), actual=\(editor.bufferPercent), cursor=\(editor.cursor), start=\(String(describing: editor.lastPlaybackStart)), regions=\(cached.cachedRegions(in: 0..<cached.frames))") }
+        guard performanceIndicators.buffer.title == editor.playbackBufferLabel, performanceIndicators.buffer.isEnabled,
+              editor.bufferPercent == 100 else { throw SounderError.message("Idle BUFFER must show editable duration while retaining ready audio") }
         editor.playPause()
         while editor.isPreparingPlayback, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
         guard editor.player?.graph.outputCache === cached else { throw SounderError.message("Interactive Play discarded the processed cache") }
         editor.stopAndReturnToStart(); performanceIndicators.refresh()
-        print("PASS: Interactive BUFFER sampled real preparation values \(samples.sorted()) and retained 100% readiness after Stop/replay")
-        print("PASS: CPU/BUFFER appear on the right of the toolbar with aligned percentage readouts")
+        editor.preparesPlaybackInBackground = false; editor.invalidateMixCache()
+        performanceIndicators.refresh()
+        let dialog = PlaybackBufferDialog(frames: 512, sampleRate: 48_000)
+        guard dialog.duration.stringValue == "10.7 ms" else { throw SounderError.message("Buffer duration does not match the project sample rate") }
+        dialog.field.stringValue = "1536"
+        dialog.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: dialog.field))
+        guard dialog.duration.stringValue == "32 ms" else { throw SounderError.message("Buffer duration does not update immediately during entry") }
+        let dialogValues = [80, 32784, 113]
+        var attempts = 0
+        let dialogDeadline = Date().addingTimeInterval(3)
+        let responder = Timer(timeInterval: 0.05, repeats: true) { _ in
+            guard let modal = NSApp.modalWindow else { return }
+            if Date() > dialogDeadline { NSApp.stopModal(withCode: .alertSecondButtonReturn); return }
+            func input(in view: NSView) -> NSTextField? {
+                if let field = view as? NSTextField, field.isEditable { return field }
+                return view.subviews.lazy.compactMap { input(in: $0) }.first
+            }
+            guard attempts < dialogValues.count, let content = modal.contentView, let field = input(in: content) else { return }
+            field.stringValue = String(dialogValues[attempts]); attempts += 1
+            NSApp.stopModal(withCode: .alertFirstButtonReturn)
+        }
+        RunLoop.main.add(responder, forMode: .modalPanel)
+        defer { responder.invalidate() }
+        performanceIndicators.buffer.performClick(nil)
+        responder.invalidate(); performanceIndicators.refresh()
+        guard attempts == 3, editor.project.playbackBufferSize == 113,
+              performanceIndicators.buffer.title == editor.playbackBufferLabel else {
+            throw SounderError.message("BUFFER editor must reject out-of-range input and preserve arbitrary integer values")
+        }
+        print("PASS: BUFFER updates milliseconds during entry, rejects invalid limits and applies the exact selected integer size")
+        print("PASS: Interactive BUFFER sampled real preparation values \(samples.sorted()) and shows editable duration while idle without discarding readiness")
+        print("PASS: CPU/BUFFER appear on the right of the toolbar with aligned readouts")
     }
 }

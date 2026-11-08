@@ -330,6 +330,15 @@ final class StreamingGraph {
 /// too late to drive a continuous stream on outputs with presentation latency.
 final class LivePlayback {
     let bufferFill = AudioBufferFill()
+    private(set) var bufferFrameCount: Int
+    private var bufferBlocks: [Int]
+    private var bufferBlockIndex = 0
+    private var bufferBlockCount: Int { bufferBlocks.count }
+    func configureBufferSize(_ frames: Int) throws {
+        try PlaybackBufferSize.validate(frames)
+        precondition(!running, "Configure the buffer before starting playback")
+        bufferFrameCount = frames; bufferBlocks = PlaybackBufferSize.blocks(frames: frames); bufferBlockIndex = 0
+    }
     func configureOutput(_ endpoint: AudioEndpoint) throws { try AudioDevices.configureOutput(endpoint, engine: engine, projectChannels: format.channels) }
     let engine = AVAudioEngine()
     let node = AVAudioPlayerNode()
@@ -414,6 +423,8 @@ final class LivePlayback {
     }
     init(graph: StreamingGraph, format: ProjectAudioFormat, start: Double) {
         self.graph = graph; self.format = format
+        bufferFrameCount = PlaybackBufferSize.initialFrames
+        bufferBlocks = PlaybackBufferSize.blocks(frames: bufferFrameCount)
         firstFrame = max(0, Int((start * format.sampleRate).rounded()))
         self.start = Double(firstFrame) / format.sampleRate; nextFrame = firstFrame
         engine.attach(node)
@@ -438,7 +449,7 @@ final class LivePlayback {
             }
             if running {
                 let pcm = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
-                while scheduled < max(3, Int(ceil(format.sampleRate / 48_000 * 3))) { try enqueue(format: pcm) }
+                while scheduled < bufferBlockCount { try enqueue(format: pcm) }
             }
         }
     }
@@ -465,11 +476,12 @@ final class LivePlayback {
                 _ = try graph.render(frames: count); progress(count)
             }
             running = true
-            let buffers = max(3, Int(ceil(format.sampleRate / 48_000 * 3)))
+            let buffers = bufferBlockCount
             for _ in 0..<buffers {
                 if cancelled() { throw CancellationError() }
+                let before = outputFrames
                 try enqueue(format: pcmFormat)
-                progress(512)
+                progress(outputFrames - before)
             }
         }
         engine.prepare(); try engine.start()
@@ -531,7 +543,13 @@ final class LivePlayback {
         let motion = ShuttleMotion(start: Double(frame) / format.sampleRate, direction: 1, end: Double(graph.totalFrames) / format.sampleRate, initialSpeed: 1, target: 1)
         transportLock.lock(); transportMotions.append((outputFrames, motion)); seekRequest = nil; transportLock.unlock()
         let pcm = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
-        for _ in 0..<max(3, Int(ceil(format.sampleRate / 48_000 * 3))) { try enqueue(format: pcm) }
+        for _ in 0..<bufferBlockCount { try enqueue(format: pcm) }
+        // A rapid resume retains the queued 10 ms fade. Complete its partial
+        // render quantum with real PCM so a short queue cannot run dry inside
+        // that quantum before consumed callbacks replenish it. This one-off
+        // bridge drains without increasing the steady-state queue capacity.
+        let bridge = (PlaybackBufferSize.blockFrames - outputFrames % PlaybackBufferSize.blockFrames) % PlaybackBufferSize.blockFrames
+        if bridge > 0 { try enqueue(format: pcm, bridgeFrames: bridge) }
         resumeRequested = false
         DispatchQueue.main.async { [weak self] in self?.didResume?() }
     }
@@ -551,7 +569,7 @@ final class LivePlayback {
         seekFade = []; seekFadeFrame = 0; resumeFadeFrame = 0
         meterBuffer.clear(); running = true
         let pcm = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
-        for _ in 0..<max(3, Int(ceil(format.sampleRate / 48_000 * 3))) { try enqueue(format: pcm) }
+        for _ in 0..<bufferBlockCount { try enqueue(format: pcm) }
         node.play(); resumeRequested = false
         DispatchQueue.main.async { [weak self] in self?.didResume?() }
     }
@@ -703,10 +721,12 @@ final class LivePlayback {
             }
         }
     }
-    private func enqueue(format pcmFormat: AVAudioFormat) throws {
+    private func enqueue(format pcmFormat: AVAudioFormat, bridgeFrames: Int? = nil) throws {
         guard running else { return }
-        let requestedFrames = pausing ? min(512, pauseFadeFrames - pauseFadeFrame) : 512
+        let blockFrames = bridgeFrames ?? bufferBlocks[bufferBlockIndex]
+        let requestedFrames = pausing ? min(blockFrames, pauseFadeFrames - pauseFadeFrame) : blockFrames
         guard requestedFrames > 0 else { return }
+        if bridgeFrames == nil { bufferBlockIndex = (bufferBlockIndex + 1) % bufferBlocks.count }
         if let renderer = shuttleRenderer, renderingNormal, !isShuttling, loopFrames != nil, renderer.sourceTransitionComplete {
             nextFrame = max(0, Int((renderer.renderedPosition * format.sampleRate).rounded()))
             seekFade = []; seekFadeFrame = 0
@@ -737,7 +757,7 @@ final class LivePlayback {
             }
             outputFrames += Int(buffer.frameLength); scheduled += 1
             let pauseFinal = advanceTransportFade(frames: Int(buffer.frameLength))
-            schedule(buffer, last: renderer.reachedEnd, format: pcmFormat, pauseFinal: pauseFinal)
+            schedule(buffer, last: renderer.reachedEnd, format: pcmFormat, pauseFinal: pauseFinal, replenishes: bridgeFrames == nil)
             return
         }
         let loop = !isShuttling && loopArmed ? loopFrames : nil
@@ -792,11 +812,11 @@ final class LivePlayback {
         outputFrames += frames; scheduled += 1
         if pausing, loop != nil { pausePosition = Double(nextFrame) / format.sampleRate }
         let pauseFinal = advanceTransportFade(frames: frames)
-        schedule(buffer, last: !recordingPlayback && loop == nil && nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal)
+        schedule(buffer, last: !recordingPlayback && loop == nil && nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal, replenishes: bridgeFrames == nil)
     }
-    private func schedule(_ buffer: AVAudioPCMBuffer, last: Bool, format pcmFormat: AVAudioFormat, pauseFinal: Bool = false) {
+    private func schedule(_ buffer: AVAudioPCMBuffer, last: Bool, format pcmFormat: AVAudioFormat, pauseFinal: Bool = false, replenishes: Bool = true) {
         let bufferFrames = Int(buffer.frameLength)
-        let bufferGeneration = bufferFill.enqueue(frames: bufferFrames, capacity: max(3, Int(ceil(format.sampleRate / 48_000 * 3))) * 512)
+        let bufferGeneration = bufferFill.enqueue(frames: bufferFrames, capacity: bufferFrameCount)
         let generation = streamGeneration
         let completionType: AVAudioPlayerNodeCompletionCallbackType = last || pauseFinal
             ? (engine.isInManualRenderingMode ? .dataRendered : .dataPlayedBack)
@@ -811,7 +831,7 @@ final class LivePlayback {
                 do {
                     if self.pausing {
                         if pauseFinal || self.scheduled == 0 { try self.finishPause() }
-                    } else { try self.enqueue(format: pcmFormat) }
+                    } else if replenishes || last { try self.enqueue(format: pcmFormat) }
                 }
                 catch { self.running = false; DispatchQueue.main.async { self.finished?(error) } }
             }
@@ -843,7 +863,7 @@ final class LivePlayback {
             if frames != nil, self.running, !self.isPaused, self.engine.isRunning {
                 let pcm = AVAudioFormat(standardFormatWithSampleRate: self.format.sampleRate, channels: AVAudioChannelCount(self.format.channels))!
                 do {
-                    while self.scheduled < max(3, Int(ceil(self.format.sampleRate / 48_000 * 3))) {
+                    while self.scheduled < self.bufferBlockCount {
                         let before = self.scheduled
                         try self.enqueue(format: pcm)
                         if self.scheduled == before { break }
@@ -1097,6 +1117,8 @@ final class ShuttlePlayback {
     private var outputFrame = 0
     private var playedFrames = 0
     private var scheduled = 0
+    private let bufferBlocks: [Int]
+    private var bufferBlockIndex = 0
     private var terminal = false
     var isPlaying: Bool { node.isPlaying && engine.isRunning }
     private var isCancelled: Bool { cancellation.lock(); defer { cancellation.unlock() }; return cancelled }
@@ -1110,6 +1132,7 @@ final class ShuttlePlayback {
     }
     init(source: DryShuttleSource, start: Double, direction: Double, initialSpeed: Double = 0) {
         self.source = source; self.format = source.project.audioFormat
+        bufferBlocks = PlaybackBufferSize.blocks(frames: source.project.playbackBufferSize)
         let format = source.project.audioFormat
         motion = ShuttleMotion(start: start, direction: direction < 0 ? -1 : 1, end: Double(source.frameCount) / format.sampleRate, initialSpeed: initialSpeed)
         motions = [(0, motion)]
@@ -1213,7 +1236,7 @@ final class ShuttlePlayback {
             guard let self else { return }
             do {
                 self.started = true
-                for _ in 0..<8 { try self.enqueue() }
+                for _ in 0..<self.bufferBlocks.count { try self.enqueue() }
                 DispatchQueue.main.async { [weak self] in
                     guard let self, !self.isCancelled else { return }
                     do { self.engine.prepare(); try self.engine.start(); self.node.play() }
@@ -1224,13 +1247,15 @@ final class ShuttlePlayback {
     }
     private func enqueue() throws {
         guard !isCancelled else { return }
-        guard let buffer = try render(frames: 512) else {
+        let frames = bufferBlocks[bufferBlockIndex]
+        bufferBlockIndex = (bufferBlockIndex + 1) % bufferBlocks.count
+        guard let buffer = try render(frames: frames) else {
             if scheduled == 0 { report(nil) }
             return
         }
         scheduled += 1
         let bufferFrames = Int(buffer.frameLength)
-        let bufferGeneration = bufferFill.enqueue(frames: bufferFrames, capacity: 8 * 512)
+        let bufferGeneration = bufferFill.enqueue(frames: bufferFrames, capacity: source.project.playbackBufferSize)
         let last = reachedEnd
         let completion: AVAudioPlayerNodeCompletionCallbackType = last ? (engine.isInManualRenderingMode ? .dataRendered : .dataPlayedBack) : .dataConsumed
         node.scheduleBuffer(buffer, completionCallbackType: completion) { [weak self] _ in

@@ -18,6 +18,23 @@ final class Editor: NSObject {
     private var standbyKey: Data?
     var isPreparingPlayback: Bool { preparation != nil && preparationAutoplay }
     var isPrebuffering: Bool { preparation != nil && !preparationAutoplay }
+    var canEditPlaybackBuffer: Bool {
+        !isPlaying && !isRecording && !isShuttling && !isPreparingPlayback && !isPrebuffering && !requestingMic && !isImporting
+    }
+    var playbackBufferLabel: String {
+        PlaybackBufferSize.durationLabel(frames: project.playbackBufferSize, sampleRate: project.audioFormat.sampleRate)
+    }
+    func setPlaybackBufferSize(_ frames: Int) throws {
+        try PlaybackBufferSize.validate(frames)
+        guard canEditPlaybackBuffer, frames != project.playbackBufferSize else { return }
+        checkpoint(); project.playbackBufferFrames = frames; update()
+    }
+    func editPlaybackBuffer(using edit: (Int) -> Int?) throws {
+        guard canEditPlaybackBuffer else { return }
+        idlePreparation?.cancel(); idlePreparation = nil
+        defer { scheduleIdlePreparation() }
+        if let frames = edit(project.playbackBufferSize) { try setPlaybackBufferSize(frames) }
+    }
     private var preparedPosition: Double { (max(0, cursor) * project.audioFormat.sampleRate).rounded() / project.audioFormat.sampleRate }
 
     var bufferPercent: Double {
@@ -26,7 +43,7 @@ final class Editor: NSObject {
         var retained = 0.0
         if let graph = mixCache?.graph {
             let first = max(0, Int(cursor * project.audioFormat.sampleRate)) + graph.latency
-            let capacity = max(3, Int(ceil(project.audioFormat.sampleRate / 48_000 * 3))) * 512
+            let capacity = project.playbackBufferSize
             let end = min(graph.totalFrames + graph.latency, first + capacity)
             if end > first { retained = graph.outputCache.retainedReadiness(in: first..<end) }
             else { retained = graph.outputCache.retainedReadiness(in: 0..<0) }
@@ -63,6 +80,8 @@ final class Editor: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
     var project = Project()
+    private static let playbackBufferPreference = "playbackBufferFrames"
+    private let preferences: UserDefaults?
     let audio: AudioStore
     var selectedTrack: UUID?
     var selection = Set<UUID>()
@@ -133,11 +152,14 @@ final class Editor: NSObject {
     var projectName: String { project.name ?? projectURL?.deletingPathExtension().lastPathComponent ?? "MY PROJECT" }
     var suggestedFilename: String { projectName.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-") + ".sounder" }
     var selectedIndex: Int? { project.tracks.firstIndex { $0.id == selectedTrack } }
-    init(store: AudioStore, notifications: ToastCenter = ToastCenter(),
+    init(store: AudioStore, notifications: ToastCenter = ToastCenter(), preferences: UserDefaults? = nil,
          makeRecorder: ((URL, ProjectAudioFormat) throws -> LiveRecorder)? = nil,
          makePlayback: @escaping (StreamingGraph, ProjectAudioFormat, Double) throws -> LivePlayback = { LivePlayback(graph: $0, format: $1, start: $2) }) {
-        audio = store; self.notifications = notifications; self.makeRecorder = makeRecorder; self.makePlayback = makePlayback
+        audio = store; self.notifications = notifications; self.preferences = preferences
+        self.makeRecorder = makeRecorder; self.makePlayback = makePlayback
         super.init()
+        let preferred = preferences?.integer(forKey: Self.playbackBufferPreference) ?? 0
+        project.playbackBufferFrames = (try? PlaybackBufferSize.validate(preferred)) != nil ? preferred : PlaybackBufferSize.initialFrames
         audio.configure(project.audioFormat)
         selectedTrack = project.tracks.first?.id
     }
@@ -909,6 +931,7 @@ final class Editor: NSObject {
             guard forRecording || loopRange.map({ start <= $0.upperBound }) == true || start < Double(graph.totalFrames) / audio.sampleRate else { update(); return }
             cursor = start
             let playback = try makePlayback(graph, project.audioFormat, start)
+            try playback.configureBufferSize(project.playbackBufferSize)
             try playback.configureOutput(project.defaultOutput)
             try activatePlayback(playback, key: mixCacheKey(), rememberStart: rememberStart, forRecording: forRecording, alreadyStarted: false)
         } catch { player?.stop(); player = nil; self.error(error) }
@@ -1019,13 +1042,14 @@ final class Editor: NSObject {
                     return
                 }
                 let prepared = try factory(graph, snapshot.audioFormat, start); playback = prepared
+                try prepared.configureBufferSize(snapshot.playbackBufferSize)
                 job.setPhase("Preparing playback audio")
                 try prepared.configureOutput(snapshot.defaultOutput)
                 prepared.setMetronome(tempo: snapshot.tempo, enabled: snapshot.metronomeEnabled)
                 prepared.setLoop(loop)
                 if forRecording { try prepared.prepareForRecording() }
                 let history = prepared.graph.needsHistory ? Double(Int((start * rate).rounded()) + prepared.graph.latency) : 0
-                let ahead = Double(max(3, Int(ceil(rate / 48_000 * 3))) * 512)
+                let ahead = Double(snapshot.playbackBufferSize)
                 job.beginRendering(frames: history + ahead)
                 try prepared.startPlayback(playImmediately: false, cancelled: { job.isCancelled }, progress: { job.advance(frames: Double($0)) })
                 try job.check()
@@ -1191,6 +1215,7 @@ final class Editor: NSObject {
         }
         pendingRecordedSources.subtract(saved.sources.keys)
         projectURL = url; dirty = false; update("Saved \(url.lastPathComponent)")
+        preferences?.set(project.playbackBufferSize, forKey: Self.playbackBufferPreference)
         // Commit paths before removing temporary takes: saved media always survives a failure.
         for (source, target) in recordedSourceCleanup {
             guard FileManager.default.fileExists(atPath: target) else { continue }
