@@ -12,6 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable instancetype)initWithPath:(NSString *)path classID:(NSString *)classID state:(nullable NSData *)state error:(NSError **)error;
 - (nullable instancetype)initWithPath:(NSString *)path classID:(NSString *)classID state:(nullable NSData *)state sampleRate:(double)sampleRate error:(NSError **)error;
 - (nullable NSData *)processAudio:(NSData *)audio channels:(NSInteger)channels error:(NSError **)error;
+- (nullable NSData *)processAudio:(NSData *)audio channels:(NSInteger)channels progress:(void (NS_NOESCAPE ^)(double))progress cancelled:(BOOL (NS_NOESCAPE ^)(void))cancelled error:(NSError **)error;
 - (nullable NSData *)processMono:(NSData *)audio error:(NSError **)error;
 - (nullable NSData *)saveState:(NSError **)error;
 - (NSArray<NSDictionary<NSString *, id> *> *)parameters;

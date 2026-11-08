@@ -888,7 +888,7 @@ final class Timeline: NSView {
     private func updateTrackControlHover(at point: NSPoint?) {
         var next: (id: UUID, kind: Int)?
         if let point, visibleTrackRect.contains(point), point.x < fragmentLeft,
-           !editor.isRecording, !editor.isShuttling, !editor.requestingMic, !editor.isImporting {
+           !editor.isRecording, !editor.isShuttling, !editor.requestingMic, !editor.isExporting, !editor.isImporting {
             let row = Int((point.y - ruler) / rowHeight)
             if rows.indices.contains(row) {
                 let (track, depth) = rows[row]
@@ -905,7 +905,7 @@ final class Timeline: NSView {
     override func mouseExited(with event: NSEvent) { updateTrackControlHover(at: nil) }
     private func drawTrackControlHover(_ id: UUID, kind: Int, rect: NSRect) {
         guard window?.isKeyWindow == true, hoveredTrackControl?.id == id, hoveredTrackControl?.kind == kind,
-              !editor.isRecording, !editor.isShuttling, !editor.requestingMic, !editor.isImporting else { return }
+              !editor.isRecording, !editor.isShuttling, !editor.requestingMic, !editor.isExporting, !editor.isImporting else { return }
         fill(rect, NSColor.white.withAlphaComponent(0.10), radius: 5)
         NSColor.white.withAlphaComponent(0.16).setStroke()
         let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.4, dy: 0.4), xRadius: 5, yRadius: 5); path.lineWidth = 0.7; path.stroke()
@@ -1371,7 +1371,7 @@ final class Timeline: NSView {
                 .intersection(NSRect(x: fragmentLeft, y: pinnedRulerRect.minY, width: max(0, viewportRect.width - header), height: ruler))
         }
     }
-    var canSelectRange: Bool { !editor.isRecording && !editor.requestingMic && !editor.isImporting }
+    var canSelectRange: Bool { !editor.isRecording && !editor.requestingMic && !editor.isExporting && !editor.isImporting }
     private func enumerateCursorRects(_ add: (NSRect, NSCursor) -> Void) {
         if canSelectRange {
             for rect in rangeHandleRects() {
@@ -1413,7 +1413,7 @@ final class Timeline: NSView {
                                    (trackMuteRect(row: row, depth: depth), NSCursor.arrow),
                                    (trackSoloRect(row: row, depth: depth), NSCursor.arrow)] {
                 let visible = rect.intersection(visibleTrackRect)
-                if !visible.isEmpty && (!editor.busy || ((rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isImporting)) { add(visible, cursor) }
+                if !visible.isEmpty && (!editor.busy || ((rect == trackMuteRect(row: row, depth: depth) || rect == trackSoloRect(row: row, depth: depth)) && !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isExporting && !editor.isImporting)) { add(visible, cursor) }
             }
         }
     }
@@ -1769,7 +1769,7 @@ final class Timeline: NSView {
             }
             return
         }
-        if !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isImporting && isTrackPoint(point) && point.x < fragmentLeft {
+        if !editor.isRecording && !editor.isShuttling && !editor.requestingMic && !editor.isExporting && !editor.isImporting && isTrackPoint(point) && point.x < fragmentLeft {
             let row = Int((point.y - ruler) / rowHeight)
             if rows.indices.contains(row), trackMuteRect(row: row, depth: rows[row].1).contains(point) {
                 editor.selectedTrack = rows[row].0.id

@@ -47,7 +47,7 @@ struct ImportedAudio {
     let data: AudioData
 }
 
-private final class ImportRow: NSView {
+final class AudioFileProgressRow: NSView {
     let progress = NSProgressIndicator()
     let status = NSTextField(labelWithString: "Waiting")
     init(url: URL) {
@@ -61,6 +61,12 @@ private final class ImportRow: NSView {
         status.frame = NSRect(x: 0, y: 6, width: 508, height: 18); status.lineBreakMode = .byTruncatingTail; addSubview(status)
     }
     required init?(coder: NSCoder) { fatalError() }
+    func update(fraction: Double, phase: String) {
+        progress.doubleValue = fraction
+        status.stringValue = phase == "Ready" || phase == "Cancelled" || phase.hasPrefix("Failed:") ? phase : "\(phase) · \(Int(fraction * 100))%"
+        status.textColor = phase.hasPrefix("Failed:") ? .systemRed : phase == "Ready" ? .systemGreen : .secondaryLabelColor
+        status.toolTip = status.stringValue
+    }
 }
 
 /// Owns the import window on the main thread; decoding uses no shared cache or UI.
@@ -76,7 +82,7 @@ final class AudioImportController: NSObject, NSWindowDelegate {
     private(set) var fractions: [Double]
     private(set) var statuses: [String]
     private(set) var window: NSWindow!
-    private var rows: [ImportRow] = []
+    private var rows: [AudioFileProgressRow] = []
     private let button = PointerButton()
     private let queue = DispatchQueue(label: "Sounder.import", qos: .userInitiated)
     private let cancellationLock = NSLock()
@@ -104,7 +110,7 @@ final class AudioImportController: NSObject, NSWindowDelegate {
         scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 508, height: CGFloat(urls.count) * 74))
         for (index, url) in urls.enumerated() {
-            let row = ImportRow(url: url); row.frame.origin.y = CGFloat(urls.count - index - 1) * 74
+            let row = AudioFileProgressRow(url: url); row.frame.origin.y = CGFloat(urls.count - index - 1) * 74
             content.addSubview(row); rows.append(row)
         }
         scroll.documentView = content; root.addSubview(scroll)
@@ -122,10 +128,7 @@ final class AudioImportController: NSObject, NSWindowDelegate {
         lastProgressTime = time; lastPhase = phase
         DispatchQueue.main.async { [self] in
             fractions[index] = max(fractions[index], min(1, fraction)); statuses[index] = phase
-            rows[index].progress.doubleValue = fractions[index]
-            rows[index].status.stringValue = phase == "Ready" || phase == "Cancelled" || phase.hasPrefix("Failed:") ? phase : "\(phase) · \(Int(fractions[index] * 100))%"
-            rows[index].status.textColor = phase.hasPrefix("Failed:") ? .systemRed : phase == "Ready" ? .systemGreen : .secondaryLabelColor
-            rows[index].status.toolTip = rows[index].status.stringValue
+            rows[index].update(fraction: fractions[index], phase: phase)
         }
     }
     private func copy(_ source: URL, to destination: URL, index: Int) throws {

@@ -15,18 +15,25 @@ enum PluginProcessing {
     static func apply(_ samples: [Float], effects: [PluginEffect]) throws -> [Float] {
         try apply(AudioSignal(channels: [samples]), effects: effects, format: ProjectAudioFormat(channels: 1)).mono
     }
-    static func apply(_ signal: AudioSignal, effects: [PluginEffect], format: ProjectAudioFormat) throws -> AudioSignal {
+    static func apply(_ signal: AudioSignal, effects: [PluginEffect], format: ProjectAudioFormat,
+                      progress: (Double, String) -> Void = { _, _ in }, cancelled: () -> Bool = { false }) throws -> AudioSignal {
         var output = signal
-        for effect in effects where !effect.bypassed {
+        let active = effects.filter { !$0.bypassed }
+        for (index, effect) in active.enumerated() {
             do {
+                if cancelled() { throw CancellationError() }
+                progress(Double(index) / Double(active.count), "Processing " + effect.name)
                 let host = try SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: format.sampleRate)
                 var interleaved = [Float](repeating: 0, count: output.frameCount * format.channels)
                 for frame in 0..<output.frameCount { for channel in 0..<format.channels { interleaved[frame * format.channels + channel] = output.channels[channel][frame] } }
-                let processed = try host.processAudio(interleaved.withUnsafeBytes { Data($0) }, channels: format.channels)
+                let processed = try host.processAudio(interleaved.withUnsafeBytes { Data($0) }, channels: format.channels, progress: {
+                    progress((Double(index) + $0) / Double(active.count), "Processing " + effect.name)
+                }, cancelled: cancelled)
                 let values = processed.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
                 let frames = values.count / format.channels
                 output = AudioSignal(channels: (0..<format.channels).map { channel in (0..<frames).map { values[$0 * format.channels + channel] } })
             } catch {
+                if cancelled() || error is CancellationError { throw CancellationError() }
                 throw SounderError.message("\(effect.name): \(error.localizedDescription)\nOpen the track’s FX chain to bypass or replace the plug-in.")
             }
         }

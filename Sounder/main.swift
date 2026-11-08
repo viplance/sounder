@@ -471,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var projectAuxiliaryWindows: [NSWindow] {
         Array(editor.effectsWindows.values).compactMap { $0.window } +
         Array(editor.pluginWindows.values).compactMap { $0.window } +
-        [editor.importer?.window, audioRoutingWindow?.window].compactMap { $0 }
+        [editor.importer?.window, editor.exporter?.window, audioRoutingWindow?.window].compactMap { $0 }
     }
     func windowWillMiniaturize(_ notification: Notification) {
         guard notification.object as? NSWindow === window else { return }
@@ -745,6 +745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--physical-shortcuts-ui-test") { try verifyPhysicalShortcutsUI() }
             if CommandLine.arguments.contains("--tap-tempo-ui-test") { try verifyTapTempoUI() }
             if CommandLine.arguments.contains("--tempo-ui-test") { try verifyTempoUI() }
+            if CommandLine.arguments.contains("--export-progress-ui-test") { try verifyExportProgressUI() }
             if CommandLine.arguments.contains("--export-ui-test") { try verifyExportUI() }
             if CommandLine.arguments.contains("--restart-ui-test") { try verifyRestartUI() }
             if CommandLine.arguments.contains("--mute-ui-test") { try verifyMuteUI() }
@@ -1107,14 +1108,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         metronomeButton.image = NSImage(systemSymbolName: editor.project.metronomeEnabled ? "metronome.fill" : "metronome", accessibilityDescription: "Metronome")
         metronomeButton.contentTintColor = editor.project.metronomeEnabled ? .systemOrange : .secondaryLabelColor
         metronomeButton.toolTip = editor.project.metronomeEnabled ? "Metronome on" : "Metronome off"
-        tempoButton.isEnabled = !editor.isImporting && !editor.requestingMic
+        tempoButton.isEnabled = !editor.isExporting && !editor.isImporting && !editor.requestingMic
         bpmButton.isEnabled = tempoButton.isEnabled; metronomeButton.isEnabled = tempoButton.isEnabled
         loopButton.state = editor.project.loopEnabled ? .on : .off
         loopButton.contentTintColor = editor.project.loopEnabled ? accent : .labelColor
         loopButton.toolTip = editor.project.loopEnabled ? "Loop on" : "Loop off"
         loopButton.isEnabled = editor.canToggleLoop
         playButton.image = NSImage(systemSymbolName: (editor.isPlaying || editor.isPreparingPlayback) ? "pause.fill" : "play.fill", accessibilityDescription: "Play / pause")
-        playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isImporting; recordButton.isEnabled = editor.canRecord
+        playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isExporting && !editor.isImporting; recordButton.isEnabled = editor.canRecord
         editButtons.forEach { $0.isEnabled = !editor.busy }
         for name in ["open", "save"] {
             projectFileButtons[name]?.isEnabled = !editor.busy
@@ -1148,6 +1149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func windowDidResize(_ notification: Notification) { updateProjectNameWidth(); timeline?.refresh() }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if editor.isExporting { editor.exporter?.cancel(); return false }
         if editor.isImporting { editor.importer?.cancel(); return false }
         if editor.isRecording { editor.stop() }
         closingConfirmed = editor.confirmDiscard()
@@ -1160,6 +1162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if editor.isExporting { editor.exporter?.cancel(); return .terminateCancel }
         if editor.isImporting { editor.importer?.cancel(); return .terminateCancel }
         if closingConfirmed { return .terminateNow }; if editor.isRecording { editor.stop() }; return editor.confirmDiscard() ? .terminateNow : .terminateCancel
     }
@@ -1268,7 +1271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if [#selector(restartPlayback), #selector(play), #selector(seekBackward), #selector(seekForward), #selector(seekToStart), #selector(seekToEnd), #selector(stop), #selector(record), #selector(rewind)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
                 && (!editor.isRecording || menuItem.action == #selector(restartPlayback) || menuItem.action == #selector(play))
-                && !editor.requestingMic && !editor.isImporting
+                && !editor.requestingMic && !editor.isExporting && !editor.isImporting
         }
         return true
     }

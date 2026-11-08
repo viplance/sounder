@@ -130,6 +130,8 @@
 
 ## Export
 
+- Export runs off the main thread from a project/source snapshot, with the same compact file/progress row as Import and a Cancel button. Report real decode, mix, per-block FX, resampling, writing and encoder progress; throttle UI updates, never simulate progress. Cancel cooperatively and preserve existing destination files, settings and metadata on failure/cancellation. Commit the file atomically and remember choices only on success. Disable conflicting project/transport edits while exporting, and include its window in project minimize/restore.
+
 - Put a Metadata disclosure button at the left of the Export audio footer. Expand editable track name, artist, album, album artist, composer, genre, date, track/disc number, copyright and comment in the same dialog; collapsing must retain edits. Write tags to MP3 (Unicode ID3v2), OGG (UTF-8 Vorbis comments) and WAV (RIFF INFO plus ID3). Keep audio samples/range unchanged. Commit metadata to project properties only after a successful file export, support Undo, persist on project Save and restore on reopening export. Cancel or failure must preserve previous metadata and existing destination files.
 
 - Show an initially unchecked Selected range checkbox at the bottom of Export audio only for a nonempty timeline selection. When checked, export exactly that captured interval for WAV/MP3/OGG, preserving pre-range effect history and padding selected empty timeline space with silence. Crop at the project rate before final resampling. Keep the range choice transient; normal format settings retain their existing persistence.

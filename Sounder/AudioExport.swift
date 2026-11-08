@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import UniformTypeIdentifiers
+import Darwin
 
 /// Project-level tags shared by the export dialog and all file encoders.
 struct AudioMetadata: Codable, Equatable {
@@ -169,13 +170,47 @@ final class ExportOptionsController: NSObject {
 
 enum AudioExporter {
     static var encoderURL: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/AudioEncoder") }
-    @discardableResult static func runEncoder(_ arguments: [String]) throws -> Data {
+    @discardableResult static func runEncoder(_ arguments: [String], captureOutput: Bool = true, progress: (Double) -> Void = { _ in }, cancelled: () -> Bool = { false }) throws -> Data {
+        if cancelled() { throw CancellationError() }
         let process = Process(); process.executableURL = encoderURL; process.arguments = arguments
         let output = Pipe(), errors = Pipe(); process.standardOutput = output; process.standardError = errors
         try process.run()
-        let result = output.fileHandleForReading.readDataToEndOfFile()
-        let failure = errors.fileHandleForReading.readDataToEndOfFile()
+        defer {
+            if process.isRunning { process.terminate(); process.waitUntilExit() }
+            try? output.fileHandleForReading.close(); try? errors.fileHandleForReading.close()
+        }
+        // Drain both pipes and poll cancellation without waiting for the encoder
+        // or letting a full stderr pipe deadlock the worker.
+        var descriptors = [output.fileHandleForReading.fileDescriptor, errors.fileHandleForReading.fileDescriptor].map {
+            pollfd(fd: $0, events: Int16(POLLIN), revents: 0)
+        }
+        var result = Data(), failure = Data(), lines = Data(), bytes = [UInt8](repeating: 0, count: 8192)
+        var terminating = false
+        while descriptors.contains(where: { $0.fd >= 0 }) {
+            if cancelled(), !terminating, process.isRunning { terminating = true; process.terminate() }
+            let ready = poll(&descriptors, nfds_t(descriptors.count), 50)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                throw SounderError.message("Cannot read audio encoder progress")
+            }
+            for index in descriptors.indices where descriptors[index].fd >= 0 && descriptors[index].revents != 0 {
+                let count = Darwin.read(descriptors[index].fd, &bytes, bytes.count)
+                if count == 0 { descriptors[index].fd = -1; continue }
+                if count < 0 { if errno == EINTR { continue }; throw SounderError.message("Cannot read audio encoder output") }
+                let data = Data(bytes.prefix(count))
+                if index == 1 { failure.append(data); continue }
+                if captureOutput { result.append(data) }
+                else {
+                    lines.append(data)
+                    while let newline = lines.firstIndex(of: 10) {
+                        if let text = String(data: lines[..<newline], encoding: .utf8), text.hasPrefix("progress "), let value = Double(text.dropFirst(9)) { progress(min(1, max(0, value))) }
+                        lines.removeSubrange(...newline)
+                    }
+                }
+            }
+        }
         process.waitUntilExit()
+        if cancelled() { throw CancellationError() }
         guard process.terminationStatus == 0 else { throw SounderError.message(String(data: failure, encoding: .utf8) ?? "Audio export failed") }
         return result
     }
@@ -188,7 +223,7 @@ enum AudioExporter {
         if payload.count % 2 != 0 { result.append(0) }
         return result
     }
-    private static func addWAVMetadata(_ metadata: AudioMetadata, to url: URL) throws {
+    private static func addWAVMetadata(_ metadata: AudioMetadata, to url: URL, cancelled: () -> Bool) throws {
         guard !metadata.encoderArguments.isEmpty else { return }
         var info = Data("INFO".utf8)
         for field in AudioMetadata.fields {
@@ -197,7 +232,7 @@ enum AudioExporter {
             info.append(try riffChunk(name, value))
         }
         // ID3 preserves all Unicode fields, including tags without a RIFF INFO equivalent.
-        let id3 = try runEncoder(["--id3"] + metadata.encoderArguments)
+        let id3 = try runEncoder(["--id3"] + metadata.encoderArguments, cancelled: cancelled)
         var tags = Data()
         if info.count > 4 { tags.append(try riffChunk("LIST", info)) }
         tags.append(try riffChunk("id3 ", id3))
@@ -214,7 +249,7 @@ enum AudioExporter {
         try file.seek(toOffset: 4)
         try withUnsafeBytes(of: &size) { try file.write(contentsOf: Data($0)) }
     }
-    static func write(project: Project, store: AudioStore, settings: ExportSettings, to destination: URL, range: Range<Double>? = nil) throws {
+    static func write(project: Project, store: AudioStore, settings: ExportSettings, to destination: URL, range: Range<Double>? = nil, progress: (Double, String) -> Void = { _, _ in }, cancelled: () -> Bool = { false }) throws {
         try settings.validate()
         try project.metadata.validate()
         if let range {
@@ -224,8 +259,30 @@ enum AudioExporter {
         let work = fm.temporaryDirectory.appendingPathComponent("SounderExport-" + UUID().uuidString)
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
+        if cancelled() { throw CancellationError() }
+        let tracks = project.processingTracks, solo = TrackSoloRouting(tracks: project.processingTracks)
+        var audible = Set<UUID>()
+        func include(_ track: Track) {
+            guard !track.muted, solo.buses.contains(track.id), audible.insert(track.id).inserted else { return }
+            for child in tracks where child.parent == track.id { include(child) }
+        }
+        for root in tracks where root.parent == nil { include(root) }
+        let paths = Set(project.tracks.filter { audible.contains($0.id) && solo.dry.contains($0.id) }.flatMap(\.clips).filter { !$0.muted }.map(\.source)).sorted()
+        for (index, path) in paths.enumerated() {
+            if cancelled() { throw CancellationError() }
+            if store.cache[path] == nil {
+                store.cache[path] = try AudioStore.decode(URL(fileURLWithPath: path), sampleRate: project.audioFormat.sampleRate, progress: {
+                    progress(0.15 * (Double(index) + $0) / Double(paths.count), $1)
+                }, isCancelled: cancelled)
+            }
+            progress(0.15 * Double(index + 1) / Double(paths.count), "Audio loaded")
+        }
         // Mix and process effects at the project rate, then resample the final mix once.
-        var signal = try store.renderAudio(project)
+        progress(0.15, "Mixing audio")
+        var signal = try store.renderAudio(project, cancelled: cancelled, renderProgress: {
+            progress(0.15 + 0.5 * $0, $1)
+        })
+        if cancelled() { throw CancellationError() }
         if let range {
             // Crop after effects so delay/reverb history before the selected start
             // remains correct. Pad empty timeline space to the exact range length.
@@ -240,32 +297,128 @@ enum AudioExporter {
         }
         if settings.sampleRate != project.audioFormat.sampleRate {
             let source = work.appendingPathComponent("mix.wav")
-            try store.write(signal, to: source)
-            signal = AudioSignal(channels: try AudioStore.decode(source, sampleRate: settings.sampleRate).channels)
+            try store.write(signal, to: source, progress: { progress(0.65 + 0.05 * $0, "Preparing resampling") }, cancelled: cancelled)
+            signal = AudioSignal(channels: try AudioStore.decode(source, sampleRate: settings.sampleRate, progress: { value, _ in
+                progress(0.7 + 0.1 * value, "Resampling audio")
+            }, isCancelled: cancelled).channels)
         }
         let temporary = destination.deletingLastPathComponent().appendingPathComponent(".sounder-" + UUID().uuidString + "." + settings.format.rawValue)
         defer { try? fm.removeItem(at: temporary) }
         if settings.format == .wav {
             let writer = try AudioStore(directory: work)
             writer.configure(ProjectAudioFormat(sampleRate: settings.sampleRate, channels: project.audioFormat.channels, bitDepth: settings.bitDepth))
-            try writer.write(signal, to: temporary, bitDepth: settings.bitDepth)
-            try addWAVMetadata(project.metadata, to: temporary)
+            try writer.write(signal, to: temporary, bitDepth: settings.bitDepth, progress: { progress(0.8 + 0.18 * $0, "Writing WAV") }, cancelled: cancelled)
+            try addWAVMetadata(project.metadata, to: temporary, cancelled: cancelled)
         } else {
             let raw = work.appendingPathComponent("mix.f32")
             fm.createFile(atPath: raw.path, contents: nil)
             let file = try FileHandle(forWritingTo: raw)
             do {
                 for first in stride(from: 0, to: signal.frameCount, by: 4096) {
+                    if cancelled() { throw CancellationError() }
                     let last = min(signal.frameCount, first + 4096)
                     var interleaved = [Float](); interleaved.reserveCapacity((last-first) * signal.channels.count)
                     for frame in first..<last { for channel in signal.channels { interleaved.append(channel[frame]) } }
                     try interleaved.withUnsafeBytes { try file.write(contentsOf: Data($0)) }
+                    progress(0.8 + 0.05 * Double(last) / Double(max(1, signal.frameCount)), "Preparing " + settings.format.title)
                 }
                 try file.close()
             } catch { try? file.close(); throw error }
-            try runEncoder([settings.format.rawValue, String(Int(settings.sampleRate)), String(project.audioFormat.channels), raw.path, temporary.path, settings.format == .mp3 ? String(settings.mp3Bitrate) : "0.7"] + project.metadata.encoderArguments)
+            try runEncoder([settings.format.rawValue, String(Int(settings.sampleRate)), String(project.audioFormat.channels), raw.path, temporary.path, settings.format == .mp3 ? String(settings.mp3Bitrate) : "0.7"] + project.metadata.encoderArguments, captureOutput: false, progress: {
+                progress(0.85 + 0.14 * $0, "Encoding " + settings.format.title)
+            }, cancelled: cancelled)
         }
+        if cancelled() { throw CancellationError() }
+        progress(0.99, "Finishing export")
         if fm.fileExists(atPath: destination.path) { _ = try fm.replaceItemAt(destination, withItemAt: temporary) }
         else { try fm.moveItem(at: temporary, to: destination) }
+        progress(1, "Ready")
     }
+}
+
+/// Owns the export UI; the worker uses an immutable project/cache snapshot.
+final class AudioExportController: NSObject, NSWindowDelegate {
+    weak var editor: Editor?
+    let destination: URL
+    let settings: ExportSettings
+    let project: Project
+    let range: Range<Double>?
+    private let directory: URL
+    private let sources: [String: AudioData]
+    private(set) var isRunning = false
+    private(set) var fraction = 0.0
+    private(set) var failure: Error?
+    private(set) var window: NSWindow!
+    private let row: AudioFileProgressRow
+    private let button = PointerButton()
+    private let queue = DispatchQueue(label: "Sounder.export", qos: .userInitiated)
+    private let lock = NSLock()
+    private var cancelled = false
+    private var lastProgressTime = 0.0
+    private var lastPhase = ""
+    var completed: (() -> Void)?
+    init(editor: Editor, destination: URL, settings: ExportSettings, range: Range<Double>?, metadata: AudioMetadata) {
+        self.editor = editor; self.destination = destination; self.settings = settings; self.range = range
+        var snapshot = editor.project; snapshot.metadata = metadata; project = snapshot
+        directory = editor.audio.directory; sources = editor.audio.cache
+        row = AudioFileProgressRow(url: destination)
+    }
+    private var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func start() {
+        guard !isRunning, window == nil else { return }
+        isRunning = true
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 144), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Export audio"; window.delegate = self; window.isReleasedWhenClosed = false
+        let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
+        row.frame.origin = NSPoint(x: 22, y: 54); root.addSubview(row)
+        row.update(fraction: 0, phase: "Preparing export")
+        button.title = "Cancel"; button.bezelStyle = .rounded; button.target = self; button.action = #selector(pressButton)
+        button.frame = NSRect(x: 426, y: 12, width: 112, height: 30); root.addSubview(button)
+        window.center(); window.makeKeyAndOrderFront(nil); editor?.update()
+        DispatchQueue.main.async { [self] in queue.async { [self] in performExport() } }
+    }
+    private func publish(_ value: Double, _ phase: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard value == 1 || phase != lastPhase || now - lastProgressTime >= 0.04 else { return }
+        lastProgressTime = now; lastPhase = phase
+        DispatchQueue.main.async { [self] in
+            fraction = max(fraction, min(1, value)); row.update(fraction: fraction, phase: phase)
+        }
+    }
+    private func performExport() {
+        let result: Result<Void, Error>
+        do {
+            let store = try AudioStore(directory: directory)
+            store.configure(project.audioFormat); store.cache = sources
+            try AudioExporter.write(project: project, store: store, settings: settings, to: destination, range: range,
+                                    progress: { self.publish($0, $1) }, cancelled: { self.isCancelled })
+            result = .success(())
+        } catch { result = .failure(error) }
+        DispatchQueue.main.async { [self] in
+            isRunning = false; button.title = "Close"; button.isEnabled = true
+            switch result {
+            case .success:
+                fraction = 1; row.update(fraction: 1, phase: "Ready")
+                editor?.finishAudioExport(to: destination, settings: settings, metadata: project.metadata)
+            case .failure(let error):
+                failure = error
+                row.update(fraction: fraction, phase: error is CancellationError ? "Cancelled" : "Failed: " + error.localizedDescription)
+                editor?.update()
+                if !(error is CancellationError) { editor?.error(error) }
+            }
+            let callback = completed; completed = nil; callback?()
+            if failure == nil || failure is CancellationError { close() }
+        }
+    }
+    func cancel() {
+        lock.lock(); cancelled = true; lock.unlock()
+        if isRunning { button.title = "Cancelling…"; button.isEnabled = false }
+    }
+    @objc private func pressButton() { if isRunning { cancel() } else { close() } }
+    func close() {
+        guard !isRunning else { cancel(); return }
+        window?.orderOut(nil)
+        if editor?.exporter === self { editor?.exporter = nil }
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { pressButton(); return false }
 }

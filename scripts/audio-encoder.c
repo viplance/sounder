@@ -107,7 +107,9 @@ int main(int argc, char **argv) {
     if ((channels != 1 && channels != 2) || rate <= 0) return 1;
     FILE *in = fopen(argv[4], "rb"), *out = fopen(argv[5], "wb+");
     if (!in || !out) { if (in) fclose(in); if (out) fclose(out); perror("Audio export"); return 1; }
+    fseek(in, 0, SEEK_END); long input_bytes = ftell(in); rewind(in);
     float pcm[4096 * 2]; int result = 0;
+
     if (!strcmp(kind, "mp3")) {
         lame_t encoder = lame_init();
         if (!encoder) { result = 1; goto finish; }
@@ -123,6 +125,7 @@ int main(int argc, char **argv) {
             int bytes = channels == 2 ? lame_encode_buffer_interleaved_ieee_float(encoder, pcm, (int)count, encoded, sizeof(encoded))
                                      : lame_encode_buffer_ieee_float(encoder, pcm, pcm, (int)count, encoded, sizeof(encoded));
             if (bytes < 0 || fwrite(encoded, 1, bytes, out) != (size_t)bytes) { result = 1; break; }
+            printf("progress %.9f\n", input_bytes > 0 ? (double)ftell(in) / input_bytes : 1.0); fflush(stdout);
         }
         if (!result) {
             int bytes = lame_encode_flush(encoder, encoded, sizeof(encoded));
@@ -156,6 +159,7 @@ int main(int argc, char **argv) {
                     while (ogg_stream_pageout(&stream, &output)) if (!page(out, &output)) result = 1;
                 }
             }
+            printf("progress %.9f\n", input_bytes > 0 ? (double)ftell(in) / input_bytes : 1.0); fflush(stdout);
         }
         ogg_stream_clear(&stream); vorbis_block_clear(&block); vorbis_dsp_clear(&dsp); vorbis_comment_clear(&comment); vorbis_info_clear(&info);
     } else result = 1;

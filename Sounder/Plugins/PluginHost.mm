@@ -304,6 +304,9 @@ struct Engine {
     return [self processAudio:audio channels:1 error:error];
 }
 - (NSData *)processAudio:(NSData *)audio channels:(NSInteger)channels error:(NSError **)error {
+    return [self processAudio:audio channels:channels progress:^(double) {} cancelled:^BOOL { return NO; } error:error];
+}
+- (NSData *)processAudio:(NSData *)audio channels:(NSInteger)channels progress:(void (NS_NOESCAPE ^)(double))progress cancelled:(BOOL (NS_NOESCAPE ^)(void))cancelled error:(NSError **)error {
     std::lock_guard<std::recursive_mutex> lock(_engine->mutex);
     if ((channels != 1 && channels != 2) || audio.length % (sizeof(float) * channels)) { fail(error, @"Invalid audio channel data."); return nil; }
     if (!_engine->prepare((int)channels, error)) return nil;
@@ -315,6 +318,7 @@ struct Engine {
     std::vector<std::vector<float>> in(channels, std::vector<float>(blockSize)), out(channels, std::vector<float>(blockSize));
     const auto *samples = (const float *)audio.bytes;
     for (size_t offset = 0; offset < total; offset += blockSize) {
+        if (cancelled()) { if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil]; return nil; }
         int count = (int)std::min((size_t)blockSize, total - offset);
         for (int ch = 0; ch < channels; ++ch) {
             std::fill(in[ch].begin(), in[ch].end(), 0);
@@ -322,6 +326,7 @@ struct Engine {
         }
         if (!_engine->block(in, out, count, offset, error)) return nil;
         for (int i = 0; i < count; ++i) for (int ch = 0; ch < channels; ++ch) result[(offset + i) * channels + ch] = std::isfinite(out[ch][i]) ? out[ch][i] : 0;
+        progress(double(offset + count) / double(total));
     }
     return [NSData dataWithBytes:result.data() + delay * channels length:(total - delay) * channels * sizeof(float)];
 }

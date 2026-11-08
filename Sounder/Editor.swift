@@ -19,7 +19,7 @@ final class Editor: NSObject {
     var isPreparingPlayback: Bool { preparation != nil && preparationAutoplay }
     var isPrebuffering: Bool { preparation != nil && !preparationAutoplay }
     var canEditPlaybackBuffer: Bool {
-        !isPlaying && !isRecording && !isShuttling && !isPreparingPlayback && !isPrebuffering && !requestingMic && !isImporting
+        !isPlaying && !isRecording && !isShuttling && !isPreparingPlayback && !isPrebuffering && !requestingMic && !isExporting && !isImporting
     }
     var playbackBufferLabel: String {
         PlaybackBufferSize.durationLabel(frames: project.playbackBufferSize, sampleRate: project.audioFormat.sampleRate)
@@ -69,11 +69,11 @@ final class Editor: NSObject {
     private func scheduleIdlePreparation() {
         idlePreparation?.cancel(); idlePreparation = nil
         guard preparesPlaybackInBackground, !isPlaying, !isRecording, !isShuttling,
-              !requestingMic, !isImporting, !isNormalizing, !isPreparingPlayback,
+              !requestingMic, !isExporting, !isImporting, !isNormalizing, !isPreparingPlayback,
               duration > 0, preparedPosition < duration, !(pausedPlayer != nil && pausedCursorIsCurrent) else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.isPlaying, !self.isRecording, !self.isShuttling,
-                  !self.requestingMic, !self.isImporting, !self.isNormalizing, !self.isPreparingPlayback else { return }
+                  !self.requestingMic, !self.isExporting, !self.isImporting, !self.isNormalizing, !self.isPreparingPlayback else { return }
             self.preparePlayback(rememberStart: false, forRecording: false, speculative: true)
         }
         idlePreparation = work
@@ -142,11 +142,13 @@ final class Editor: NSObject {
     var importer: AudioImportController?
     private(set) var isNormalizing = false
     var isImporting: Bool { importer?.isRunning == true }
+    var exporter: AudioExportController?
+    var isExporting: Bool { exporter?.isRunning == true }
     var requestingMic = false
     var isRecording: Bool { recorder != nil }
     var isPlaying: Bool { player?.isPlaying == true || shuttle?.isPlaying == true }
-    var canRecord: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isImporting && !isNormalizing }
-    var busy: Bool { isPreparingPlayback || isRecording || isPlaying || isShuttling || requestingMic || isImporting || isNormalizing }
+    var canRecord: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
+    var busy: Bool { isPreparingPlayback || isRecording || isPlaying || isShuttling || requestingMic || isExporting || isImporting || isNormalizing }
     var canExport: Bool { !busy && duration > 0 }
     var duration: Double { project.tracks.flatMap(\.clips).map(\.end).max() ?? 0 }
     var projectName: String { project.name ?? projectURL?.deletingPathExtension().lastPathComponent ?? "MY PROJECT" }
@@ -646,7 +648,7 @@ final class Editor: NSObject {
     func effectChain(for trackID: UUID) -> [PluginEffect]? {
         trackID == Project.masterID ? project.masterEffects : project.tracks.first(where: { $0.id == trackID })?.effects
     }
-    var canEditEffects: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isImporting && !isNormalizing }
+    var canEditEffects: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
     func showEffects(for trackID: UUID) {
         guard canEditEffects, effectChain(for: trackID) != nil else { return }
         if trackID != Project.masterID { selectedTrack = trackID; update() }
@@ -686,7 +688,7 @@ final class Editor: NSObject {
         }
         return duration > 0 ? 0..<duration : nil
     }
-    var canToggleLoop: Bool { !isRecording && !isShuttling && !requestingMic && !isImporting && !isNormalizing }
+    var canToggleLoop: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
     func toggleLoop() {
         guard canToggleLoop else { return }
         checkpoint(); project.loopEnabled.toggle(); updateLoop(); update()
@@ -699,7 +701,7 @@ final class Editor: NSObject {
         player?.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
         recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled && player == nil)
     }
-    var canAdjustTrackMix: Bool { !isShuttling && !requestingMic && !isImporting && !isNormalizing }
+    var canAdjustTrackMix: Bool { !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
     @discardableResult func setTrackMix(_ id: UUID, volumeDB: Double? = nil, pan: Double? = nil, checkpoint shouldCheckpoint: Bool = true) -> Bool {
         if id == Project.masterID {
             guard canAdjustTrackMix, let volumeDB, volumeDB.isFinite else { return false }
@@ -720,7 +722,7 @@ final class Editor: NSObject {
         update(); return true
     }
     func toggleMute(_ trackID: UUID) {
-        guard !isRecording, !isShuttling, !requestingMic, !isImporting,
+        guard !isRecording, !isShuttling, !requestingMic, !isExporting, !isImporting,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
         checkpoint()
         project.tracks[index].muted.toggle()
@@ -728,7 +730,7 @@ final class Editor: NSObject {
         update()
     }
     func toggleSolo(_ trackID: UUID) {
-        guard !isRecording, !isShuttling, !requestingMic, !isImporting,
+        guard !isRecording, !isShuttling, !requestingMic, !isExporting, !isImporting,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
         checkpoint()
         project.tracks[index].solo.toggle()
@@ -755,7 +757,7 @@ final class Editor: NSObject {
         cursor = stoppedPosition
     }
     func seek(to position: Double) {
-        guard !isPreparingPlayback, !isRecording, !requestingMic, !isImporting, position.isFinite else { return }
+        guard !isPreparingPlayback, !isRecording, !requestingMic, !isExporting, !isImporting, position.isFinite else { return }
         let target = max(0, position)
         if !isShuttling, let playback = player, playback.isPlaying {
             guard loopRange.map({ target <= $0.upperBound }) == true || target < Double(playback.graph.totalFrames) / audio.sampleRate else {
@@ -784,7 +786,7 @@ final class Editor: NSObject {
             let start = recordingOrigin
             stop(); cursor = start; update(); return
         }
-        guard !requestingMic, !isImporting else { return }
+        guard !requestingMic, !isExporting, !isImporting else { return }
         if let playback = player {
             do {
                 try playback.pause()
@@ -802,7 +804,7 @@ final class Editor: NSObject {
     }
     func restartFromLastStart() {
         if isRecording { restartRecording(); return }
-        guard !requestingMic, !isImporting else { return }
+        guard !requestingMic, !isExporting, !isImporting else { return }
         let start = lastPlaybackStart ?? 0
         if !isShuttling, isPlaying { seek(to: start); return }
         endShuttle(resume: false)
@@ -833,7 +835,7 @@ final class Editor: NSObject {
         return try Self.makeGraph(project: project, store: audio, hosts: playbackHosts(), dryGraph: previous, processedCache: previous?.outputCache)
     }
     func beginShuttle(direction: Double) {
-        guard !isPreparingPlayback, !isRecording, !requestingMic, !isImporting, !isNormalizing, duration > 0 else { return }
+        guard !isPreparingPlayback, !isRecording, !requestingMic, !isExporting, !isImporting, !isNormalizing, duration > 0 else { return }
         discardPausedPlayback()
         let direction = direction < 0 ? -1.0 : 1.0
         if shuttleGesture?.direction == direction && !shuttleReleasing { return }
@@ -1261,16 +1263,29 @@ final class Editor: NSObject {
         panel.allowsOtherFileTypes = false
         panel.nameFieldStringValue = projectName.replacingOccurrences(of: "/", with: "-") + "." + settings.format.rawValue
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try export(to: url, settings: settings, range: options.selectedRange, metadata: options.metadata) } catch { self.error(error) }
+        do { try startAudioExport(to: url, settings: settings, range: options.selectedRange, metadata: options.metadata) } catch { self.error(error) }
+    }
+    func startAudioExport(to url: URL, settings: ExportSettings, range: Range<Double>? = nil, metadata: AudioMetadata? = nil) throws {
+        guard canExport else { return }
+        try settings.validate()
+        try (metadata ?? project.metadata).validate()
+        flushPluginEdits()
+        cancelPlaybackPreparation(); discardStandbyPlayback()
+        exporter?.close()
+        let job = AudioExportController(editor: self, destination: url, settings: settings, range: range, metadata: metadata ?? project.metadata)
+        exporter = job; job.start()
     }
     func export(to url: URL, settings: ExportSettings, range: Range<Double>? = nil, metadata: AudioMetadata? = nil) throws {
         flushPluginEdits()
         var exportedProject = project
         if let metadata { exportedProject.metadata = metadata }
         try AudioExporter.write(project: exportedProject, store: audio, settings: settings, to: url, range: range)
-        if settings != project.exportSettings || !project.exportSettingsConfirmed || exportedProject.metadata != project.metadata {
+        finishAudioExport(to: url, settings: settings, metadata: exportedProject.metadata)
+    }
+    func finishAudioExport(to url: URL, settings: ExportSettings, metadata: AudioMetadata) {
+        if settings != project.exportSettings || !project.exportSettingsConfirmed || metadata != project.metadata {
             checkpoint(); project.exportSettings = settings; project.exportSettingsConfirmed = true
-            project.metadata = exportedProject.metadata
+            project.metadata = metadata
         }
         update("Exported \(url.lastPathComponent)")
     }

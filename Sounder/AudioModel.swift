@@ -521,7 +521,7 @@ final class AudioStore {
         return data
     }
     func write(_ samples: [Float], to url: URL) throws { try write(AudioSignal(channels: [samples]), to: url) }
-    func write(_ signal: AudioSignal, to url: URL, bitDepth: Int = 32) throws {
+    func write(_ signal: AudioSignal, to url: URL, bitDepth: Int = 32, progress: (Double) -> Void = { _ in }, cancelled: () -> Bool = { false }) throws {
         guard [16, 24, 32].contains(bitDepth) else { throw SounderError.message("Unsupported WAV bit depth") }
         let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: AVAudioChannelCount(signal.channels.count))!
         var settings = format.settings
@@ -532,16 +532,18 @@ final class AudioStore {
         let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
         let chunk = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 65_536)!
         for i in stride(from: 0, to: signal.frameCount, by: 65_536) {
+            if cancelled() { throw CancellationError() }
             let count = min(65_536, signal.frameCount - i)
             chunk.frameLength = AVAudioFrameCount(count)
             for channel in signal.channels.indices { for j in 0..<count { chunk.floatChannelData![channel][j] = signal.channels[channel][i + j] } }
             try file.write(from: chunk)
+            progress(Double(i + count) / Double(max(1, signal.frameCount)))
         }
     }
     func render(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil) throws -> [Float] {
         try renderAudio(project, range: range, onlyTrack: onlyTrack).mono
     }
-    func renderAudio(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil, sourceFrames: Range<Int>? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }) throws -> AudioSignal {
+    func renderAudio(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil, sourceFrames: Range<Int>? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, renderProgress: (Double, String) -> Void = { _, _ in }) throws -> AudioSignal {
         try project.audioFormat.validate()
         configure(project.audioFormat)
         let channelCount = project.audioFormat.channels
@@ -551,8 +553,10 @@ final class AudioStore {
         // Fragment joining is deliberately dry and excludes child buses and effects.
         let region = onlyTrack == nil ? 0..<max(0, end) : (sourceFrames.map { (Double($0.lowerBound) / sampleRate)..<(Double($0.upperBound) / sampleRate) } ?? range ?? 0..<max(0, end))
         let length = max(0, sourceFrames?.count ?? Int((region.upperBound - region.lowerBound) * sampleRate))
-        func raw(_ track: Track) throws -> AudioSignal {
+        func raw(_ track: Track, progress: (Double) -> Void = { _ in }) throws -> AudioSignal {
             var lane = silence(length)
+            let total = max(1, track.clips.filter { !$0.muted }.reduce(0) { $0 + max(0, min(length, Int($1.end * sampleRate)) - max(0, Int($1.start * sampleRate))) })
+            var completed = 0
             // Composite oldest first. A new fragment wins outside its edge
             // ramps; within each 10 ms ramp it crossfades with the audio below.
             for clip in track.clips.sorted(by: { $0.order < $1.order }) where !clip.muted {
@@ -567,6 +571,7 @@ final class AudioStore {
                     if (frame - first) % 4096 == 0 {
                         if cancelled() { throw CancellationError() }
                         if frame > first { preparationProgress(4096) }
+                        progress(Double(completed + frame - first) / Double(total))
                     }
                     let sourceFrame = sourceFrames.map { Int((clip.offset - clip.start) * sampleRate) + $0.lowerBound + frame } ?? (Int((region.lowerBound - clip.start + clip.offset) * sampleRate) + frame)
                     let incoming = fadeIn == 0 ? 1 : clip.fadeInCurve.value(Double(frame - clipFirst) / fadeIn)
@@ -583,6 +588,7 @@ final class AudioStore {
                     }
                 }
                 preparationProgress((last - first - 1) % 4096 + 1)
+                completed += last - first; progress(Double(completed) / Double(total))
             }
             return lane
         }
@@ -595,20 +601,39 @@ final class AudioStore {
         }
         let processingTracks = project.processingTracks
         let solo = TrackSoloRouting(tracks: processingTracks)
+        var activeTracks = Set<UUID>()
+        func collect(_ track: Track) {
+            guard !track.muted, solo.buses.contains(track.id), activeTracks.insert(track.id).inserted else { return }
+            for child in processingTracks where child.parent == track.id { collect(child) }
+        }
+        for root in processingTracks where root.parent == nil { collect(root) }
+        let jobs = max(1, processingTracks.filter { activeTracks.contains($0.id) }.reduce(0) { $0 + 1 + $1.effects.filter { !$0.bypassed }.count })
+        var completedJobs = 0
         var visited = Set<UUID>()
         func bus(_ track: Track) throws -> AudioSignal {
             guard visited.insert(track.id).inserted else { throw SounderError.message("Invalid track hierarchy") }
             guard !track.muted, solo.buses.contains(track.id) else { return silence(length) }
-            var signal = solo.dry.contains(track.id) ? try raw(track) : silence(length)
+            if cancelled() { throw CancellationError() }
+            var signal = solo.dry.contains(track.id) ? try raw(track, progress: {
+                renderProgress((Double(completedJobs) + $0) / Double(jobs), "Mixing " + track.name)
+            }) : silence(length)
+            completedJobs += 1
             for child in processingTracks where child.parent == track.id { sum(try bus(child), into: &signal) }
             if track.id != Project.masterID || !track.effects.isEmpty {
                 if let processEffects { signal = AudioSignal(channels: try signal.channels.map { try processEffects($0, track.effects) }) }
-                else { signal = try PluginProcessing.apply(signal, effects: track.effects, format: project.audioFormat) }
+                else {
+                    let effects = track.effects.filter { !$0.bypassed }.count
+                    signal = try PluginProcessing.apply(signal, effects: track.effects, format: project.audioFormat, progress: {
+                        renderProgress((Double(completedJobs) + $0 * Double(effects)) / Double(jobs), $1)
+                    }, cancelled: cancelled)
+                }
+                completedJobs += track.effects.filter { !$0.bypassed }.count
             }
             return track.applyMix(to: signal)
         }
         var mix = silence(length)
         for track in processingTracks where track.parent == nil { sum(try bus(track), into: &mix) }
+        renderProgress(1, "Mix ready")
         mix.channels = mix.channels.map { $0.map { $0.isFinite ? min(1, max(-1, $0)) : 0 } }
         if let range {
             let first = min(mix.frameCount, max(0, Int(range.lowerBound * sampleRate)))

@@ -22,6 +22,26 @@ func runExportTests() throws {
         let file = try AVAudioFile(forReading: path)
         try check(file.fileFormat.sampleRate == 96_000 && file.fileFormat.channelCount == 2 && file.fileFormat.settings[AVLinearPCMBitDepthKey] as? Int == depth && abs(file.length - 96_000) < 2, "WAV export writes the selected \(depth)-bit format and 96 kHz with the correct stereo duration")
     }
+    for format in [ExportFormat.wav, .mp3, .ogg] {
+        var formatSettings = ExportSettings(projectFormat: project.audioFormat); formatSettings.format = format
+        let path = directory.appendingPathComponent("progress." + format.rawValue)
+        var values: [Double] = [], encoding: [Double] = []
+        try AudioExporter.write(project: project, store: store, settings: formatSettings, to: path, progress: { value, phase in
+            values.append(value)
+            if phase.hasPrefix("Encoding") { encoding.append(value) }
+        })
+        try check(values.count > 10 && values.last == 1 && zip(values, values.dropFirst()).allSatisfy { $0 <= $1 }, "\(format.title) reports monotonic progress from actual audio work")
+        if format != .wav { try check(encoding.count > 2, "\(format.title) reports incremental encoder progress") }
+        let original = try Data(contentsOf: path)
+        var cancel = false, cancelled = false
+        do {
+            try AudioExporter.write(project: project, store: store, settings: formatSettings, to: path, progress: { _, phase in
+                if phase == "Writing WAV" || phase.hasPrefix("Encoding") { cancel = true }
+            }, cancelled: { cancel })
+        } catch is CancellationError { cancelled = true }
+        try check(cancelled && (try Data(contentsOf: path)) == original, "Cancelling \(format.title) during writing preserves the existing destination")
+        try check(!(try fm.contentsOfDirectory(atPath: directory.path)).contains { $0.hasPrefix(".sounder-") }, "Cancelled export removes its partial output")
+    }
     var rangeSettings = ExportSettings(projectFormat: project.audioFormat)
     rangeSettings.format = .wav; rangeSettings.bitDepth = 32
     let selectedWAV = directory.appendingPathComponent("selected.wav")
@@ -227,5 +247,40 @@ extension AppDelegate {
         guard typing.runModal() != nil, typing.metadata.trackName == "Last typed character 🎵" else { throw SounderError.message("Export did not commit the active metadata text editor") }
         print("PASS: Export captures the active metadata field's latest typed text")
         print("PASS: export range checkbox is conditional, initially off, survives format validation and stays at the form bottom; defaults and Cancel work")
+    }
+}
+
+extension AppDelegate {
+    func verifyExportProgressUI() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderExportUI-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var settings = ExportSettings(projectFormat: editor.project.audioFormat); settings.format = .mp3
+        let destination = directory.appendingPathComponent("export.mp3")
+        let previous = editor.project.defaultExportSettings
+        try editor.startAudioExport(to: destination, settings: settings)
+        guard let cancelledJob = editor.exporter, cancelledJob.isRunning, cancelledJob.window.isVisible,
+              editor.busy, !editor.canRecord, !editor.canExport else {
+            throw SounderError.message("Export window must appear immediately and lock conflicting controls")
+        }
+        cancelledJob.cancel()
+        func wait(_ job: AudioExportController) throws {
+            let deadline = Date().addingTimeInterval(30)
+            while job.isRunning && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+            guard !job.isRunning else { job.cancel(); throw SounderError.message("Background export timed out") }
+        }
+        try wait(cancelledJob)
+        guard cancelledJob.failure is CancellationError, !FileManager.default.fileExists(atPath: destination.path), editor.project.defaultExportSettings == previous else {
+            throw SounderError.message("Cancelled background export changed the file or saved choices")
+        }
+        try editor.startAudioExport(to: destination, settings: settings)
+        guard let job = editor.exporter else { throw SounderError.message("Missing export job") }
+        var mainThreadResponded = false
+        DispatchQueue.main.async { mainThreadResponded = job.isRunning }
+        try wait(job)
+        guard mainThreadResponded, job.failure == nil, job.fraction == 1,
+              FileManager.default.fileExists(atPath: destination.path), editor.project.defaultExportSettings == settings,
+              !job.window.isVisible, !editor.isExporting else { throw SounderError.message("Background export did not complete responsively") }
+        print("PASS: Export shows shared progress UI immediately, keeps the main run loop responsive, cancels safely and commits choices only on success")
     }
 }
