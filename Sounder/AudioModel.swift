@@ -155,6 +155,7 @@ struct Track: Codable, Identifiable {
     var solo = false
     var clips: [Clip] = []
     var effects: [PluginEffect] = []
+    var effectsBypassed = false
     var input: AudioEndpoint? = nil
     var nextTakeNumber = 1
     var volumeDB = 0.0
@@ -236,7 +237,7 @@ enum TrackHierarchy {
 }
 // Keep projects saved before effects and per-track take numbering readable.
 extension Track {
-    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, clips, effects, nextTakeNumber, volumeDB, pan, input }
+    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, clips, effects, effectsBypassed, nextTakeNumber, volumeDB, pan, input }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
@@ -248,6 +249,7 @@ extension Track {
         solo = try values.decodeIfPresent(Bool.self, forKey: .solo) ?? false
         clips = try values.decode([Clip].self, forKey: .clips)
         effects = try values.decodeIfPresent([PluginEffect].self, forKey: .effects) ?? []
+        effectsBypassed = try values.decodeIfPresent(Bool.self, forKey: .effectsBypassed) ?? false
         nextTakeNumber = max(1, try values.decodeIfPresent(Int.self, forKey: .nextTakeNumber) ?? 1)
         volumeDB = try values.decodeIfPresent(Double.self, forKey: .volumeDB) ?? 0
         pan = try values.decodeIfPresent(Double.self, forKey: .pan) ?? 0
@@ -314,15 +316,18 @@ struct Project: Codable {
     var tracks: [Track] = [Track(name: "Audio 01")]
     var masterVolumeDB = 0.0
     var masterEffects: [PluginEffect] = []
-    var masterTrack: Track { Track(id: Self.masterID, name: "Master", effects: masterEffects, volumeDB: masterVolumeDB) }
+    var masterEffectsBypassed = false
+    var masterTrack: Track { Track(id: Self.masterID, name: "Master", effects: masterEffects, effectsBypassed: masterEffectsBypassed, volumeDB: masterVolumeDB) }
     var processingTracks: [Track] {
-        tracks.map { track in
+        (tracks + [masterTrack]).map { track in
             var routed = track
-            if routed.parent == nil { routed.parent = Self.masterID }
+            if routed.id != Self.masterID && routed.parent == nil { routed.parent = Self.masterID }
+            if routed.effectsBypassed { routed.effects = [] }
             return routed
-        } + [masterTrack]
+        }
     }
     var allEffects: [PluginEffect] { tracks.flatMap(\.effects) + masterEffects }
+    var activeEffects: [PluginEffect] { processingTracks.flatMap(\.effects).filter { !$0.bypassed } }
     var nextOrder = 1
     var name: String? = nil
     var audioFormat = ProjectAudioFormat()
@@ -344,7 +349,7 @@ struct Project: Codable {
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel, defaultInput, defaultOutput }
+    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, masterEffectsBypassed, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel, defaultInput, defaultOutput }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
@@ -352,6 +357,7 @@ extension Project {
         if let playbackBufferFrames { try PlaybackBufferSize.validate(playbackBufferFrames) }
         masterVolumeDB = try values.decodeIfPresent(Double.self, forKey: .masterVolumeDB) ?? 0
         masterEffects = try values.decodeIfPresent([PluginEffect].self, forKey: .masterEffects) ?? []
+        masterEffectsBypassed = try values.decodeIfPresent(Bool.self, forKey: .masterEffectsBypassed) ?? false
         guard masterVolumeDB.isFinite, (-60...12).contains(masterVolumeDB) else { throw SounderError.message("Invalid master volume") }
         nextOrder = try values.decodeIfPresent(Int.self, forKey: .nextOrder) ?? 1
         name = try values.decodeIfPresent(String.self, forKey: .name)

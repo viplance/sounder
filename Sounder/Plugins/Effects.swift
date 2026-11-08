@@ -329,36 +329,41 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     @objc func toggleAll() { editor.toggleAllEffects(for: trackID) }
     func reload(notifyEditor: Bool = true) {
         table.reloadData()
-        allEffects.title = effects.contains { !$0.bypassed } ? "Bypass all" : "Activate all"
-        allEffects.isEnabled = exists && !effects.isEmpty && editor.canEditEffects
+        refreshAvailability()
         if let window, exists { window.title = "FX · " + (trackID == Project.masterID ? "Master" : editor.project.tracks[index!].name) }
         if notifyEditor { editor.update() }
+    }
+    func refreshAvailability() {
+        allEffects.title = editor.effectsBypassed(for: trackID) ? "Activate all" : "Bypass all"
+        allEffects.isEnabled = exists && !effects.isEmpty && editor.canToggleEffects
     }
     func numberOfRows(in tableView: NSTableView) -> Int { effects.count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard effects.indices.contains(row) else { return nil }
         let effect = effects[row], id = effect.id
         let missing = !FileManager.default.fileExists(atPath: effect.path)
-        let name = NSTextField(labelWithString: "\(row + 1).  \(effect.name)  [\(effect.format)]" + (missing ? " · missing" : ""))
+        let chainBypassed = editor.effectsBypassed(for: trackID)
+        let enabledMark = effect.bypassed ? "" : " •"
+        let name = NSTextField(labelWithString: "\(row + 1).  \(effect.name)  [\(effect.format)]\(enabledMark)" + (missing ? " · missing" : ""))
         name.lineBreakMode = .byTruncatingTail; name.font = .systemFont(ofSize: 12)
-        name.textColor = effect.bypassed ? .secondaryLabelColor : .labelColor
+        name.textColor = effect.bypassed || chainBypassed ? .secondaryLabelColor : .labelColor
         name.toolTip = effect.name + "\n" + effect.path
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let open = EffectActionButton("Open") { [weak self] in self?.editPlugin(id: id, native: true) }
         let up = EffectActionButton("Up") { [weak self] in self?.move(id: id, by: -1) }
         let down = EffectActionButton("Down") { [weak self] in self?.move(id: id, by: 1) }
         let bypass = EffectActionButton("Bypass") { [weak self] in self?.bypass(id: id) }
-        bypass.setButtonType(.pushOnPushOff); bypass.state = effect.bypassed ? .off : .on
+        bypass.setButtonType(.pushOnPushOff); bypass.state = effect.bypassed || chainBypassed ? .off : .on
         let remove = EffectActionButton("Remove") { [weak self] in self?.remove(id: id) }
         up.isEnabled = row > 0; down.isEnabled = row < effects.count - 1
-        for button in [open, up, down, bypass, remove] { button.setAccessibilityLabel(button.title + " " + effect.name) }
         bypass.activeAppearanceColor = .systemGreen
         bypass.contentTintColor = .secondaryLabelColor
-        for (button, symbol, help) in [(open, "slider.horizontal.3", "Open editor"), (up, "arrow.up", "Move up"), (down, "arrow.down", "Move down"), (bypass, "power", "Bypass"), (remove, "trash", "Remove")] {
+        for (button, symbol, help) in [(open, "slider.horizontal.3", "Open plugin"), (up, "arrow.up", "Move up"), (down, "arrow.down", "Move down"), (bypass, "power", "Bypass"), (remove, "trash", "Remove")] {
             button.title = ""; button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: help)
             button.imagePosition = .imageOnly; button.isBordered = false; button.toolTip = help
+            button.setAccessibilityLabel(help + " " + effect.name)
         }
-        bypass.toolTip = effect.bypassed ? "Включить" : "Выключить"
+        bypass.toolTip = effect.bypassed ? "Enable" : "Disable"
         bypass.setAccessibilityLabel((bypass.toolTip ?? "") + " " + effect.name)
         return EffectRowView(name: name, controls: [(open, 26), (up, 26), (down, 26), (bypass, 26), (remove, 26)])
     }

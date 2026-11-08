@@ -37,12 +37,12 @@ final class MixerFXButton: PointerButton {
         setAccessibilityLabel("\(track.name) effects")
         if isEnabled != editor.canEditEffects { isEnabled = editor.canEditEffects }
         hasEffects = !track.effects.isEmpty; effectColor = color
-        let active = track.effects.contains { !$0.bypassed }
+        let active = !track.effectsBypassed && track.effects.contains { !$0.bypassed }
         hasActiveEffects = active
         let caption = hasEffects ? "FX  •" : "FX"
         if title != caption { title = caption; needsDisplay = true }
         power.state = active ? .on : .off
-        power.isEnabled = editor.canEditEffects && hasEffects
+        power.isEnabled = editor.canToggleEffects && hasEffects
         power.toolTip = active ? "Выключить все эффекты" : "Включить все эффекты"
         power.setAccessibilityLabel((power.toolTip ?? "") + " · " + track.name)
         positionPower()

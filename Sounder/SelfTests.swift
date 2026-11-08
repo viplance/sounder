@@ -928,6 +928,36 @@ func runMasterMixTests() throws {
     try AudioExporter.write(project: project, store: store, settings: settings, to: output)
     let exported = try AudioStore.decode(output, sampleRate: 48_000)
     try check(abs(exported.channels[0][2000] - live[0]) < 1e-6 && abs(exported.channels[1][2000] - live[1]) < 1e-6, "WAV export includes master effects and gain exactly once")
+    var bulk = project
+    var disabled = offset; disabled.bypassed = true
+    bulk.masterVolumeDB = 0; bulk.masterEffects = [square, disabled]
+    bulk.tracks[0].effects = [square, disabled]
+    for (trackBypass, masterBypass, expected) in [(false, false, 0.0576), (true, false, 0.16), (true, true, 0.4), (false, true, 0.24)] {
+        bulk.tracks[0].effectsBypassed = trackBypass; bulk.masterEffectsBypassed = masterBypass
+        let offline = try store.renderAudio(bulk)
+        let liveGraph = try StreamingGraph(project: bulk, store: store) { effect in
+            StreamingEffect(latency: 0, tail: 0) { process($0, effect.classID) }
+        }
+        try liveGraph.seek(to: 2000)
+        let live = try liveGraph.render(frames: 512)
+        try check(abs(Double(offline.channels[0][2000]) - expected) < 1e-6 && abs(Double(live[0]) - expected) < 1e-6,
+                  "Track/Master global bypass \(trackBypass)/\(masterBypass) matches in live and offline DSP without enabling individually bypassed effects")
+    }
+    bulk.tracks[0].effectsBypassed = true; bulk.masterEffectsBypassed = true
+    try AudioExporter.write(project: bulk, store: store, settings: settings, to: output)
+    let dryExport = try AudioStore.decode(output, sampleRate: 48_000)
+    try check(abs(dryExport.channels[0][2000] - 0.4) < 1e-6 && bulk.activeEffects.isEmpty,
+              "Global bypass skips processor creation and exports dry audio for both track and MASTER")
+    let storedBulk = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(bulk))
+    try check(storedBulk.tracks[0].effectsBypassed && storedBulk.masterEffectsBypassed && storedBulk.tracks[0].effects.map(\.bypassed) == [false, true] && storedBulk.masterEffects.map(\.bypassed) == [false, true],
+              "Project serialization keeps global bypass independently from each plug-in's saved enabled state")
+    let bulkEditor = Editor(store: store); bulkEditor.project = bulk
+    bulkEditor.toggleAllEffects(for: bulk.tracks[0].id)
+    try check(!bulkEditor.project.tracks[0].effectsBypassed && bulkEditor.project.masterEffectsBypassed && bulkEditor.project.tracks[0].effects.map(\.bypassed) == [false, true],
+              "Activate all restores only selected plug-ins and does not affect the MASTER chain")
+    bulkEditor.undo()
+    try check(bulkEditor.project.tracks[0].effectsBypassed && bulkEditor.project.tracks[0].effects.map(\.bypassed) == [false, true],
+              "Undo restores global bypass without modifying per-plug-in bypass flags")
     graph.setSolo([a.id]); let solo = try graph.render(frames: 512)
     try check(abs(solo[0] - 0.025) < 1e-6, "Solo routing remains active through the master effects bus")
     let count = creations

@@ -9,15 +9,19 @@ final class Editor: NSObject {
     private let preparationQueue = DispatchQueue(label: "Sounder.playback.prepare", qos: .userInitiated)
     private var preparation: PlaybackPreparation?
     private var preparationTarget: (key: Data, start: Double)?
-    private var preparationAutoplay = true
-    private var preparationRecording = false
-    private var preparationRememberStart = true
-    private var preparationCompletion: (() -> Void)?
+    private struct PlaybackRequest {
+        let rememberStart: Bool
+        let forRecording: Bool
+        let completed: (() -> Void)?
+    }
+    // Survives invalidation while the replacement graph is being prepared.
+    // Only explicit transport cancellation or completion clears the request.
+    private var preparationRequest: PlaybackRequest?
     private var idlePreparation: DispatchWorkItem?
     private(set) var standbyPlayer: LivePlayback?
     private var standbyKey: Data?
-    var isPreparingPlayback: Bool { preparation != nil && preparationAutoplay }
-    var isPrebuffering: Bool { preparation != nil && !preparationAutoplay }
+    var isPreparingPlayback: Bool { preparationRequest != nil }
+    var isPrebuffering: Bool { preparation != nil && preparationRequest == nil }
     var canEditPlaybackBuffer: Bool {
         !isPlaying && !isRecording && !isShuttling && !isPreparingPlayback && !isPrebuffering && !requestingMic && !isExporting && !isImporting
     }
@@ -64,10 +68,19 @@ final class Editor: NSObject {
     }
     private func cancelPlaybackPreparation() {
         idlePreparation?.cancel(); idlePreparation = nil
-        preparation?.cancel(); preparation = nil; preparationTarget = nil; preparationCompletion = nil
+        preparation?.cancel(); preparation = nil; preparationTarget = nil; preparationRequest = nil
     }
     private func scheduleIdlePreparation() {
         idlePreparation?.cancel(); idlePreparation = nil
+        if preparation == nil, preparationRequest != nil {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.preparation == nil, let request = self.preparationRequest else { return }
+                self.preparePlayback(request)
+            }
+            idlePreparation = work
+            DispatchQueue.main.async(execute: work)
+            return
+        }
         guard preparesPlaybackInBackground, !isPlaying, !isRecording, !isShuttling,
               !requestingMic, !isExporting, !isImporting, !isNormalizing, !isPreparingPlayback,
               duration > 0, preparedPosition < duration, !(pausedPlayer != nil && pausedCursorIsCurrent) else { return }
@@ -107,7 +120,12 @@ final class Editor: NSObject {
     private var shuttleGesture: (direction: Double, resume: Bool)?
     private var shuttleReleasing = false
     private var mixCache: (key: Data, graph: StreamingGraph)?
-    func invalidateMixCache() { cancelPlaybackPreparation(); discardStandbyPlayback(); mixCache = nil; discardPausedPlayback() }
+    func invalidateMixCache() {
+        let request = preparationRequest
+        cancelPlaybackPreparation()
+        preparationRequest = request
+        discardStandbyPlayback(); mixCache = nil; discardPausedPlayback()
+    }
     private func discardPausedPlayback() {
         guard let paused = pausedPlayer else { return }
         if pausedCursorIsCurrent { cursor = paused.currentTime }
@@ -167,6 +185,7 @@ final class Editor: NSObject {
     }
     func update(_ text: String? = nil) {
         if let text { notifications.show(text, style: .success) }
+        for window in effectsWindows.values { window.refreshAvailability() }
         changed?()
         scheduleIdlePreparation()
     }
@@ -654,12 +673,15 @@ final class Editor: NSObject {
         if trackID != Project.masterID { selectedTrack = trackID; update() }
         EffectsWindow(editor: self, trackID: trackID).run()
     }
+    var canToggleEffects: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
+    func effectsBypassed(for trackID: UUID) -> Bool {
+        trackID == Project.masterID ? project.masterEffectsBypassed : project.tracks.first(where: { $0.id == trackID })?.effectsBypassed ?? false
+    }
     func toggleAllEffects(for trackID: UUID) {
-        guard canEditEffects, var chain = effectChain(for: trackID), !chain.isEmpty else { return }
-        let bypass = chain.contains { !$0.bypassed }
+        guard canToggleEffects, let chain = effectChain(for: trackID), !chain.isEmpty else { return }
         checkpoint()
-        for index in chain.indices { chain[index].bypassed = bypass }
-        setEffectChain(chain, for: trackID)
+        if trackID == Project.masterID { project.masterEffectsBypassed.toggle() }
+        else if let index = project.tracks.firstIndex(where: { $0.id == trackID }) { project.tracks[index].effectsBypassed.toggle() }
         effectsChanged()
         effectsWindows[trackID]?.reload(notifyEditor: false)
         update()
@@ -738,9 +760,10 @@ final class Editor: NSObject {
         update()
     }
     func effectsChanged() {
-        invalidateMixCache()
         let playing = isPlaying
-        if player != nil || pausedPlayer != nil { stop() }
+        invalidateMixCache()
+        if isRecording || isShuttling { stop() }
+        else if player != nil || pausedPlayer != nil { stopPlayback() }
         let ids = Set(project.allEffects.map(\.id))
         pluginHosts = pluginHosts.filter { ids.contains($0.key) }
         if playing { startPlayback(rememberStart: false) } else { update() }
@@ -759,13 +782,11 @@ final class Editor: NSObject {
     func seek(to position: Double) {
         guard !isRecording, !requestingMic, !isExporting, !isImporting, position.isFinite else { return }
         let target = max(0, position)
-        if preparation != nil {
-            let autoplay = preparationAutoplay, recording = preparationRecording
-            let remember = preparationRememberStart, completion = preparationCompletion
+        if preparation != nil || preparationRequest != nil {
+            let request = preparationRequest
             cancelPlaybackPreparation()
             cursor = target
-            preparePlayback(rememberStart: remember, forRecording: recording,
-                            speculative: !autoplay, completed: completion)
+            preparePlayback(request)
             return
         }
         if !isShuttling, let playback = player, playback.isPlaying {
@@ -823,7 +844,7 @@ final class Editor: NSObject {
     }
     private func playbackHosts() throws -> [UUID: SNPluginHost] {
         var hosts: [UUID: SNPluginHost] = [:]
-        for effect in project.allEffects where !effect.bypassed { hosts[effect.id] = try pluginHost(effect) }
+        for effect in project.activeEffects { hosts[effect.id] = try pluginHost(effect) }
         return hosts
     }
     private static func makeGraph(project: Project, store: AudioStore, hosts: [UUID: SNPluginHost], dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, progress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }) throws -> StreamingGraph {
@@ -985,15 +1006,20 @@ final class Editor: NSObject {
             if rememberStart { lastPlaybackStart = playback.start; if !forRecording { playbackScrollRequest &+= 1 } }
             startTimer(); update()
     }
+    private func preparePlayback(_ request: PlaybackRequest?) {
+        preparePlayback(rememberStart: request?.rememberStart ?? false,
+                        forRecording: request?.forRecording ?? false,
+                        speculative: request == nil, completed: request?.completed)
+    }
     private func preparePlayback(rememberStart: Bool, forRecording: Bool, speculative: Bool = false, completed: (() -> Void)? = nil) {
-        guard duration > 0 || forRecording else { return }
+        guard duration > 0 || forRecording else { preparationRequest = nil; update(); return }
         flushPluginEdits()
         let key: Data
-        do { key = try mixCacheKey() } catch { if !speculative { self.error(error) }; return }
+        do { key = try mixCacheKey() } catch { preparationRequest = nil; if !speculative { self.error(error) }; return }
         let start = preparedPosition
         if let ready = standbyPlayer, standbyKey == key, ready.start == start {
             guard !speculative else { return }
-            standbyPlayer = nil; standbyKey = nil
+            standbyPlayer = nil; standbyKey = nil; preparationRequest = nil
             do {
                 if forRecording { try ready.prepareForRecording() }
                 try activatePlayback(ready, key: key, rememberStart: rememberStart, forRecording: forRecording, alreadyStarted: true)
@@ -1003,8 +1029,8 @@ final class Editor: NSObject {
         }
         if preparation != nil, preparationTarget?.key == key, preparationTarget?.start == start {
             if !speculative {
-                preparationAutoplay = true; preparationRecording = forRecording
-                preparationRememberStart = rememberStart; preparationCompletion = completed; update()
+                preparationRequest = PlaybackRequest(rememberStart: rememberStart, forRecording: forRecording, completed: completed)
+                update()
             }
             return
         }
@@ -1012,8 +1038,8 @@ final class Editor: NSObject {
         let job = PlaybackPreparation(), snapshot = project
         let cached = audio.cache, directory = audio.directory, existingHosts = pluginHosts
         let factory = makePlayback, loop = loopRange
-        preparationTarget = (key, start); preparationAutoplay = !speculative
-        preparationRecording = forRecording; preparationRememberStart = rememberStart; preparationCompletion = completed
+        preparationTarget = (key, start)
+        preparationRequest = speculative ? nil : PlaybackRequest(rememberStart: rememberStart, forRecording: forRecording, completed: completed)
         let previous = mixCache?.key == key ? mixCache?.graph : nil
         preparation = job; update()
         preparationQueue.async { [weak self] in
@@ -1039,7 +1065,7 @@ final class Editor: NSObject {
                 }
                 job.setPhase(previous == nil ? "Preparing tracks and effects" : "Reusing prepared tracks")
                 var hosts: [UUID: SNPluginHost] = [:]
-                for effect in snapshot.allEffects where !effect.bypassed {
+                for effect in snapshot.activeEffects {
                     try job.check()
                     hosts[effect.id] = try existingHosts[effect.id] ?? SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: snapshot.audioFormat.sampleRate)
                 }
@@ -1048,7 +1074,7 @@ final class Editor: NSObject {
                 guard forRecording || loop.map({ start <= $0.upperBound }) == true || start < Double(graph.totalFrames) / snapshot.audioFormat.sampleRate else {
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.preparation === job else { return }
-                        self.preparation = nil; self.update()
+                        self.preparation = nil; self.preparationTarget = nil; self.preparationRequest = nil; self.update()
                     }
                     return
                 }
@@ -1071,12 +1097,13 @@ final class Editor: NSObject {
                         DispatchQueue.global(qos: .utility).async { prepared.stop() }; return
                     }
                     guard (try? self.mixCacheKey()) == key, self.preparedPosition == start else {
+                        let request = self.preparationRequest
                         self.cancelPlaybackPreparation()
                         self.preparationQueue.async { prepared.stop() }
-                        self.scheduleIdlePreparation(); return
+                        if let request { self.preparePlayback(request) } else { self.scheduleIdlePreparation() }
+                        return
                     }
-                    let autoplay = self.preparationAutoplay, recording = self.preparationRecording
-                    let remember = self.preparationRememberStart, completion = self.preparationCompletion
+                    let request = self.preparationRequest
                     // A plug-in editor may have opened while this worker was
                     // creating processors. Keep its host authoritative; never
                     // publish a graph connected to a different instance.
@@ -1085,29 +1112,28 @@ final class Editor: NSObject {
                     }) {
                         self.cancelPlaybackPreparation()
                         self.preparationQueue.async { prepared.stop() }
-                        self.preparePlayback(rememberStart: remember, forRecording: recording,
-                                             speculative: !autoplay, completed: completion)
+                        self.preparePlayback(request)
                         return
                     }
-                    self.preparation = nil; self.preparationTarget = nil; self.preparationCompletion = nil
+                    self.preparation = nil; self.preparationTarget = nil; self.preparationRequest = nil
                     self.audio.cache.merge(readySources) { current, _ in current }
                     self.pluginHosts.merge(readyHosts) { _, prepared in prepared }
                     self.mixCache = (key, prepared.graph)
-                    if !autoplay {
+                    guard let request else {
                         self.standbyPlayer = prepared; self.standbyKey = key
                         self.update(); return
                     }
                     do {
-                        if recording && !forRecording { try prepared.prepareForRecording() }
-                        try self.activatePlayback(prepared, key: key, rememberStart: remember, forRecording: recording, alreadyStarted: true)
-                        completion?()
+                        if request.forRecording && !forRecording { try prepared.prepareForRecording() }
+                        try self.activatePlayback(prepared, key: key, rememberStart: request.rememberStart, forRecording: request.forRecording, alreadyStarted: true)
+                        request.completed?()
                     } catch { self.stopPlayback(); self.error(error) }
                 }
             } catch {
                 playback?.stop()
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.preparation === job else { return }
-                    self.preparation = nil; self.preparationTarget = nil; self.preparationCompletion = nil
+                    self.preparation = nil; self.preparationTarget = nil; self.preparationRequest = nil
                     if !job.isCancelled { self.error(error) }
                 }
             }

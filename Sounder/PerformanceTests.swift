@@ -394,6 +394,31 @@ func runPerformanceTests() throws {
     lock.lock(); let afterClick = heavyFactories; lock.unlock()
     try check(expensive.player === heavyReady && beforeClick == afterClick && ProcessInfo.processInfo.systemUptime - heavyClick < 0.1,
               "A truthful 100% starts the exact warmed heavy VST transport without any new factory or warm-up")
+    let originalStart = expensive.lastPlaybackStart
+    lock.lock(); blockDSP = true; lock.unlock()
+    expensive.effectsChanged()
+    var rebuildBlocked = false
+    try wait { if !rebuildBlocked { rebuildBlocked = dspEntered.wait(timeout: .now()) == .success }; return rebuildBlocked }
+    let rebuildPosition = expensive.cursor
+    // Native plug-ins can publish saved state/latency after the chain edit has
+    // already started a costly warm-up. Checkpoint invalidates that first job.
+    expensive.invalidateMixCache(); expensive.checkpoint()
+    expensive.project.masterVolumeDB = -4; expensive.update()
+    expensive.effectsChanged()
+    try check(expensive.isPreparingPlayback && expensive.cursor == rebuildPosition,
+              "FX state/checkpoint invalidation retains pending Play through repeated heavy graph rebuilds")
+    dspGate.signal(); try wait { expensive.isPlaying }
+    try check(abs((expensive.player?.start ?? -1) - rebuildPosition) < 1 / store.sampleRate && expensive.lastPlaybackStart == originalStart,
+              "Playback resumes automatically at the retained position after FX rebuild without moving the last-start notch")
+    lock.lock(); blockDSP = true; lock.unlock()
+    expensive.effectsChanged()
+    var cancelRebuildBlocked = false
+    try wait { if !cancelRebuildBlocked { cancelRebuildBlocked = dspEntered.wait(timeout: .now()) == .success }; return cancelRebuildBlocked }
+    expensive.checkpoint(); expensive.project.masterVolumeDB = -6; expensive.effectsChanged()
+    expensive.stop(); dspGate.signal()
+    try wait { expensive.standbyPlayer != nil }
+    try check(!expensive.isPlaying && !expensive.isPreparingPlayback,
+              "Explicit Stop during an invalidated FX rebuild cancels autoplay; idle preparation stays silent")
     let seekGate = DispatchSemaphore(value: 0), seekEntered = DispatchSemaphore(value: 0)
     let seeking = Editor(store: store, makePlayback: { graph, format, start in
         if start == 0.25 { seekEntered.signal(); seekGate.wait() }

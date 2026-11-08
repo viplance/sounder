@@ -1373,6 +1373,12 @@ extension AppDelegate {
             let view = rack.table.view(atColumn: 0, row: row, makeIfNecessary: true)!
             return buttons(view).first { $0.identifier?.rawValue == title }!
         }
+        func marked(_ row: Int) -> Bool {
+            let cell = rack.table.view(atColumn: 0, row: row, makeIfNecessary: true) as! EffectRowView
+            return cell.name.stringValue.contains("[\(rack.effects[row].format)] •")
+        }
+        try check(action("Open", row: 0).toolTip == "Open plugin" && marked(0),
+                  "Enabled plug-ins show a dot after their format and offer Open plugin")
         let browse = rack.makeBrowsePanel()
         try check(Set(browse.allowedContentTypes.compactMap(\.preferredFilenameExtension)) == Set(["vst", "vst3"]) && !browse.allowsOtherFileTypes && !browse.canChooseDirectories,
                   "Browse filters file selection to VST and VST3 plug-in bundles")
@@ -1410,13 +1416,13 @@ extension AppDelegate {
         try check(!hiddenRack.window.isVisible && editor.effectsWindows[Project.masterID] == nil && !native.window.isVisible && editor.pluginWindows[first.id] == nil && rack.window.isVisible,
                   "A visible plug-in closed while minimized is not resurrected, while its FX chain is restored")
         try check(!action("Up", row: 0).isEnabled && !action("Down", row: 2).isEnabled, "FX row order buttons disable at chain boundaries")
-        try check(action("Bypass", row: 0).state == .on && (action("Bypass", row: 0) as? PointerButton)?.activeAppearanceColor == .systemGreen && action("Bypass", row: 0).toolTip == "Выключить",
+        try check(action("Bypass", row: 0).state == .on && (action("Bypass", row: 0) as? PointerButton)?.activeAppearanceColor == .systemGreen && action("Bypass", row: 0).toolTip == "Disable",
                   "An enabled effect has a green power icon and a disable tooltip")
         action("Bypass", row: 0).performClick(nil)
-        try check(rack.effects[0].bypassed && action("Bypass", row: 0).state == .off && action("Bypass", row: 0).contentTintColor == .secondaryLabelColor && action("Bypass", row: 0).toolTip == "Включить",
+        try check(rack.effects[0].bypassed && !marked(0) && action("Bypass", row: 0).state == .off && action("Bypass", row: 0).contentTintColor == .secondaryLabelColor && action("Bypass", row: 0).toolTip == "Enable",
                   "Clicking power bypasses the effect, grays the icon and offers to enable it")
         action("Bypass", row: 0).performClick(nil)
-        try check(!rack.effects[0].bypassed && action("Bypass", row: 0).state == .on && action("Bypass", row: 0).toolTip == "Выключить",
+        try check(!rack.effects[0].bypassed && marked(0) && action("Bypass", row: 0).state == .on && action("Bypass", row: 0).toolTip == "Disable",
                   "Clicking again re-enables processing and restores the green power icon")
         rack.bypass(id: second.id)
         refresh()
@@ -1428,12 +1434,17 @@ extension AppDelegate {
         let powerPoint = power.convert(NSPoint(x: power.bounds.midX, y: power.bounds.midY), to: trackFX.superview)
         try check(trackFX.hitTest(powerPoint) === power, "The FX power icon has its own mouse hit target")
         let beforeAll = editor.undoStack.count
+        let individualBypass = rack.effects.map(\.bypassed)
         trackFX.power.performClick(nil)
-        try check(rack.effects.allSatisfy(\.bypassed) && editor.undoStack.count == beforeAll + 1 && rack.allEffects.title == "Activate all" && trackFX.power.state == .off,
-                  "The shared FX power button bypasses the entire chain with one Undo step")
+        try check(editor.effectsBypassed(for: track) && rack.effects.map(\.bypassed) == individualBypass && editor.undoStack.count == beforeAll + 1 && rack.allEffects.title == "Activate all" && trackFX.power.state == .off,
+                  "The shared FX power button bypasses the chain independently, retaining individual flags with one Undo step")
+        try check(rack.allEffects.isEnabled, "Activate all remains available immediately in the open FX window")
+        for row in 0..<rack.effects.count {
+            try check(marked(row) == !individualBypass[row], "Global bypass preserves individual enabled dots after the plug-in format")
+        }
         rack.allEffects.performClick(nil)
-        try check(rack.effects.allSatisfy { !$0.bypassed } && rack.allEffects.title == "Bypass all" && trackFX.power.state == .on,
-                  "Popup Activate all enables every plug-in and synchronizes the track power icon")
+        try check(!editor.effectsBypassed(for: track) && rack.effects.map(\.bypassed) == individualBypass && rack.allEffects.isEnabled && rack.allEffects.title == "Bypass all" && trackFX.power.state == .on,
+                  "Popup Activate all restores only individually enabled plug-ins and remains clickable")
         try check(abs(rack.window.contentView!.bounds.width - 507) < 1 && rack.allEffects.frame.maxX <= rack.window.contentView!.bounds.maxX - 15,
                   "FX window is one and a half times narrower with the bulk action at the right edge")
         let savedMaster = editor.project.masterEffects
@@ -1442,12 +1453,27 @@ extension AppDelegate {
         try check(type(of: masterFXButton!) == type(of: trackFX) && masterFXButton.power.action == trackFX.power.action && masterFXButton.power.state == .on,
                   "MASTER and tracks reuse the exact same FX group and power action")
         masterFXButton.power.performClick(nil)
-        try check(editor.project.masterEffects.allSatisfy(\.bypassed) && rack.effects.allSatisfy { !$0.bypassed },
+        try check(editor.project.masterEffectsBypassed && !editor.effectsBypassed(for: track) && rack.effects.map(\.bypassed) == individualBypass,
                   "MASTER FX power bypasses only the master chain")
         masterFXButton.power.performClick(nil)
         let restored = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(editor.project))
-        try check(restored.masterEffects.allSatisfy { !$0.bypassed }, "Bulk activation states persist in the project")
+        try check(!restored.masterEffectsBypassed && restored.masterEffects.map(\.bypassed) == individualBypass, "Bulk activation states persist in the project")
         editor.project.masterEffects = savedMaster; refresh()
+        let backgroundPreparation = editor.preparesPlaybackInBackground
+        editor.preparesPlaybackInBackground = true
+        editor.playPause()
+        try check(editor.isPreparingPlayback && rack.allEffects.isEnabled,
+                  "Bulk FX toggle remains enabled while a real VST chain prepares playback")
+        rack.allEffects.performClick(nil)
+        try check(editor.effectsBypassed(for: track) && rack.allEffects.isEnabled && rack.allEffects.title == "Activate all",
+                  "Bypass all can be selected immediately during buffer preparation")
+        rack.allEffects.performClick(nil)
+        try check(!editor.effectsBypassed(for: track) && rack.allEffects.isEnabled && rack.effects.map(\.bypassed) == individualBypass,
+                  "Activate all works immediately in the same window and retains individual choices during preparation")
+        let playbackDeadline = Date().addingTimeInterval(20)
+        while editor.isPreparingPlayback && Date() < playbackDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        try check(editor.isPlaying && rack.allEffects.isEnabled, "Latest bulk FX selection resumes playback and stays enabled after the buffer is ready")
+        editor.stop(); editor.preparesPlaybackInBackground = backgroundPreparation
         let retainedBypass = action("Bypass", row: 1), history = editor.undoStack.count
         let writer = rack.tableView(rack.table, pasteboardWriterForRow: 0) as? NSPasteboardItem
         try check(writer?.string(forType: NSPasteboard.PasteboardType("enotix.Sounder.effect")) == first.id.uuidString,
@@ -1455,7 +1481,7 @@ extension AppDelegate {
         try check(rack.reorder(id: first.id, insertion: 3) && rack.effects.map(\.id) == [second.id, third.id, first.id] && editor.undoStack.count == history + 1,
                   "Drag reorder preserves plug-in state and commits one Undo step")
         retainedBypass.performClick(nil)
-        try check(rack.effects[0].id == second.id && rack.effects[0].bypassed && !rack.effects[2].bypassed,
+        try check(rack.effects[0].id == second.id && rack.effects[0].bypassed == !individualBypass[1] && !rack.effects[2].bypassed,
                   "Row actions keep targeting the same plug-in after a reorder")
         action("Up", row: 2).performClick(nil)
         try check(rack.effects.map(\.id) == [second.id, first.id, third.id], "Per-row Up moves only its plug-in by one position")
