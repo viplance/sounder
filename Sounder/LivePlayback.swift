@@ -380,6 +380,7 @@ final class LivePlayback {
     private func isCurrentReturn(_ token: UUID) -> Bool { returnLock.lock(); defer { returnLock.unlock() }; return returnToken == token }
     func completeReturn() { isShuttling = false; returnReady = false; cancelReturn() }
     private let transportLock = NSLock()
+    private var renderedOutputFrames = 0
     private var transportMotions: [(frame: Int, motion: ShuttleMotion)] = []
     private(set) var isShuttling = false
     private(set) var shuttleUsesProcessedCache = false
@@ -400,14 +401,17 @@ final class LivePlayback {
     var renderedFrames: Int { queue.sync { graph.position } }
     var currentTime: Double {
         if pauseComplete { return pausePosition }
+        var renderedClock: Int?
         if let time = node.lastRenderTime, time.isSampleTimeValid || time.isHostTimeValid,
            let played = node.playerTime(forNodeTime: time),
            played.isSampleTimeValid, played.sampleRate > 0 {
-            let frames = Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded())
-            lastKnownFrame = max(lastKnownFrame, frames)
+            renderedClock = Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded())
         }
         // Output time stays monotonic; source time may reverse smoothly.
         transportLock.lock(); defer { transportLock.unlock() }
+        // Player time continues through silence while the final presentation
+        // callback is pending. Never display a position beyond scheduled PCM.
+        if let renderedClock { lastKnownFrame = max(lastKnownFrame, min(renderedOutputFrames, renderedClock)) }
         if let index = transportMotions.lastIndex(where: { $0.frame <= lastKnownFrame }) {
             let segment = transportMotions[index]
             if index > 0 { transportMotions.removeFirst(index) }
@@ -564,7 +568,7 @@ final class LivePlayback {
         nextFrame = frame; outputFrames = 0
         resetLoopPosition(frame)
         transportLock.lock()
-        firstFrame = frame; lastKnownFrame = 0; transportMotions = []; seekRequest = nil
+        firstFrame = frame; lastKnownFrame = 0; renderedOutputFrames = 0; transportMotions = []; seekRequest = nil
         transportLock.unlock()
         seekFade = []; seekFadeFrame = 0; resumeFadeFrame = 0
         meterBuffer.clear(); running = true
@@ -815,6 +819,7 @@ final class LivePlayback {
         schedule(buffer, last: !recordingPlayback && loop == nil && nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal, replenishes: bridgeFrames == nil)
     }
     private func schedule(_ buffer: AVAudioPCMBuffer, last: Bool, format pcmFormat: AVAudioFormat, pauseFinal: Bool = false, replenishes: Bool = true) {
+        transportLock.lock(); renderedOutputFrames = outputFrames; transportLock.unlock()
         let bufferFrames = Int(buffer.frameLength)
         let bufferGeneration = bufferFill.enqueue(frames: bufferFrames, capacity: bufferFrameCount)
         let generation = streamGeneration
@@ -1116,6 +1121,7 @@ final class ShuttlePlayback {
     private var cancelled = false
     private var outputFrame = 0
     private var playedFrames = 0
+    private var renderedOutputFrames = 0
     private var scheduled = 0
     private let bufferBlocks: [Int]
     private var bufferBlockIndex = 0
@@ -1123,10 +1129,12 @@ final class ShuttlePlayback {
     var isPlaying: Bool { node.isPlaying && engine.isRunning }
     private var isCancelled: Bool { cancellation.lock(); defer { cancellation.unlock() }; return cancelled }
     var currentTime: Double {
+        var renderedClock: Int?
         if let time = node.lastRenderTime, let played = node.playerTime(forNodeTime: time), played.isSampleTimeValid, played.sampleRate > 0 {
-            playedFrames = max(playedFrames, Int(Double(played.sampleTime) * format.sampleRate / played.sampleRate))
+            renderedClock = Int(Double(played.sampleTime) * format.sampleRate / played.sampleRate)
         }
         motionLock.lock(); defer { motionLock.unlock() }
+        if let renderedClock { playedFrames = max(playedFrames, min(renderedOutputFrames, renderedClock)) }
         let segment = motions.last(where: { $0.frame <= playedFrames }) ?? motions[0]
         return segment.motion.position(at: Double(playedFrames - segment.frame) / format.sampleRate)
     }
@@ -1204,6 +1212,7 @@ final class ShuttlePlayback {
             }
         }
         outputFrame += positions.count
+        motionLock.lock(); renderedOutputFrames = outputFrame; motionLock.unlock()
         return buffer
     }
     // Worker-only: re-anchor at the next unscheduled sample, preserving phase

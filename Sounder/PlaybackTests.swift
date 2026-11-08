@@ -1669,6 +1669,31 @@ extension AppDelegate {
         try check(editor.player == nil && abs(editor.cursor - 15.85) < 0.001 && centered() && !timeline.isEasingPlaybackScroll,
                   "Natural completion during an unfinished scroll still returns to and reveals the last-start marker")
         editor.stop()
+        func observeStop(action: () -> Void) -> (screenBackwards: CGFloat, timeBackwards: Double) {
+            var lastX = timeline.playheadFrame.midX - timeline.viewportRect.minX
+            var lastTime = editor.cursor, backwards: CGFloat = 0, timeBackwards = 0.0
+            let timer = Timer(timeInterval: 0.002, repeats: true) { _ in
+                let x = self.timeline.playheadFrame.midX - self.timeline.viewportRect.minX
+                backwards = max(backwards, lastX - x)
+                timeBackwards = max(timeBackwards, lastTime - self.editor.cursor)
+                lastX = x; lastTime = self.editor.cursor
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            action(); wait(0.6); timer.invalidate()
+            return (backwards, timeBackwards)
+        }
+        editor.seek(to: 5); editor.playPause(); wait(1.2)
+        let pause = observeStop { editor.playPause() }
+        try check(pause.screenBackwards < 1 && pause.timeBackwards <= 1 / editor.audio.sampleRate,
+                  "Pausing never overshoots the last audible sample or snaps the marker backward (pixels: \(pause.screenBackwards), seconds: \(pause.timeBackwards))")
+        editor.stop()
+        for direction in [-1.0, 1.0] {
+            editor.seek(to: 5); editor.beginShuttle(direction: direction); wait(0.55)
+            let stopped = observeStop { editor.releaseShuttle() }
+            try check(!editor.isShuttling && stopped.screenBackwards < 1,
+                      "Shuttle deceleration and final scroll handoff preserve the marker position (direction: \(direction), pixels: \(stopped.screenBackwards))")
+            editor.stop()
+        }
         print("PASS: One-second playback scroll integration")
     }
 }
