@@ -171,8 +171,15 @@ func runPerformanceTests() throws {
         while !predicate(), Date() < end { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
         guard predicate() else { throw SounderError.message("Background playback preparation timed out") }
     }
-    var cpu = ProcessCPUSampler()
-    try check(cpu.sample(wall: 1, cpu: 0) == 0 && cpu.sample(wall: 3, cpu: 1) == 50 && cpu.sample(wall: 4, cpu: 3) == 200, "CPU uses measured process time, including multicore usage")
+    for cores in [1, 4, 8] {
+        var cpu = ProcessCPUSampler()
+        try check(cpu.sample(wall: 1, cpu: 0, processorCount: cores) == 0 &&
+                  cpu.sample(wall: 2, cpu: 1, processorCount: cores) == 100 / Double(cores) &&
+                  cpu.sample(wall: 3, cpu: Double(cores + 1), processorCount: cores) == 100 &&
+                  cpu.sample(wall: 4, cpu: Double(cores * 3 + 1), processorCount: cores) == 100 &&
+                  cpu.sample(wall: 5, cpu: Double(cores * 3 + 1), processorCount: cores) == 0,
+                  "CPU is normalized to all \(cores) logical CPUs and stays within 0–100%")
+    }
     let fill = AudioBufferFill()
     try check(fill.percent == 0, "Unprepared playback buffer reports zero")
     fill.update(filled: 2, capacity: 4); try check(fill.percent == 50, "Buffer reports actual prepared queue occupancy")

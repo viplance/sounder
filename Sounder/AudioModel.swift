@@ -543,7 +543,7 @@ final class AudioStore {
     func render(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil) throws -> [Float] {
         try renderAudio(project, range: range, onlyTrack: onlyTrack).mono
     }
-    func renderAudio(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil, sourceFrames: Range<Int>? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, renderProgress: (Double, String) -> Void = { _, _ in }) throws -> AudioSignal {
+    func renderAudio(_ project: Project, range: Range<Double>? = nil, onlyTrack: UUID? = nil, sourceFrames: Range<Int>? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, renderProgress: (Double, String) -> Void = { _, _ in }, parallel: Bool = true) throws -> AudioSignal {
         try project.audioFormat.validate()
         configure(project.audioFormat)
         let channelCount = project.audioFormat.channels
@@ -607,32 +607,48 @@ final class AudioStore {
             for child in processingTracks where child.parent == track.id { collect(child) }
         }
         for root in processingTracks where root.parent == nil { collect(root) }
-        let jobs = max(1, processingTracks.filter { activeTracks.contains($0.id) }.reduce(0) { $0 + 1 + $1.effects.filter { !$0.bypassed }.count })
-        var completedJobs = 0
-        var visited = Set<UUID>()
-        func bus(_ track: Track) throws -> AudioSignal {
-            guard visited.insert(track.id).inserted else { throw SounderError.message("Invalid track hierarchy") }
-            guard !track.muted, solo.buses.contains(track.id) else { return silence(length) }
+        let plan = try AudioRenderPlan(tracks: processingTracks.filter { activeTracks.contains($0.id) }, parallel: parallel, minimumCost: 0.001)
+        // Decode once before parallel readers enter the immutable source cache.
+        for path in Set(plan.tracks.filter { solo.dry.contains($0.id) }.flatMap(\.clips).filter { !$0.muted }.map(\.source)) {
             if cancelled() { throw CancellationError() }
+            _ = try load(path)
+        }
+        let weights = plan.tracks.map { 1 + $0.effects.filter { !$0.bypassed }.count }
+        let total = Double(max(1, weights.reduce(0, +)))
+        var done = [Double](repeating: 0, count: plan.tracks.count), completed = 0.0
+        let progressLock = NSLock()
+        func report(_ index: Int, _ work: Double, _ phase: String) {
+            progressLock.lock(); defer { progressLock.unlock() }
+            let next = max(done[index], min(Double(weights[index]), work))
+            completed += next - done[index]; done[index] = next
+            renderProgress(completed / total, phase)
+        }
+        let signals = plan.tracks.map { _ in AudioRenderResult<AudioSignal>(silence(0)) }
+        try plan.perform { index in
+            if cancelled() { throw CancellationError() }
+            let track = plan.tracks[index]
             var signal = solo.dry.contains(track.id) ? try raw(track, progress: {
-                renderProgress((Double(completedJobs) + $0) / Double(jobs), "Mixing " + track.name)
+                report(index, $0, "Mixing " + track.name)
             }) : silence(length)
-            completedJobs += 1
-            for child in processingTracks where child.parent == track.id { sum(try bus(child), into: &signal) }
+            report(index, 1, "Mixing " + track.name)
+            // Sum in project order, never completion order, for reproducible PCM.
+            for child in plan.children[index] {
+                sum(signals[child].value, into: &signal)
+                signals[child].value = silence(0)
+            }
             if track.id != Project.masterID || !track.effects.isEmpty {
                 if let processEffects { signal = AudioSignal(channels: try signal.channels.map { try processEffects($0, track.effects) }) }
                 else {
-                    let effects = track.effects.filter { !$0.bypassed }.count
                     signal = try PluginProcessing.apply(signal, effects: track.effects, format: project.audioFormat, progress: {
-                        renderProgress((Double(completedJobs) + $0 * Double(effects)) / Double(jobs), $1)
+                        report(index, 1 + $0 * Double(weights[index] - 1), $1)
                     }, cancelled: cancelled)
                 }
-                completedJobs += track.effects.filter { !$0.bypassed }.count
             }
-            return track.applyMix(to: signal)
+            signals[index].value = track.applyMix(to: signal)
+            report(index, Double(weights[index]), "Mixed " + track.name)
         }
         var mix = silence(length)
-        for track in processingTracks where track.parent == nil { sum(try bus(track), into: &mix) }
+        for root in plan.roots { sum(signals[root].value, into: &mix) }
         renderProgress(1, "Mix ready")
         mix.channels = mix.channels.map { $0.map { $0.isFinite ? min(1, max(-1, $0)) : 0 } }
         if let range {

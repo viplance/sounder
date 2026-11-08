@@ -1,3 +1,4 @@
+#import "../AudioRenderScheduler.h"
 #import <AppKit/AppKit.h>
 NS_ASSUME_NONNULL_BEGIN
 // Objective-C surface keeps the VST C++ ABI out of Swift.

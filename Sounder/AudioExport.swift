@@ -355,7 +355,6 @@ final class AudioExportController: NSObject, NSWindowDelegate {
     private let lock = NSLock()
     private var cancelled = false
     private var lastProgressTime = 0.0
-    private var lastPhase = ""
     var completed: (() -> Void)?
     init(editor: Editor, destination: URL, settings: ExportSettings, range: Range<Double>?, metadata: AudioMetadata) {
         self.editor = editor; self.destination = destination; self.settings = settings; self.range = range
@@ -379,8 +378,8 @@ final class AudioExportController: NSObject, NSWindowDelegate {
     }
     private func publish(_ value: Double, _ phase: String) {
         let now = ProcessInfo.processInfo.systemUptime
-        guard value == 1 || phase != lastPhase || now - lastProgressTime >= 0.04 else { return }
-        lastProgressTime = now; lastPhase = phase
+        guard value == 1 || now - lastProgressTime >= 0.04 else { return }
+        lastProgressTime = now
         DispatchQueue.main.async { [self] in
             fraction = max(fraction, min(1, value)); row.update(fraction: fraction, phase: phase)
         }

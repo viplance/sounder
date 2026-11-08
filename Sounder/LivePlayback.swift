@@ -197,6 +197,7 @@ final class StreamingGraph {
             dryDelay.reset(); childDelays.forEach { $0.reset() }; meterDelay?.reset()
             children.forEach { $0.resetDelays() }
         }
+        var output: [Float] = []
         func render(position: Int, frames: Int) throws -> [Float] {
             var input = [Float](repeating: 0, count: frames * channels)
             let first = position * channels
@@ -206,7 +207,7 @@ final class StreamingGraph {
             }
             input = dryDelay.apply(input)
             for (index, child) in children.enumerated() {
-                let signal = childDelays[index].apply(try child.render(position: position, frames: frames))
+                let signal = childDelays[index].apply(child.output)
                 for i in input.indices { input[i] += signal[i] }
             }
             for effect in effects { input = try effect.process(input) }
@@ -230,6 +231,8 @@ final class StreamingGraph {
     }
     private var buses: [UUID: Bus] = [:]
     private let tracks: [Track]
+    private let renderPlan: AudioRenderPlan
+    private let orderedBuses: [Bus]
     private let parents: [UUID: UUID]
     private(set) var trackPeaks: [UUID: StereoLevels] = [:]
     private let roots: [Bus]
@@ -240,43 +243,61 @@ final class StreamingGraph {
     let outputCache: ProcessedMixCache
     var needsHistory: Bool { tracks.contains { $0.effects.contains { !$0.bypassed } } }
     private(set) var position = 0
-    init(project: Project, store: AudioStore, dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
+    init(project: Project, store: AudioStore, dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, parallel: Bool = true, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
         let processingTracks = project.processingTracks
         tracks = processingTracks
         parents = Dictionary(uniqueKeysWithValues: processingTracks.compactMap { track in track.parent.map { (track.id, $0) } })
         channels = project.audioFormat.channels
         outputCache = try processedCache ?? ProcessedMixCache(channels: channels)
         let channelCount = channels
-        var visited = Set<UUID>()
-        var trackBuses: [UUID: Bus] = [:]
-        func bus(_ track: Track) throws -> Bus {
+        // Source preparation has no graph dependencies. Give each track its own
+        // store so mutable decode caches never cross worker boundaries.
+        let sourceTracks = project.tracks
+        for path in Set(sourceTracks.flatMap(\.clips).filter { !$0.muted }.map(\.source)) {
             if cancelled() { throw CancellationError() }
-            guard visited.insert(track.id).inserted else { throw SounderError.message("Invalid track hierarchy") }
-            let dry: [Float]
-            if track.id == Project.masterID { dry = [] }
-            else if let previous = dryGraph?.buses[track.id], previous.channels == channelCount {
-                dry = previous.dry // Immutable PCM is shared; no full-project remix on release.
-            } else {
-                let raw = try store.renderAudio(project, onlyTrack: track.id, preparationProgress: preparationProgress, cancelled: cancelled)
-                var samples = [Float](repeating: 0, count: raw.frameCount * channelCount)
-                for frame in 0..<raw.frameCount {
-                    if frame % 4096 == 0 {
-                        if cancelled() { throw CancellationError() }
-                        if frame > 0 { preparationProgress(4096) }
-                    }
-                    for ch in 0..<channelCount { samples[frame * channelCount + ch] = raw.channels[ch][frame] }
-                }
-                if raw.frameCount > 0 { preparationProgress((raw.frameCount - 1) % 4096 + 1) }
-                dry = samples
-            }
-            let children = try processingTracks.filter { $0.parent == track.id }.map { try bus($0) }
-            let effects = try track.effects.filter { !$0.bypassed }.map(makeEffect)
-            let result = Bus(dry: dry, children: children, effects: effects, channels: channelCount, track: track, sampleRate: project.audioFormat.sampleRate)
-            trackBuses[track.id] = result
-            return result
+            if dryGraph == nil { _ = try store.load(path) }
         }
-        roots = try processingTracks.filter { $0.parent == nil }.map { try bus($0) }
-        buses = trackBuses
+        let sources = store.cache
+        let dryResults = sourceTracks.map { _ in AudioRenderResult<[Float]>([]) }
+        let sourcePlan = try AudioRenderPlan(tracks: sourceTracks.map { track in
+            var independent = track; independent.parent = nil; return independent
+        }, parallel: parallel, minimumCost: 0.001)
+        try sourcePlan.perform { index in
+            if cancelled() { throw CancellationError() }
+            let track = sourcePlan.tracks[index]
+            if let previous = dryGraph?.buses[track.id], previous.channels == channelCount {
+                dryResults[index].value = previous.dry
+                return
+            }
+            let local = try AudioStore(directory: store.directory)
+            local.configure(project.audioFormat); local.cache = sources
+            let raw = try local.renderAudio(project, onlyTrack: track.id, preparationProgress: preparationProgress, cancelled: cancelled)
+            var samples = [Float](repeating: 0, count: raw.frameCount * channelCount)
+            for frame in 0..<raw.frameCount {
+                if frame % 4096 == 0 {
+                    if cancelled() { throw CancellationError() }
+                    if frame > 0 { preparationProgress(4096) }
+                }
+                for ch in 0..<channelCount { samples[frame * channelCount + ch] = raw.channels[ch][frame] }
+            }
+            if raw.frameCount > 0 { preparationProgress((raw.frameCount - 1) % 4096 + 1) }
+            dryResults[index].value = samples
+        }
+        let dryByID = Dictionary(uniqueKeysWithValues: sourcePlan.tracks.enumerated().map { ($0.element.id, dryResults[$0.offset].value) })
+        // A single FX path cannot run concurrently with itself. Avoid pool
+        // handoffs altogether for the common one-track / one-chain project.
+        let fxTracks = processingTracks.filter { $0.id != Project.masterID && $0.effects.contains { !$0.bypassed } }.count
+        renderPlan = try AudioRenderPlan(tracks: processingTracks, parallel: parallel && (fxTracks > 1 || project.tracks.count >= 8))
+        var prepared: [Bus] = []
+        for (index, track) in renderPlan.tracks.enumerated() {
+            if cancelled() { throw CancellationError() }
+            let children = renderPlan.children[index].map { prepared[$0] }
+            let effects = try track.effects.filter { !$0.bypassed }.map(makeEffect)
+            prepared.append(Bus(dry: dryByID[track.id] ?? [], children: children, effects: effects, channels: channelCount, track: track, sampleRate: project.audioFormat.sampleRate))
+        }
+        orderedBuses = prepared
+        roots = renderPlan.roots.map { prepared[$0] }
+        buses = Dictionary(uniqueKeysWithValues: renderPlan.tracks.enumerated().map { ($0.element.id, prepared[$0.offset]) })
         latency = roots.map(\.latency).max() ?? 0
         if let processedCache, dryGraph?.latency != latency { processedCache.invalidate() }
         for bus in buses.values { bus.meterDelay = SampleDelay(frames: max(0, latency - bus.latency), channels: channelCount) }
@@ -305,8 +326,12 @@ final class StreamingGraph {
     func render(frames: Int) throws -> [Float] {
         precondition(frames > 0 && frames <= 512)
         var mix = [Float](repeating: 0, count: frames * channels)
+        try renderPlan.perform { index in
+            let bus = orderedBuses[index]
+            bus.output = try bus.render(position: position, frames: frames)
+        }
         for (index, root) in roots.enumerated() {
-            let output = delays[index].apply(try root.render(position: position, frames: frames))
+            let output = delays[index].apply(root.output)
             for i in mix.indices { mix[i] += output[i] }
         }
         for (id, bus) in buses {

@@ -207,6 +207,7 @@ func runAudioTests() throws {
     }
     try runRecordedMediaMoveTests()
     try runProjectStorageTests()
+    try runMulticoreTests()
     try runPerformanceTests()
     try runAudioRoutingTests()
     try runTrackMeterTests()
@@ -266,6 +267,7 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
         guard channelDifference > 0.1 else { throw SounderError.message("Stereo plug-in processing collapsed the channels") }
         print("PASS: real plug-in preserves stereo at \(Int(rate)) Hz")
     }
+    try runMulticorePluginTest(path: path, classID: host.classID, state: state)
     // Reuse the same processor across blocks and change a parameter while it runs.
     let stream = try SNPluginHost(path: path, classID: host.classID, state: state)
     try stream.beginStreaming(2)

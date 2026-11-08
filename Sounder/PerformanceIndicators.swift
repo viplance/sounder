@@ -1,11 +1,11 @@
 import AppKit
 import Darwin
 
-/// Process CPU, where 100% represents one logical CPU, as in Activity Monitor.
+/// Process CPU normalized to all available logical CPUs (0–100%).
 /// Sample cumulative CPU time, never enumerate threads or touch the audio queue.
 struct ProcessCPUSampler {
     private var previous: (wall: Double, cpu: Double)?
-    mutating func sample(wall: Double = ProcessInfo.processInfo.systemUptime, cpu: Double? = nil) -> Double {
+    mutating func sample(wall: Double = ProcessInfo.processInfo.systemUptime, cpu: Double? = nil, processorCount: Int = ProcessInfo.processInfo.activeProcessorCount) -> Double {
         let total: Double
         if let cpu { total = cpu }
         else {
@@ -15,7 +15,7 @@ struct ProcessCPUSampler {
         }
         defer { previous = (wall, total) }
         guard let previous, wall > previous.wall, total >= previous.cpu else { return 0 }
-        return max(0, (total - previous.cpu) / (wall - previous.wall) * 100)
+        return min(100, max(0, (total - previous.cpu) / (wall - previous.wall) / Double(max(1, processorCount)) * 100))
     }
 }
 
@@ -57,7 +57,7 @@ final class PerformanceIndicators: NSStackView {
             addArrangedSubview(column)
         }
         buffer.toolTip = "Prepared audio in the playback queue"
-        cpu.toolTip = "Sounder CPU usage · 100% = one logical CPU"
+        cpu.toolTip = "Sounder CPU usage · 100% = all available logical CPUs"
         setContentHuggingPriority(.required, for: .horizontal)
     }
     required init?(coder: NSCoder) { fatalError() }

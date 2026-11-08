@@ -1347,6 +1347,10 @@ if let index = CommandLine.arguments.firstIndex(of: "--playback-test"), index + 
     do { try runPlaybackContinuityTest(path: CommandLine.arguments[index + 1], reference: reference); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
+if CommandLine.arguments.contains("--multicore-test") {
+    do { setbuf(stdout, nil); try runMulticoreTests(benchmark: !CommandLine.arguments.contains("--no-benchmark")); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
 if CommandLine.arguments.contains("--self-test") {
     do { try runAudioTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
