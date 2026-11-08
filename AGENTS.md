@@ -36,6 +36,7 @@
 
 ## Waveforms
 
+- Render waveforms as continuous filled contours from the real peak envelope, not separated vertical strokes. Anchor contour sampling to fragment coordinates and extend beyond dirty/tile edges before clipping so partial redraws and horizontal scrolling keep identical pixels.
 - Waveforms fill the fragment height. Draw fragment names over the waveform, with no reserved title row. Do not draw a RECORDING label or indicator icon inside the live recording fragment.
 - Draw stereo fragments as separate waveforms: left channel above right, using actual per-channel PCM peaks for both imported audio and live recording. Mono sources use one waveform.
 

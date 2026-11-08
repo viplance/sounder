@@ -1463,12 +1463,19 @@ final class Timeline: NSView {
         let top = rect.minY + 1, bottom = rect.maxY - 1
         let mid = (top + bottom) / 2, amplitude = max(1, (bottom - top) / 2)
         let lowX = max(rect.minX, dirtyRect.minX), highX = min(rect.maxX, dirtyRect.maxX)
+        guard lowX < highX, !peaks.isEmpty || partialPeak != nil else { return }
         let count = peaks.count + (partialPeak == nil ? 0 : 1)
-        let path = NSBezierPath(); path.lineWidth = 1
-        for x in stride(from: lowX, to: highX, by: 2) {
+        // Anchor the contour to the fragment, with one extra point on either
+        // side of the dirty region so adjacent cached tiles share their edges.
+        let step: CGFloat = 2
+        let firstX = rect.minX + (floor((lowX - rect.minX) / step) - 1) * step
+        let lastX = rect.minX + (ceil((highX - rect.minX) / step) + 1) * step
+        let path = NSBezierPath()
+        var lower: [NSPoint] = []
+        for x in stride(from: firstX, through: lastX, by: step) {
             let seconds = offset + (x - rect.minX) / editor.zoom
             let first = max(0, Int(seconds * sampleRate) / 128)
-            let last = min(count, max(first + 1, Int((seconds + 2 / editor.zoom) * sampleRate) / 128))
+            let last = min(count, max(first + 1, Int((seconds + step / editor.zoom) * sampleRate) / 128))
             var peak: Float = 0
             if first < last { for index in first..<last { peak = max(peak, index < peaks.count ? peaks[index] : (partialPeak ?? 0)) } }
             var envelope = 1.0
@@ -1479,10 +1486,17 @@ final class Timeline: NSView {
                 let outgoing = fragment.fadeOutBaked || last == 0 ? 1 : fragment.fadeOutCurve.value((Double(frames - 1) - relative) / last)
                 envelope = min(incoming, outgoing)
             }
-            let h = CGFloat(min(1, Double(peak) * gain * envelope)) * amplitude
-            path.move(to: NSPoint(x: x, y: mid - h)); path.line(to: NSPoint(x: x, y: mid + max(0.4, h)))
+            let h = max(0.4, CGFloat(min(1, Double(peak) * gain * envelope)) * amplitude)
+            let upper = NSPoint(x: x, y: mid - h)
+            if lower.isEmpty { path.move(to: upper) } else { path.line(to: upper) }
+            lower.append(NSPoint(x: x, y: mid + h))
         }
-        color.setStroke(); path.stroke()
+        for point in lower.reversed() { path.line(to: point) }
+        path.close()
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: rect.intersection(dirtyRect)).addClip()
+        color.setFill(); path.fill()
+        NSGraphicsContext.restoreGraphicsState()
     }
     func drawChannelWaveforms(_ peaks: [[Float]], partialPeaks: [Float?] = [], sampleRate: Double, offset: Double, gain: Double = 1, fragment: Clip? = nil, in rect: NSRect, dirtyRect: NSRect, color: NSColor) {
         let count = min(2, peaks.count)
