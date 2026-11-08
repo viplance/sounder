@@ -1,4 +1,7 @@
 import AppKit
+import QuartzCore
+
+private let toastMovementDuration: TimeInterval = 0.2
 
 enum ToastStyle { case success, hint, error }
 enum UXHint: String {
@@ -72,6 +75,17 @@ private final class ToastCard: NSView {
         setAccessibilityElement(true); setAccessibilityRole(.staticText); setAccessibilityLabel(message.text)
     }
     required init?(coder: NSCoder) { fatalError() }
+    func animateEntrance() {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, let layer else { return }
+        // Animate only the presentation layer so layout/reflow can keep the
+        // final stack geometry without interrupting the entrance.
+        let rise = CABasicAnimation(keyPath: "position.y")
+        rise.isAdditive = true
+        rise.fromValue = superview?.isFlipped == true ? 50 : -50
+        rise.toValue = 0; rise.duration = toastMovementDuration
+        rise.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(rise, forKey: "entrance")
+    }
     func width(maximum: CGFloat) -> CGFloat {
         let measured = (message.text as NSString).size(withAttributes: [.font: text.font!])
         return min(maximum, ceil(measured.width) + 32)
@@ -118,17 +132,20 @@ final class ToastOverlay: NSView {
                 }, completionHandler: { card.removeFromSuperview() })
             }
         }
+        var appearing: [ToastCard] = []
         for message in center.messages where cards[message.id] == nil {
             let card = ToastCard(message); card.alphaValue = 0
             cards[message.id] = card; addSubview(card)
+            appearing.append(card)
         }
         positionCards(animated: true)
+        appearing.forEach { $0.animateEntrance() }
     }
     private func positionCards(animated: Bool) {
         let maximumWidth = min(340, max(0, bounds.width - 32))
         var y: CGFloat = 16
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = animated ? 0.2 : 0
+            context.duration = animated ? toastMovementDuration : 0
             for message in center.messages {
                 guard let card = cards[message.id] else { continue }
                 let width = card.width(maximum: maximumWidth)

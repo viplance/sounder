@@ -6,7 +6,7 @@
 - Present action feedback only in the upper-right corner of the main editor window. Never install duplicate notification overlays in FX, plug-in or import windows.
 - Successful edits and saves: green background, white text. Errors: red background, white text. UX hints: yellow background, dark readable text.
 - Size each notification to its text plus horizontal padding, align right edges, and wrap long messages at the viewport-aware maximum width.
-- Each message uses an 80%-opaque colored background with fully opaque text, remains for 4 seconds independently, and fades out over 0.36 seconds. Append newer messages below older messages. Animate remaining messages upward when earlier messages expire.
+- Each message uses an 80%-opaque colored background with fully opaque text, rises 50 pt into place over 0.2 seconds on appearance (the same duration as stack reflow), remains for 4 seconds independently, and fades out over 0.36 seconds. Animate the entrance on its presentation layer independently of stack layout/reflow, and respect Reduce Motion. Append newer messages below older messages. Animate remaining messages upward when earlier messages expire.
 - UX hints trigger at the relevant interaction and appear only once per running app session. Do not persist their seen-state across launches, and do not reset it on project open, save, or Undo/Redo.
 - First actual drag of a track header: "Drag tracks to nest". First selection of an audio fragment: "Shift click to multi select".
 - Opening or refreshing an editor or effects panel is not a successful edit and must not emit a success notification. Transport state belongs in transport controls, not success notifications.
