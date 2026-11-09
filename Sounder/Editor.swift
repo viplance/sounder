@@ -310,8 +310,23 @@ final class Editor: NSObject {
         let track = Track(name: "Audio " + String(format: "%02d", project.tracks.count + 1), parent: nested ? selectedTrack : nil)
         do { try TrackHierarchy.validate(project.tracks + [track]) }
         catch { notifications.show(TrackHierarchy.limitMessage, style: .hint); return }
+        var insertion = project.tracks.endIndex
+        if let active = project.tracks.first(where: { $0.id == selectedTrack }) {
+            if nested {
+                insertion = project.tracks.firstIndex(where: { $0.parent == active.id }) ?? (selectedIndex! + 1)
+            } else {
+                // A new root follows the active root's entire subtree, keeping
+                // children together even when the active row is nested.
+                var root = active
+                while let parent = root.parent, let ancestor = project.tracks.first(where: { $0.id == parent }) { root = ancestor }
+                let roots = project.tracks.filter { $0.parent == nil }
+                if let index = roots.firstIndex(where: { $0.id == root.id }), index + 1 < roots.count {
+                    insertion = project.tracks.firstIndex(where: { $0.id == roots[index + 1].id })!
+                }
+            }
+        }
         checkpoint()
-        project.tracks.append(track); selectedTrack = track.id; selection = []; update(nested ? "Nested track added" : "Track added")
+        project.tracks.insert(track, at: insertion); selectedTrack = track.id; selection = []; update(nested ? "Nested track added" : "Track added")
     }
     func descendants(of id: UUID) -> Set<UUID> {
         var result: Set<UUID> = [id]

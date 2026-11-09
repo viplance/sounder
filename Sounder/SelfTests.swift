@@ -109,6 +109,27 @@ func runAudioTests() throws {
     try check(hierarchyEditor.project.tracks.last?.parent == nil, "Subtree height prevents an otherwise valid parent from creating a third level")
     hierarchyEditor.reparent(levelTwo, to: nil)
     try check(hierarchyEditor.project.tracks[2].parent == nil, "Moving a deepest nested track back to the root remains available")
+    let insertionEditor = Editor(store: store)
+    let firstRoot = Track(name: "First"), nextRoot = Track(name: "Next")
+    let nestedChild = Track(name: "Child", parent: firstRoot.id)
+    insertionEditor.project = Project(tracks: [firstRoot, nextRoot, nestedChild]); insertionEditor.selectedTrack = firstRoot.id
+    insertionEditor.addTrack()
+    let insertedRoot = insertionEditor.selectedTrack!
+    try check(TrackHierarchy.orderedRows(insertionEditor.project.tracks).map { $0.0.id } == [firstRoot.id, nestedChild.id, insertedRoot, nextRoot.id],
+              "New tracks follow the active track's subtree rather than the end of the project")
+    insertionEditor.undo()
+    try check(insertionEditor.project.tracks.map(\.id) == [firstRoot.id, nextRoot.id, nestedChild.id], "Undo restores the original track order")
+    insertionEditor.redo()
+    try check(TrackHierarchy.orderedRows(insertionEditor.project.tracks).map { $0.0.id } == [firstRoot.id, nestedChild.id, insertedRoot, nextRoot.id], "Redo restores the inserted track at its original position")
+    insertionEditor.selectedTrack = nestedChild.id; insertionEditor.addTrack()
+    try check(TrackHierarchy.orderedRows(insertionEditor.project.tracks).map { $0.0.id } == [firstRoot.id, nestedChild.id, insertionEditor.selectedTrack!, insertedRoot, nextRoot.id] && insertionEditor.project.tracks.first(where: { $0.id == insertionEditor.selectedTrack })?.parent == nil,
+              "Adding from a nested row places the new root below its containing subtree")
+    insertionEditor.selectedTrack = firstRoot.id; insertionEditor.addTrack(nested: true)
+    try check(TrackHierarchy.orderedRows(insertionEditor.project.tracks)[1].0.id == insertionEditor.selectedTrack,
+              "A new nested track appears immediately below its active parent before existing children")
+    insertionEditor.project = Project(tracks: []); insertionEditor.selectedTrack = nil; insertionEditor.addTrack()
+    try check(insertionEditor.project.tracks.count == 1 && insertionEditor.project.tracks[0].id == insertionEditor.selectedTrack,
+              "Adding a track to an empty project still selects the new root")
     var fxParent = Track(name: "Bus", clips: [track.clips[0]], effects: [PluginEffect(name: "half", path: "test", classID: "half")])
     var fxChild = Track(name: "Child", parent: fxParent.id, clips: [track.clips[0]], effects: [PluginEffect(name: "half", path: "test", classID: "half")])
     store.processEffects = { samples, effects in
