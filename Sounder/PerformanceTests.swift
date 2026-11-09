@@ -339,6 +339,50 @@ func runPerformanceTests() throws {
     try wait { ahead.standbyPlayer?.start == 2.25 }
     let stopped = ahead.standbyPlayer; ahead.stop()
     try check(ahead.standbyPlayer === stopped && ahead.bufferPercent == 100 && !ahead.isPlaying, "Rapid stopped seeks prepare only the latest cursor and Stop preserves a ready standby buffer")
+    // Hold a real preparation result while changing every track-header choice.
+    // Both silent prebuffering and a pending user Play must replace the old job.
+    for foreground in [false, true] {
+        let editGate = DispatchSemaphore(value: 0), editEntered = DispatchSemaphore(value: 0)
+        var editFactories = 0
+        let editing = Editor(store: store, makePlayback: { graph, format, start in
+            lock.lock(); editFactories += 1; let first = editFactories == 1; lock.unlock()
+            if first { editEntered.signal(); editGate.wait() }
+            let live = LivePlayback(graph: graph, format: format, start: start)
+            try live.engine.enableManualRenderingMode(.offline,
+                format: AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!, maximumFrameCount: 512)
+            return live
+        })
+        let effect = PluginEffect(name: "Individually bypassed", path: "/unused", classID: "", bypassed: true)
+        let first = Track(name: "Header edits", clips: [Clip(name: "Source", source: source.path, start: 0, duration: 3, order: 1)], effects: [effect])
+        let second = Track(name: "Solo destination")
+        editing.project = Project(tracks: [first, second]); editing.selectedTrack = first.id
+        editing.preparesPlaybackInBackground = true; editing.update()
+        defer { editGate.signal(); editing.preparesPlaybackInBackground = false; editing.stop() }
+        if foreground { editing.playPause() }
+        var held = false
+        try wait { if !held { held = editEntered.wait(timeout: .now()) == .success }; return held }
+        let controls = TrackMixerControls(track: first, editor: editing)
+        try check(controls.rec.isEnabled && controls.fx.isEnabled && controls.fx.power.isEnabled && editing.canEditEffects,
+                  "REC and both FX actions remain enabled during \(foreground ? "foreground" : "idle") buffer preparation")
+        let began = ProcessInfo.processInfo.systemUptime
+        controls.rec.performClick(nil)
+        editing.toggleMute(first.id); editing.toggleSolo(second.id)
+        controls.fx.power.performClick(nil)
+        controls.configure(editing.project.tracks[0])
+        try check(ProcessInfo.processInfo.systemUptime - began < 0.5 && controls.rec.isEnabled && controls.fx.isEnabled &&
+                  editing.project.tracks[0].recordArmed && editing.project.tracks[0].muted && editing.project.tracks[1].solo && editing.project.tracks[0].effectsBypassed,
+                  "REC/MUTE/SOLO/FX apply without waiting for blocked buffer work and remain clickable")
+        try check(editing.isPreparingPlayback == foreground && !editing.isPlaying,
+                  "Track-header invalidation retains pending Play while idle preparation remains silent")
+        editGate.signal()
+        try wait { foreground ? editing.isPlaying : editing.standbyPlayer != nil }
+        lock.lock(); let count = editFactories; lock.unlock()
+        guard let prepared = editing.player ?? editing.standbyPlayer else { throw SounderError.message("Missing rebuilt header-edit buffer") }
+        let samples = try prepared.graph.outputCache.read(0..<96)
+        try check(count == 2 && samples.allSatisfy { $0 == 0 } && editing.isPlaying == foreground,
+                  "Cancelled buffer never activates; replacement reflects the latest Mute/Solo/FX/REC choices and playback intent")
+        editing.preparesPlaybackInBackground = false; editing.stop()
+    }
     let idleGate = DispatchSemaphore(value: 0), idleEntered = DispatchSemaphore(value: 0)
     var factoryCalls = 0
     let promoted = Editor(store: store, makePlayback: { graph, format, start in

@@ -153,6 +153,7 @@ struct Track: Codable, Identifiable {
     var parent: UUID?
     var muted = false
     var solo = false
+    var recordArmed = false
     var clips: [Clip] = []
     var effects: [PluginEffect] = []
     var effectsBypassed = false
@@ -237,7 +238,7 @@ enum TrackHierarchy {
 }
 // Keep projects saved before effects and per-track take numbering readable.
 extension Track {
-    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, clips, effects, effectsBypassed, nextTakeNumber, volumeDB, pan, input }
+    enum CodingKeys: String, CodingKey { case id, name, parent, muted, solo, recordArmed, clips, effects, effectsBypassed, nextTakeNumber, volumeDB, pan, input }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
@@ -247,6 +248,7 @@ extension Track {
         parent = try values.decodeIfPresent(UUID.self, forKey: .parent)
         muted = try values.decodeIfPresent(Bool.self, forKey: .muted) ?? false
         solo = try values.decodeIfPresent(Bool.self, forKey: .solo) ?? false
+        recordArmed = try values.decodeIfPresent(Bool.self, forKey: .recordArmed) ?? false
         clips = try values.decode([Clip].self, forKey: .clips)
         effects = try values.decodeIfPresent([PluginEffect].self, forKey: .effects) ?? []
         effectsBypassed = try values.decodeIfPresent(Bool.self, forKey: .effectsBypassed) ?? false

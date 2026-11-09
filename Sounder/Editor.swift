@@ -2,6 +2,60 @@ import AppKit
 import AVFoundation
 import UniformTypeIdentifiers
 
+/// Main-thread preview state for one input; each writer owns conversion and disk I/O.
+final class TrackRecording {
+    let track: UUID?
+    let recorder: LiveRecorder
+    var start: Double
+    var end: Double
+    var cursor: Double
+    var peaks: [Float] = []
+    var channelPeaks: [[Float]]
+    var partialPeak: Float?
+    var partialChannelPeaks: [Float?]
+    init(track: UUID?, recorder: LiveRecorder, start: Double) {
+        self.track = track; self.recorder = recorder; self.start = start; end = start; cursor = start
+        channelPeaks = Array(repeating: [], count: recorder.format.channels)
+        partialChannelPeaks = Array(repeating: nil, count: recorder.format.channels)
+    }
+    func consumeUpdate() -> (levels: StereoLevels, failure: Error?) {
+        let update = recorder.writer.consumeUpdate()
+        if let loop = update.loop {
+            let count = (loop.frameCount + 127) / 128
+            if loop.resetWaveform {
+                channelPeaks = Array(repeating: Array(repeating: 0, count: count), count: recorder.format.channels)
+                peaks = Array(repeating: 0, count: count)
+            } else if peaks.count < count {
+                peaks.append(contentsOf: repeatElement(0, count: count - peaks.count))
+                for channel in channelPeaks.indices {
+                    channelPeaks[channel].append(contentsOf: repeatElement(0, count: count - channelPeaks[channel].count))
+                }
+            }
+            for (index, peaks) in loop.peakPatches where index < count {
+                for channel in peaks.indices { channelPeaks[channel][index] = peaks[channel] }
+                self.peaks[index] = peaks.max() ?? 0
+            }
+            partialPeak = nil; partialChannelPeaks = Array(repeating: nil, count: recorder.format.channels)
+            start = Double(loop.startFrame) / recorder.format.sampleRate
+            end = Double(loop.startFrame + loop.frameCount) / recorder.format.sampleRate
+            cursor = Double(loop.cursorFrame) / recorder.format.sampleRate
+        } else {
+            peaks.append(contentsOf: update.peaks); partialPeak = update.partialPeak
+            for channel in update.channelPeaks.indices { channelPeaks[channel].append(contentsOf: update.channelPeaks[channel]) }
+            partialChannelPeaks = update.partialChannelPeaks
+            cursor = start + Double(update.frames) / recorder.format.sampleRate
+            end = cursor
+        }
+        func channelPeak(_ channel: Int) -> Float {
+            guard !update.partialChannelPeaks.isEmpty else { return 0 }
+            let index = min(channel, update.partialChannelPeaks.count - 1)
+            if update.loop != nil { return update.partialChannelPeaks[index] ?? 0 }
+            return max(update.channelPeaks[index].max() ?? 0, update.partialChannelPeaks[index] ?? 0)
+        }
+        return (StereoLevels(left: channelPeak(0), right: channelPeak(1)), update.failure)
+    }
+}
+
 final class Editor: NSObject {
     // App controllers opt into nonblocking preparation; synchronous operation
     // remains available for deterministic offline audio clients/tests.
@@ -144,15 +198,27 @@ final class Editor: NSObject {
     var pluginHosts: [UUID: SNPluginHost] = [:]
     var pluginWindows: [UUID: PluginEditorWindow] = [:]
     var effectsWindows: [UUID: EffectsWindow] = [:]
-    var recorder: LiveRecorder?
-    var recordingPeaks: [Float] = []
-    var recordingChannelPeaks: [[Float]] = []
-    var recordingPartialChannelPeaks: [Float?] = []
-    var recordingPartialPeak: Float?
-    var recordingURL: URL?
-    var recordingTrack: UUID?
-    var recordingStart = 0.0
-    var recordingEnd = 0.0
+    private(set) var recordings: [TrackRecording] = []
+    var recorder: LiveRecorder? { recordings.first?.recorder }
+    var recordingPeaks: [Float] { recordings.first?.peaks ?? [] }
+    var recordingChannelPeaks: [[Float]] { recordings.first?.channelPeaks ?? [] }
+    var recordingPartialChannelPeaks: [Float?] { recordings.first?.partialChannelPeaks ?? [] }
+    var recordingPartialPeak: Float? { recordings.first?.partialPeak }
+    var recordingURL: URL? { recorder?.url }
+    var recordingTrack: UUID? { recordings.first?.track }
+    var recordingStart: Double { recordings.first?.start ?? recordingOrigin }
+    var recordingEnd: Double { recordings.first?.end ?? 0 }
+    func recording(for track: UUID) -> TrackRecording? { recordings.first { $0.track == track } }
+    var recordingTargets: [UUID] {
+        let armed = TrackHierarchy.orderedRows(project.tracks).map { $0.0 }.filter(\.recordArmed).map(\.id)
+        if !armed.isEmpty { return armed }
+        return project.tracks.first(where: { $0.id == selectedTrack }).map { [$0.id] } ?? []
+    }
+    var canArmTracks: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
+    func toggleRecordArm(_ id: UUID) {
+        guard canArmTracks, let index = project.tracks.firstIndex(where: { $0.id == id }) else { return }
+        checkpoint(); project.tracks[index].recordArmed.toggle(); update()
+    }
     private var recordingOrigin = 0.0
     private var pendingRecordedSources = Set<String>()
     private var recordedSourceCleanup: [String: String] = [:]
@@ -487,7 +553,7 @@ final class Editor: NSObject {
                 guard let self else { return }; self.requestingMic = false
                 guard granted else { self.error(SounderError.message("Allow Sounder to use the microphone in System Settings → Privacy & Security → Microphone.")); return }
                 do {
-                    if self.selectedIndex == nil {
+                    if self.recordingTargets.isEmpty {
                         self.checkpoint()
                         let track = Track(name: "Audio " + String(format: "%02d", self.project.tracks.count + 1))
                         self.project.tracks.append(track); self.selectedTrack = track.id
@@ -497,71 +563,83 @@ final class Editor: NSObject {
             }
         }
     }
-    func startRecording(at position: Double? = nil) throws {
+    func startRecording(at position: Double? = nil, tracks: [UUID]? = nil) throws {
         if preparesPlaybackInBackground, player == nil {
             guard !isPreparingPlayback else { return }
             if let position { cursor = position }
             preparePlayback(rememberStart: true, forRecording: true) { [weak self] in
                 guard let self else { return }
-                do { try self.startRecording(at: position) } catch { self.error(error) }
+                do { try self.startRecording(at: position, tracks: tracks) } catch { self.error(error) }
             }
             return
         }
-        let url = audio.freshURL(), wasPlaying = isPlaying
+        let wasPlaying = isPlaying
+        let targets = tracks ?? recordingTargets
+        guard !targets.isEmpty else { throw SounderError.message("Select a track for recording") }
+        var pending: [TrackRecording] = []
         do {
-            // Prepare the backing mix before opening capture, keeping a running
-            // transport intact when Record is pressed during Play.
+            // Prepare every input before starting capture. The backing mix and
+            // its single metronome remain shared by all recording tracks.
             if let player { try player.prepareForRecording() }
             else { startPlayback(forRecording: true) }
             guard let player else { throw SounderError.message("Cannot start recording playback") }
-            let input = project.tracks.first(where: { $0.id == selectedTrack })?.input ?? project.defaultInput
-            let recorder = try makeRecorder?(url, project.audioFormat) ?? LiveRecorder(url: url, format: project.audioFormat, input: input)
             let origin = position ?? (wasPlaying ? player.currentTime : player.start)
-            if let loopRange { try recorder.configureLoop(loopRange, start: origin) }
-            recorder.metronome.configure(bpm: project.tempo, enabled: false, start: origin)
-            try recorder.start()
+            for id in targets {
+                guard let track = project.tracks.first(where: { $0.id == id }) else { continue }
+                let url = audio.freshURL()
+                let capture: LiveRecorder
+                do {
+                    capture = try makeRecorder?(url, project.audioFormat) ?? LiveRecorder(url: url, format: project.audioFormat, input: track.input ?? project.defaultInput)
+                } catch { try? FileManager.default.removeItem(at: url); throw error }
+                pending.append(TrackRecording(track: id, recorder: capture, start: origin))
+                if let loopRange { try capture.configureLoop(loopRange, start: origin) }
+                capture.metronome.configure(bpm: project.tempo, enabled: false, start: origin)
+            }
+            guard !pending.isEmpty else { throw SounderError.message("Select a track for recording") }
+            for take in pending { try take.recorder.start() }
             if !wasPlaying { player.beginPreparedPlayback() }
-            cursor = recorder.writer.isLoopRecording ? origin : (position ?? (wasPlaying ? player.currentTime : player.start))
-            activateRecording(recorder)
+            cursor = pending[0].recorder.writer.isLoopRecording ? origin : (position ?? (wasPlaying ? player.currentTime : player.start))
+            for take in pending { take.start = cursor; take.end = cursor; take.cursor = cursor }
+            activateRecordings(pending)
         } catch {
+            for take in pending { _ = take.recorder.stop(save: false); try? FileManager.default.removeItem(at: take.recorder.url) }
             if wasPlaying { player?.cancelRecordingPreparation() } else { stopPlayback() }
-            try? FileManager.default.removeItem(at: url)
             throw error
         }
     }
-    private func clearRecordingState() {
-        recordingURL = nil; recordingTrack = nil; recordingEnd = 0
-        recordingPeaks = []; recordingPartialPeak = nil
-        recordingChannelPeaks = []; recordingPartialChannelPeaks = []
-    }
+    private func clearRecordingState() { recordings = [] }
     private func restartRecording() {
-        guard let recorder else { return }
-        let start = recordingOrigin, track = recordingTrack, url = recordingURL
+        guard !recordings.isEmpty else { return }
+        let start = recordingOrigin, targets = recordings.compactMap(\.track)
+        let previous = recordings
         timer?.invalidate(); timer = nil
-        _ = recorder.stop(save: false); self.recorder = nil
-        clearRecordingState()
-        cursor = start; selectedTrack = track
+        for take in previous {
+            _ = take.recorder.stop(save: false)
+            try? FileManager.default.removeItem(at: take.recorder.url)
+        }
+        clearRecordingState(); cursor = start
         do {
-            if let url, FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
             player?.seek(to: start)
-            try startRecording(at: start)
+            try startRecording(at: start, tracks: targets)
         } catch { stopPlayback(); self.error(error) }
         update()
     }
     func activateRecording(_ recorder: LiveRecorder) {
-        recorder.metronome.configure(bpm: project.tempo, enabled: project.metronomeIsAudible && player == nil, start: cursor)
-        recordingPeaks = []; recordingPartialPeak = nil
-        recordingChannelPeaks = Array(repeating: [], count: recorder.format.channels); recordingPartialChannelPeaks = Array(repeating: nil, count: recorder.format.channels)
-        recordingURL = recorder.url; recordingTrack = selectedTrack; recordingStart = cursor
-        recordingOrigin = cursor; recordingEnd = cursor
-        self.recorder = recorder; startTimer(); update()
+        activateRecordings([TrackRecording(track: selectedTrack, recorder: recorder, start: cursor)])
+    }
+    private func activateRecordings(_ takes: [TrackRecording]) {
+        recordings = takes; recordingOrigin = cursor
+        for (index, take) in takes.enumerated() {
+            take.recorder.metronome.configure(bpm: project.tempo, enabled: project.metronomeIsAudible && player == nil && index == 0, start: cursor)
+        }
+        startTimer(); update()
     }
     func showsTrackMeter(_ id: UUID) -> Bool { isPlaying || isRecording || (trackMeters[id]?.peak ?? 0) > 0 }
     func displayedTrackMeter(_ track: Track) -> StereoTrackLevelMeter {
         var meter = trackMeters[track.id] ?? StereoTrackLevelMeter()
         // Playback is already metered after the fader. Capture snapshots are
         // source PCM; apply the current controls to both bars and held peaks.
-        if isRecording && recordingTrack == track.id {
+        if recording(for: track.id) != nil {
             let left = track.outputGain(channel: 0, channels: project.audioFormat.channels)
             let right = track.outputGain(channel: 1, channels: project.audioFormat.channels)
             meter.left.level *= left; meter.left.peak *= left
@@ -589,46 +667,17 @@ final class Editor: NSObject {
         }
     }
     func updateRecordingWaveform(handleFailure: Bool = true) {
-        guard let recorder else { return }
-        let update = recorder.writer.consumeUpdate()
-        if let loop = update.loop {
-            let count = (loop.frameCount + 127) / 128
-            if loop.resetWaveform {
-                recordingChannelPeaks = Array(repeating: Array(repeating: 0, count: count), count: recorder.format.channels)
-                recordingPeaks = Array(repeating: 0, count: count)
-            } else if recordingPeaks.count < count {
-                recordingPeaks.append(contentsOf: repeatElement(0, count: count - recordingPeaks.count))
-                for channel in recordingChannelPeaks.indices {
-                    recordingChannelPeaks[channel].append(contentsOf: repeatElement(0, count: count - recordingChannelPeaks[channel].count))
-                }
-            }
-            for (index, peaks) in loop.peakPatches where index < count {
-                for channel in peaks.indices { recordingChannelPeaks[channel][index] = peaks[channel] }
-                recordingPeaks[index] = peaks.max() ?? 0
-            }
-            recordingPartialPeak = nil; recordingPartialChannelPeaks = Array(repeating: nil, count: recorder.format.channels)
-            recordingStart = Double(loop.startFrame) / recorder.format.sampleRate
-            recordingEnd = Double(loop.startFrame + loop.frameCount) / recorder.format.sampleRate
-            cursor = Double(loop.cursorFrame) / recorder.format.sampleRate
-        } else {
-            recordingPeaks.append(contentsOf: update.peaks); recordingPartialPeak = update.partialPeak
-            for channel in update.channelPeaks.indices { recordingChannelPeaks[channel].append(contentsOf: update.channelPeaks[channel]) }
-            recordingPartialChannelPeaks = update.partialChannelPeaks
-            cursor = recordingStart + Double(update.frames) / recorder.format.sampleRate
-            recordingEnd = cursor
+        guard !recordings.isEmpty else { return }
+        var peaks = player.map { $0.consumeTrackPeaks(at: $0.currentTime) } ?? [:]
+        var failed = false
+        for take in recordings {
+            let update = take.consumeUpdate()
+            if let track = take.track { peaks[track] = update.levels }
+            failed = failed || update.failure != nil
         }
-        if let recordingTrack {
-            func channelPeak(_ channel: Int) -> Float {
-                if update.loop != nil { return update.partialChannelPeaks[min(channel, update.partialChannelPeaks.count - 1)] ?? 0 }
-                guard !update.channelPeaks.isEmpty else { return 0 }
-                let index = min(channel, update.channelPeaks.count - 1)
-                return max(update.channelPeaks[index].max() ?? 0, update.partialChannelPeaks[index] ?? 0)
-            }
-            var peaks = player.map { $0.consumeTrackPeaks(at: $0.currentTime) } ?? [:]
-            peaks[recordingTrack] = StereoLevels(left: channelPeak(0), right: channelPeak(1))
-            updateTrackMeters(peaks)
-        }
-        if handleFailure, update.failure != nil { stop() }
+        cursor = recordings[0].cursor
+        updateTrackMeters(peaks)
+        if handleFailure, failed { stop() }
     }
     func updateTransportPosition() {
         if recorder != nil { updateRecordingWaveform() }
@@ -670,7 +719,7 @@ final class Editor: NSObject {
     func effectChain(for trackID: UUID) -> [PluginEffect]? {
         trackID == Project.masterID ? project.masterEffects : project.tracks.first(where: { $0.id == trackID })?.effects
     }
-    var canEditEffects: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
+    var canEditEffects: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     func showEffects(for trackID: UUID) {
         guard canEditEffects, effectChain(for: trackID) != nil else { return }
         if trackID != Project.masterID { selectedTrack = trackID; update() }
@@ -724,7 +773,9 @@ final class Editor: NSObject {
     }
     private func updateMetronome() {
         player?.setMetronome(tempo: project.tempo, enabled: project.metronomeIsAudible)
-        recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeIsAudible && player == nil)
+        for (index, take) in recordings.enumerated() {
+            take.recorder.metronome.configure(bpm: project.tempo, enabled: project.metronomeIsAudible && player == nil && index == 0)
+        }
     }
     var canAdjustTrackMix: Bool { !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     @discardableResult func setTrackMix(_ id: UUID, volumeDB: Double? = nil, pan: Double? = nil, checkpoint shouldCheckpoint: Bool = true) -> Bool {
@@ -1150,26 +1201,38 @@ final class Editor: NSObject {
         cancelPlaybackPreparation()
         endShuttle(resume: false)
         stopPlayback()
-        if let recorder {
-            let failure = recorder.stop()
-            updateRecordingWaveform(handleFailure: false); self.recorder = nil
-            do {
-                if let url = recordingURL, let index = project.tracks.firstIndex(where: { $0.id == recordingTrack }) {
+        if !recordings.isEmpty {
+            let takes = recordings
+            let failures = takes.map { $0.recorder.stop() }
+            updateRecordingWaveform(handleFailure: false)
+            clearRecordingState()
+            var saved: [(Int, Clip)] = []
+            var errors: [Error] = []
+            for (take, failure) in zip(takes, failures) {
+                do {
+                    guard let index = project.tracks.firstIndex(where: { $0.id == take.track }) else { continue }
+                    let url = take.recorder.url
                     let data = try audio.load(url.path)
                     guard data.frameCount > 0 else {
-                        if let failure { throw failure }
-                        throw SounderError.message("No audio was captured. Check the selected input device.")
+                        try? FileManager.default.removeItem(at: url)
+                        throw failure ?? SounderError.message("No audio was captured. Check the selected input device.")
                     }
                     pendingRecordedSources.insert(url.path)
-                    checkpoint()
-                    let clip = Clip(name: "\(project.tracks[index].name) \(project.tracks[index].nextTakeNumber)", source: url.path, start: recordingStart, duration: Double(data.frameCount) / audio.sampleRate, order: project.nextOrder)
-                    project.tracks[index].nextTakeNumber += 1
-                    project.nextOrder += 1; project.tracks[index].clips.append(clip); selection = [clip.id]
-                    cursor = clip.end
-                    if failure == nil { notifications.show("Recording saved", style: .success) }
-                    else if let failure { self.error(SounderError.message("Recording interrupted; captured audio was saved. " + failure.localizedDescription)) }
+                    let clip = Clip(name: "\(project.tracks[index].name) \(project.tracks[index].nextTakeNumber)", source: url.path, start: take.start, duration: Double(data.frameCount) / audio.sampleRate, order: project.nextOrder + saved.count)
+                    saved.append((index, clip))
+                    if let failure { errors.append(SounderError.message("Recording interrupted; captured audio was saved. " + failure.localizedDescription)) }
+                } catch { errors.append(error) }
+            }
+            if !saved.isEmpty {
+                checkpoint()
+                for (index, clip) in saved {
+                    project.tracks[index].nextTakeNumber += 1; project.tracks[index].clips.append(clip)
                 }
-            } catch { self.error(error) }
+                project.nextOrder += saved.count; selection = Set(saved.map { $0.1.id })
+                cursor = saved.map { $0.1.end }.max() ?? cursor
+                if errors.isEmpty { notifications.show("Recording saved", style: .success) }
+            }
+            for error in errors { self.error(error) }
         }
         clearRecordingState(); stopTrackMeters(); update()
     }

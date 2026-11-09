@@ -404,3 +404,94 @@ extension AppDelegate {
         print("PASS: Loop recording displays the full period with its overwritten prefix and retained tail, creates no file while active, and Space commits one fragment")
     }
 }
+
+func runMultitrackRecordingTests() throws {
+    func check(_ condition: Bool, _ message: String) throws {
+        guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderMultiCapture-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let mono = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+    let stereo = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+    var created = 0
+    let editor = Editor(store: store, makeRecorder: { url, format in
+        let input = created.isMultiple(of: 2) ? mono : stereo; created += 1
+        return try LiveRecorder(url: url, format: format, inputFormat: input)
+    }, makePlayback: { graph, format, start in
+        let playback = LivePlayback(graph: graph, format: format, start: start)
+        try playback.engine.enableManualRenderingMode(.offline, format: stereo, maximumFrameCount: 512)
+        return playback
+    })
+    let a = Track(name: "Microphone"), b = Track(name: "Instrument"), c = Track(name: "Active")
+    editor.project = Project(tracks: [a, c, b]); editor.selectedTrack = c.id; editor.cursor = 2.5
+    try check(editor.recordingTargets == [c.id], "Without REC selections recording targets only the active track")
+    editor.toggleRecordArm(a.id); editor.toggleRecordArm(b.id)
+    let decoded = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(editor.project))
+    try check(decoded.tracks.filter(\.recordArmed).map(\.id) == [a.id, b.id] && editor.selectedTrack == c.id,
+              "Independent REC choices persist without changing the active track")
+    var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(a)) as! [String: Any]
+    legacy.removeValue(forKey: "recordArmed")
+    try check(try !JSONDecoder().decode(Track.self, from: JSONSerialization.data(withJSONObject: legacy)).recordArmed,
+              "Projects saved before REC default to unarmed tracks")
+    let undoCount = editor.undoStack.count
+    try editor.startRecording()
+    let transport = editor.player!
+    try check(editor.recordings.compactMap(\.track) == [a.id, b.id] && editor.recordings.count == 2 && !editor.canArmTracks,
+              "Record starts all armed inputs and freezes REC choices during capture")
+    func feed(_ frames: Int) {
+        for (index, take) in editor.recordings.enumerated() {
+            let input = take.recorder.format.channels == 1 ? mono : stereo
+            let buffer = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(frames))!
+            buffer.frameLength = AVAudioFrameCount(frames)
+            for channel in 0..<Int(input.channelCount) {
+                for frame in 0..<frames { buffer.floatChannelData![channel][frame] = index == 0 ? 0.2 : -0.5 }
+            }
+            take.recorder.writer.append(buffer); take.recorder.writer.waitForPendingWrites()
+        }
+        editor.updateRecordingWaveform()
+    }
+    feed(4800)
+    try check(editor.recordings.allSatisfy { !$0.peaks.isEmpty && abs($0.start - 2.5) < 1e-8 } &&
+              editor.recordings[0].channelPeaks.count == 1 && editor.recordings[1].channelPeaks.count == 2,
+              "Every armed track has an independent live PCM waveform in its actual channel format")
+    try check((editor.displayedTrackMeter(editor.project.tracks[0]).left.peak) > 0.19 &&
+              (editor.displayedTrackMeter(editor.project.tracks[2]).left.peak) > 0.49,
+              "All recording tracks display their own microphone meters")
+    editor.restartFromLastStart()
+    try check(editor.recordings.count == 2 && editor.player === transport && editor.cursor == 2.5 && editor.undoStack.count == undoCount,
+              "Enter replaces all unsaved takes together on the same backing transport without Undo entries")
+    feed(4800)
+    let discarded = editor.recordings.map { $0.recorder.url }
+    editor.restartFromLastStart()
+    try check(discarded.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) } && editor.project.tracks.allSatisfy { $0.nextTakeNumber == 1 },
+              "Enter removes every discarded take file without consuming track take numbers")
+    feed(4800); editor.playPause()
+    let clips = editor.project.tracks.flatMap(\.clips)
+    try check(!editor.isRecording && !editor.isPlaying && editor.cursor == 2.5 && clips.count == 2 && editor.project.tracks[1].clips.isEmpty && editor.undoStack.count == undoCount + 1,
+              "Space saves every armed track together as one Undo step and returns to the recording start")
+    let first = try store.load(clips[0].source), second = try store.load(clips[1].source)
+    try check(first.channels.count == 1 && second.channels.count == 2 && abs(first.channels[0][0] - 0.2) < 0.0001 && abs(second.channels[0][0] + 0.5) < 0.0001,
+              "Multitrack takes retain distinct microphone PCM and true mono/stereo formats")
+    editor.undo()
+    try check(editor.project.tracks.allSatisfy { $0.clips.isEmpty && $0.nextTakeNumber == 1 }, "Undo removes the whole multitrack take and restores all counters")
+    editor.redo()
+    try check(editor.project.tracks.flatMap(\.clips).count == 2, "Redo restores all tracks in the take")
+    editor.toggleRecordArm(a.id); editor.toggleRecordArm(b.id)
+    editor.cursor = 1
+    try editor.startRecording()
+    try check(editor.recordings.count == 1 && editor.recordingTrack == c.id,
+              "Clearing every REC selection restores recording to the active track")
+    feed(480); editor.stop()
+
+    editor.toggleRecordArm(a.id); editor.toggleRecordArm(b.id)
+    editor.project.loopEnabled = true; editor.range = 0.1...0.3; editor.cursor = 0
+    try editor.startRecording(); feed(33_600)
+    try check(editor.recordings.count == 2 && editor.recordings.allSatisfy { abs($0.start) < 1e-8 && abs($0.end - 0.3) < 1e-8 } &&
+              editor.recordings.allSatisfy { !FileManager.default.fileExists(atPath: $0.recorder.url.path) },
+              "Loop capture keeps a separate bounded RAM period and live preview for every armed track")
+    let beforeLoop = editor.undoStack.count
+    editor.playPause()
+    try check(editor.undoStack.count == beforeLoop + 1 && editor.project.tracks.filter(\.recordArmed).allSatisfy { abs(($0.clips.last?.duration ?? 0) - 0.3) < 1e-8 },
+              "Stopping loop capture writes all armed tracks as one take and one Undo action")
+}

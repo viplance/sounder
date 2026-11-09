@@ -4,6 +4,7 @@ import CoreText
 
 final class MixerFXButton: PointerButton {
     static let controlWidth: CGFloat = 54
+    static let trackControlWidth: CGFloat = 48
     let power = PointerButton(title: "", target: nil, action: nil)
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -31,7 +32,7 @@ final class MixerFXButton: PointerButton {
     func configure(editor: Editor, track: Track, color: NSColor) {
         if self.editor !== editor || trackID != track.id {
             self.editor = editor; trackID = track.id
-            title = "FX"; font = .systemFont(ofSize: 10, weight: .semibold); isBordered = false
+            title = "FX"; font = .systemFont(ofSize: 9, weight: .semibold); isBordered = false
             target = self; action = #selector(openEffects)
         }
         setAccessibilityLabel("\(track.name) effects")
@@ -64,7 +65,7 @@ final class MixerFXButton: PointerButton {
             let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.4, dy: 0.4), xRadius: 5, yRadius: 5)
             path.lineWidth = 0.7; path.stroke()
         }
-        centeredControlLabel(title, NSRect(x: rect.minX, y: rect.minY, width: max(0, rect.width - 18), height: rect.height), size: 10,
+        centeredControlLabel(title, NSRect(x: rect.minX, y: rect.minY, width: max(0, rect.width - 18), height: rect.height), size: 9,
                              color: active ? color : .secondaryLabelColor, flipped: flipped)
     }
     override func draw(_ dirtyRect: NSRect) {
@@ -421,11 +422,23 @@ final class MixerPeakChannelReadout: NSView {
 
 /// Native sliders keep keyboard and accessibility support. The clipped holder
 /// follows the pinned sidebar while the document scrolls underneath it.
+final class TrackRecordButton: PointerButton {
+    override func draw(_ dirtyRect: NSRect) {
+        let active = state == .on
+        fill(bounds, active ? NSColor.systemRed.withAlphaComponent(0.3) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+        if isEnabled && isHovering && window?.isKeyWindow == true {
+            fill(bounds, NSColor.white.withAlphaComponent(0.10), radius: 5)
+        }
+        centeredControlLabel("REC", bounds, size: 9, color: active ? .systemRed : .secondaryLabelColor, flipped: isFlipped)
+    }
+}
+
 final class TrackMixerControls: NSView {
     let volumeControl = MixerVolumeControl(frame: .zero)
     var volume: TrackMixerSlider { volumeControl.slider }
     let pan = TrackMixerSlider(value: 0, minValue: -90, maxValue: 90, target: nil, action: nil)
     let fx = MixerFXButton(title: "FX", target: nil, action: nil)
+    let rec = TrackRecordButton(title: "REC", target: nil, action: nil)
     let trackID: UUID
     private weak var editor: Editor?
     override var isFlipped: Bool { true }
@@ -433,7 +446,9 @@ final class TrackMixerControls: NSView {
         trackID = track.id; self.editor = editor
         super.init(frame: .zero)
         wantsLayer = true; layer?.masksToBounds = true
-        addSubview(volumeControl); addSubview(pan); addSubview(fx)
+        addSubview(volumeControl); addSubview(pan); addSubview(fx); addSubview(rec)
+        rec.setButtonType(.pushOnPushOff); rec.isBordered = false
+        rec.activeAppearanceColor = .systemRed; rec.target = self; rec.action = #selector(toggleRecord)
         let panCell = TrackPanSliderCell(); panCell.minValue = -90; panCell.maxValue = 90; panCell.doubleValue = 0
         pan.cell = panCell
         pan.controlSize = .mini; pan.isContinuous = true; pan.target = self; pan.trackFillColor = accent
@@ -458,9 +473,12 @@ final class TrackMixerControls: NSView {
         pan.refreshValuePresentation()
         if let editor {
             fx.configure(editor: editor, track: track, color: color)
+            rec.state = track.recordArmed ? .on : .off; rec.isEnabled = editor.canArmTracks
+            rec.toolTip = track.recordArmed ? "Disarm recording" : "Arm recording"
+            rec.setAccessibilityLabel("\(track.name) REC")
             let meter = editor.displayedTrackMeter(track)
             let active = editor.isPlaying || editor.isRecording
-            volumeControl.configure(track: track, meter: meter, active: active, recording: editor.isRecording && editor.recordingTrack == track.id,
+            volumeControl.configure(track: track, meter: meter, active: active, recording: editor.recording(for: track.id) != nil,
                                     enabled: editor.canAdjustTrackMix, showsPeaks: editor.showsTrackMeter(track.id))
         }
     }
@@ -472,6 +490,7 @@ final class TrackMixerControls: NSView {
             slider.checkpointed = true
         }
     }
+    @objc private func toggleRecord() { editor?.toggleRecordArm(trackID) }
     @objc private func changeVolume(_ sender: TrackMixerSlider) { change(sender, isPan: false) }
     @objc private func changePan(_ sender: TrackMixerSlider) { change(sender, isPan: true) }
 }
@@ -999,6 +1018,8 @@ final class Timeline: NSView {
                 control.volumeControl.frame = NSRect(x: first.minX - pinnedHeaderX, y: offset + trackVolumeY, width: trackMeterReadoutRect(row: row, channel: 0).maxX - first.minX, height: 22)
                 control.volumeControl.layoutSubtreeIfNeeded()
                 control.pan.frame = NSRect(x: header - 24, y: offset + 4, width: 20, height: rowHeight - 8)
+                let recRect = trackRecordRect(row: row, depth: depth)
+                control.rec.frame = NSRect(x: recRect.minX - pinnedHeaderX, y: recRect.minY - rect.minY, width: recRect.width, height: recRect.height)
                 let fxRect = trackFXRect(row: row, depth: depth)
                 control.fx.frame = NSRect(x: fxRect.minX - pinnedHeaderX, y: fxRect.minY - rect.minY, width: fxRect.width, height: fxRect.height)
             }
@@ -1132,14 +1153,19 @@ final class Timeline: NSView {
         for (track, _) in rows {
             guard let control = mixerControls[track.id], !control.isHidden else { continue }
             control.volumeControl.updateMeter(editor.displayedTrackMeter(track), active: editor.isPlaying || editor.isRecording,
-                                              recording: editor.recordingTrack == track.id && editor.isRecording,
+                                              recording: editor.recording(for: track.id) != nil,
                                               showsPeaks: editor.showsTrackMeter(track.id))
         }
     }
     func invalidateRecordingPreview() {
-        guard editor.isRecording, let row = rows.firstIndex(where: { $0.0.id == editor.recordingTrack }) else { previousRecordingRect = nil; return }
-        let rect = NSRect(x: header + editor.recordingStart * editor.zoom - 2, y: ruler + CGFloat(row) * rowHeight,
-                          width: max(14, (editor.recordingEnd - editor.recordingStart) * editor.zoom + 4), height: rowHeight)
+        var combined: NSRect?
+        for take in editor.recordings {
+            guard let row = rows.firstIndex(where: { $0.0.id == take.track }) else { continue }
+            let rect = NSRect(x: header + take.start * editor.zoom - 2, y: ruler + CGFloat(row) * rowHeight,
+                              width: max(14, (take.end - take.start) * editor.zoom + 4), height: rowHeight)
+            combined = combined.map { $0.union(rect) } ?? rect
+        }
+        guard let rect = combined else { previousRecordingRect = nil; return }
         let dirty = (previousRecordingRect.map { $0.union(rect) } ?? rect).intersection(viewportRect)
         if !dirty.isNull, !dirty.isEmpty { setNeedsDisplay(dirty) }
         previousRecordingRect = rect
@@ -1392,14 +1418,19 @@ final class Timeline: NSView {
         return rect
     }
     func trackMuteRect(row: Int, depth: Int) -> NSRect {
-        NSRect(x: pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: 46, height: 20)
+        NSRect(x: pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: 36, height: 20)
     }
     func trackSoloRect(row: Int, depth: Int) -> NSRect {
-        trackMuteRect(row: row, depth: depth).offsetBy(dx: 50, dy: 0)
+        let first = trackMuteRect(row: row, depth: depth)
+        return NSRect(x: first.minX + 40, y: first.minY, width: 34, height: first.height)
+    }
+    func trackRecordRect(row: Int, depth: Int) -> NSRect {
+        let first = trackMuteRect(row: row, depth: depth)
+        return NSRect(x: first.minX + 78, y: first.minY, width: 32, height: first.height)
     }
     func trackFXRect(row: Int, depth: Int) -> NSRect {
         let x = pinnedHeaderX + CGFloat(min(depth, 2)) * 6 + 18
-        return NSRect(x: x + 100, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: MixerFXButton.controlWidth, height: 20)
+        return NSRect(x: x + 114, y: ruler + CGFloat(row) * rowHeight + trackButtonsY, width: MixerFXButton.trackControlWidth, height: 20)
     }
     func rangeHandleRects() -> [NSRect] {
         guard let range = editor.range else { return [] }
@@ -1595,12 +1626,12 @@ final class Timeline: NSView {
                 guard rect.insetBy(dx: -4, dy: -4).intersects(dirtyRect) else { continue }
                 drawFragmentRaster(clip, in: rect, dirtyRect: dirtyRect, colorIndex: index % trackColors.count, dimmed: trackDimmed)
             }
-            if editor.isRecording && editor.recordingTrack == track.id {
-                let rect = NSRect(x: header + editor.recordingStart * editor.zoom, y: y + 8, width: max(10, (editor.recordingEnd - editor.recordingStart) * editor.zoom), height: rowHeight - 16)
+            if let take = editor.recording(for: track.id) {
+                let rect = NSRect(x: header + take.start * editor.zoom, y: y + 8, width: max(10, (take.end - take.start) * editor.zoom), height: rowHeight - 16)
                 fill(rect, NSColor.systemRed.blended(withFraction: 0.85, of: background)!, radius: 6)
                 NSColor.systemRed.setStroke(); NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).stroke()
                 NSGraphicsContext.saveGraphicsState(); NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1)).addClip()
-                drawChannelWaveforms(editor.recordingChannelPeaks, partialPeaks: editor.recordingPartialChannelPeaks, sampleRate: editor.recorder?.format.sampleRate ?? editor.audio.sampleRate, offset: 0, in: rect, dirtyRect: dirtyRect, color: .systemRed)
+                drawChannelWaveforms(take.channelPeaks, partialPeaks: take.partialChannelPeaks, sampleRate: take.recorder.format.sampleRate, offset: 0, in: rect, dirtyRect: dirtyRect, color: .systemRed)
                 NSGraphicsContext.restoreGraphicsState()
             }
         }
@@ -1816,6 +1847,9 @@ final class Timeline: NSView {
                 editor.selectedTrack = rows[row].0.id
                 editor.toggleSolo(rows[row].0.id); return
             }
+            if rows.indices.contains(row), trackRecordRect(row: row, depth: rows[row].1).contains(point) {
+                editor.toggleRecordArm(rows[row].0.id); return
+            }
             if rows.indices.contains(row), trackFXRect(row: row, depth: rows[row].1).contains(point) {
                 mixerControls[rows[row].0.id]?.fx.performClick(nil); return
             }
@@ -1834,6 +1868,8 @@ final class Timeline: NSView {
                 editor.toggleMute(track.id)
             } else if trackSoloRect(row: row, depth: depth).contains(p) {
                 editor.toggleSolo(track.id)
+            } else if trackRecordRect(row: row, depth: depth).contains(p) {
+                editor.toggleRecordArm(track.id)
             } else {
                 trackDrag = track.id
                 if trackNameHitRect(row: row, depth: depth).contains(p) { pendingTrackRename = track.id }

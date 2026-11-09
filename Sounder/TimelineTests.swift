@@ -754,7 +754,8 @@ extension AppDelegate {
         for row in 0..<3 {
             let solo = timeline.trackSoloRect(row: row, depth: row)
             guard solo.minX > timeline.trackMuteRect(row: row, depth: row).maxX,
-                  solo.maxX < timeline.trackFXRect(row: row, depth: row).minX,
+                  solo.maxX < timeline.trackRecordRect(row: row, depth: row).minX,
+                  timeline.trackRecordRect(row: row, depth: row).maxX < timeline.trackFXRect(row: row, depth: row).minX,
                   timeline.trackFXRect(row: row, depth: row).maxX < timeline.fragmentLeft else { throw SounderError.message("Solo/Mute/FX overlap in nested headers") }
             let point = timeline.convertDocumentPoint(NSPoint(x: solo.midX, y: solo.midY), to: nil)
             let event = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
@@ -762,6 +763,14 @@ extension AppDelegate {
             guard editor.project.tracks[row].solo else { throw SounderError.message("Solo button did not activate") }
         }
         guard editor.project.tracks.allSatisfy(\.solo) else { throw SounderError.message("Solo cleared another track") }
+        for row in 0..<3 {
+            let rect = timeline.trackRecordRect(row: row, depth: row)
+            let event = NSEvent.mouseEvent(with: .leftMouseDown, location: timeline.convertDocumentPoint(NSPoint(x: rect.midX, y: rect.midY), to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            timeline.mouseDown(with: event)
+        }
+        guard editor.project.tracks.allSatisfy(\.recordArmed), !editor.isRecording else { throw SounderError.message("REC must independently arm tracks without starting capture") }
+        print("PASS: MUTE/SOLO/REC/FX fit nested headers and REC arms multiple tracks without starting capture")
+
         editor.seek(to: 2); editor.playPause()
         guard let playback = editor.player else { throw SounderError.message("Solo UI playback did not start") }
         let messages = editor.notifications.messages.count
@@ -773,7 +782,7 @@ extension AppDelegate {
         }
         guard editor.notifications.messages.count == messages else { throw SounderError.message("Solo toggles must remain silent") }
         print("PASS: Live Solo buttons toggle without replacing playback or emitting notifications")
-        print("PASS: Solo buttons sit between MUTE and FX at every nesting depth and independently activate multiple tracks")
+        print("PASS: MUTE/SOLO/REC/FX remain separated at every nesting depth and Solo independently activates multiple tracks")
     }
 }
 
@@ -1260,7 +1269,7 @@ extension AppDelegate {
             guard masterVolumeControl.window === window, !masterVolumeControl.isHiddenOrHasHiddenAncestor,
                   abs(group.midX - window.frame.width / 2) < 2, heading.maxX < fx.minX, fx.maxX < master.minX,
                   masterFXButton.title == "FX", masterFXButton.font?.pointSize == 10,
-                  abs(fx.width - MixerFXButton.controlWidth) < 0.5, abs(fx.height - 20) < 0.5,
+                  abs(fx.width - MixerFXButton.trackControlWidth) < 0.5, abs(fx.height - 20) < 0.5,
                   masterVolumeControl.slider.cell is TrackVolumeMeterCell else { throw SounderError.message("Master group must stay centered in MASTER → FX → volume order, using the track FX dimensions/font: \(group), \(fx)") }
             let name = editor.project.name
             editor.project.name = String(repeating: "W", count: 100); refresh()
