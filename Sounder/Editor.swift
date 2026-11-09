@@ -379,7 +379,8 @@ final class Editor: NSObject {
     }
     private func mixCacheKey() throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
-        return try encoder.encode(project)
+        var renderProject = project; renderProject.timelineRange = nil
+        return try encoder.encode(renderProject)
     }
     var isShuttling: Bool { shuttleGesture != nil }
     private(set) var trackMeters: [UUID: StereoTrackLevelMeter] = [:]
@@ -1006,6 +1007,16 @@ final class Editor: NSObject {
                 let effect = project.tracks[track].effects.firstIndex(where: { $0.id == effectID }) { project.tracks[track].effects[effect].state = state }
     }
     func flushPluginEdits() { for window in Array(pluginWindows.values) { window.captureChanges() } }
+    // Files/presets/impulse responses can change without any normalized
+    // parameter or edit notification. Save the complete authoritative hosts,
+    // including processors whose editors have already been closed.
+    private func capturePluginStates() throws {
+        var states: [(UUID, Data)] = []
+        for effect in project.allEffects {
+            if let host = pluginHosts[effect.id] { states.append((effect.id, try host.saveState())) }
+        }
+        for (id, state) in states { setEffectState(state, effectID: id) }
+    }
     func closePluginWindows(capture: Bool = true) { for window in Array(pluginWindows.values) { window.close(capture: capture) } }
     func toggleTempoMode() { checkpoint(); project.tempoMode.toggle(); updateMetronome(); update() }
     func setTempo(_ bpm: Double) {
@@ -1587,7 +1598,8 @@ final class Editor: NSObject {
     func save(to url: URL) throws {
         guard !busy else { throw SounderError.message("Wait for the current operation before saving") }
         flushPluginEdits()
-        var snapshot = project; snapshot.name = projectName
+        try capturePluginStates()
+        var snapshot = project; snapshot.name = projectName; snapshot.timelineRange = range
         let saved = try ProjectStorage.save(snapshot, to: url, additionalSources: pendingRecordedSources)
         func remapped(_ original: Project) -> Project {
             var result = original
@@ -1597,7 +1609,7 @@ final class Editor: NSObject {
             return result
         }
         for (source, target) in saved.sources { if let data = audio.cache[source] { audio.cache[target] = data } }
-        project = remapped(project); project.name = saved.project.name
+        project = remapped(project); project.name = saved.project.name; project.timelineRange = snapshot.timelineRange
         undoStack = undoStack.map(remapped); redoStack = redoStack.map(remapped)
         let pasteboard = NSPasteboard.general
         if let bytes = pasteboard.data(forType: Self.fragmentPasteboardType),
@@ -1655,7 +1667,7 @@ final class Editor: NSObject {
         project = prepared.project; projectURL = url
         audio.configure(project.audioFormat); audio.cache = prepared.sources
         undoStack = []; redoStack = []; selection = []; cursor = 0
-        lastPlaybackStart = nil; range = nil; dirty = false
+        lastPlaybackStart = nil; range = project.timelineRange; dirty = false
         reconcile(); update()
     }
     func export() {
@@ -1673,6 +1685,7 @@ final class Editor: NSObject {
         try settings.validate()
         try (metadata ?? project.metadata).validate()
         flushPluginEdits()
+        try capturePluginStates()
         cancelPlaybackPreparation(); discardStandbyPlayback()
         exporter?.close()
         let job = AudioExportController(editor: self, destination: url, settings: settings, range: range, metadata: metadata ?? project.metadata)
@@ -1680,6 +1693,7 @@ final class Editor: NSObject {
     }
     func export(to url: URL, settings: ExportSettings, range: Range<Double>? = nil, metadata: AudioMetadata? = nil) throws {
         flushPluginEdits()
+        try capturePluginStates()
         var exportedProject = project
         if let metadata { exportedProject.metadata = metadata }
         try AudioExporter.write(project: exportedProject, store: audio, settings: settings, to: url, range: range)

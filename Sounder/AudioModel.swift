@@ -343,6 +343,7 @@ struct Project: Codable {
     var metronomeEnabled = false
     var metronomeIsAudible: Bool { tempoMode && metronomeEnabled }
     var loopEnabled = false
+    var timelineRange: ClosedRange<Double>? = nil
     var defaultInput = AudioEndpoint()
     var defaultOutput = AudioEndpoint()
     var normalizationLevel = -1.0
@@ -352,7 +353,7 @@ struct Project: Codable {
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, masterEffectsBypassed, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, normalizationLevel, defaultInput, defaultOutput }
+    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, masterEffectsBypassed, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, timelineRange, normalizationLevel, defaultInput, defaultOutput }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
@@ -376,6 +377,12 @@ extension Project {
         tempoMode = try values.decodeIfPresent(Bool.self, forKey: .tempoMode) ?? false
         metronomeEnabled = try values.decodeIfPresent(Bool.self, forKey: .metronomeEnabled) ?? false
         loopEnabled = try values.decodeIfPresent(Bool.self, forKey: .loopEnabled) ?? false
+        timelineRange = try values.decodeIfPresent(ClosedRange<Double>.self, forKey: .timelineRange)
+        if let range = timelineRange {
+            guard range.lowerBound.isFinite, range.upperBound.isFinite, range.lowerBound >= 0 else {
+                throw SounderError.message("Invalid timeline selection")
+            }
+        }
         defaultInput = try values.decodeIfPresent(AudioEndpoint.self, forKey: .defaultInput) ?? AudioEndpoint()
         defaultOutput = try values.decodeIfPresent(AudioEndpoint.self, forKey: .defaultOutput) ?? AudioEndpoint()
         try defaultInput.validate(); try defaultOutput.validate()

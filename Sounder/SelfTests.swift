@@ -755,6 +755,7 @@ func runProjectStorageTests() throws {
     var split = a; split.id = UUID(); split.start = 0.06; split.offset = 0.01; split.duration = 0.02
     let b = Clip(name: "Imported", source: inputs[1].path, start: 0, duration: 0.05, order: 2)
     editor.project = Project(tracks: [Track(name: "Media", clips: [a, b, split])])
+    editor.range = 1.125...3.875
     let originalAudio = try store.renderAudio(editor.project)
     editor.checkpoint(); editor.project.tracks[0].clips[0].name = "Renamed"
     let url = root.appendingPathComponent("Session/Project.sounder"), media = url.deletingLastPathComponent().appendingPathComponent("media")
@@ -762,6 +763,17 @@ func runProjectStorageTests() throws {
     var directory: ObjCBool = false
     try check(fm.fileExists(atPath: url.path, isDirectory: &directory) && !directory.boolValue && fm.fileExists(atPath: media.path), "New projects save as a file beside a media folder")
     let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: url))
+    try check(saved.timelineRange == 1.125...3.875, "Save stores the exact selected timeline period independently of clips")
+    let reopened = Editor(store: try AudioStore(directory: root.appendingPathComponent("reopened")))
+    try reopened.open(from: url)
+    try check(reopened.range == editor.range, "Open restores the selected timeline period")
+    editor.range = nil; try editor.save(to: url)
+    try reopened.open(from: url)
+    try check(reopened.range == nil, "Saving a cleared timeline period removes the previous selection")
+    var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+    legacy.removeValue(forKey: "timelineRange")
+    try check(try JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: legacy)).timelineRange == nil,
+              "Projects without a saved timeline period open with no selection")
     let paths = saved.tracks.flatMap(\.clips).map(\.source)
     try check(paths.allSatisfy { $0.hasPrefix("media/") } && Set(paths).count == 2 && paths[0] != paths[1] && paths[0] == paths[2], "Relative media paths deduplicate split sources and keep same-named input files distinct")
     try check(try inputs.enumerated().allSatisfy { try Data(contentsOf: $0.element) == bytes[$0.offset] }, "Saving copies media without modifying or deleting original inputs")

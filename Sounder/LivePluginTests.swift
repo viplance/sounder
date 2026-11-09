@@ -337,3 +337,76 @@ func runLiveEffectsOwnershipTest(path: String) throws {
                       "Play during idle-FX startup leaves exactly one running audio producer")
     }
 }
+
+func runPluginPersistenceTest(path: String) throws {
+    _ = NSApplication.shared; NSApp.setActivationPolicy(.accessory)
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderPluginState-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try AudioStore(directory: root)
+    let host = try SNPluginHost(path: path, classID: "", state: nil)
+    let baseline = try host.saveState()
+    let dictionary = try PropertyListSerialization.propertyList(from: baseline, format: nil) as! [String: Any]
+    let key = dictionary["component"] != nil ? "component" : "chunk"
+    guard let original = dictionary[key] as? Data, let xmlMagic = original.range(of: Data("VC2!".utf8)) else {
+        throw SounderError.message("This persistence fixture requires Convology XT's JUCE state")
+    }
+    let xmlStart = xmlMagic.lowerBound + 8
+    func littleInt(_ data: Data, _ at: Int) -> Int {
+        (0..<4).reduce(0) { $0 | Int(data[at + $1]) << ($1 * 8) }
+    }
+    func writeInt(_ value: Int, into data: inout Data, at offset: Int, big: Bool) {
+        for byte in 0..<4 { data[offset + byte] = UInt8((value >> ((big ? 3 - byte : byte) * 8)) & 255) }
+    }
+    let xmlLength = littleInt(original, xmlStart - 4)
+    guard let xml = String(data: original[xmlStart..<(xmlStart + xmlLength)], encoding: .utf8), xml.contains("<file></file>") else {
+        throw SounderError.message("Unexpected Convology XT fixture state")
+    }
+    func state(selecting url: URL) throws -> Data {
+        let escaped = url.path.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+        let changed = Data(xml.replacingOccurrences(of: "<file></file>", with: "<file>" + escaped + "</file>").utf8)
+        var component = original
+        component.replaceSubrange(xmlStart..<(xmlStart + xmlLength), with: changed)
+        let difference = changed.count - xmlLength
+        writeInt(changed.count, into: &component, at: xmlStart - 4, big: false)
+        // VST3 wraps the same legacy chunk in a VstW/FBCh header.
+        if key == "component" {
+            writeInt(component.count - 24, into: &component, at: 20, big: true)
+            let chunkSize = (0..<4).reduce(0) { $0 << 8 | Int(original[xmlMagic.lowerBound - 4 + $1]) }
+            writeInt(chunkSize + difference, into: &component, at: xmlMagic.lowerBound - 4, big: true)
+        }
+        var result = dictionary; result[key] = component
+        return try PropertyListSerialization.data(fromPropertyList: result, format: .binary, options: 0)
+    }
+    func containsFile(_ state: Data?, _ url: URL) throws -> Bool {
+        guard let state, let saved = try PropertyListSerialization.propertyList(from: state, format: nil) as? [String: Any],
+              let component = saved[key] as? Data else { return false }
+        return component.range(of: Data(url.path.utf8)) != nil
+    }
+    let effect = PluginEffect(name: host.pluginName, path: path, classID: host.classID, state: baseline)
+    let masterEffect = PluginEffect(name: host.pluginName, path: path, classID: host.classID, state: baseline)
+    let editor = Editor(store: store)
+    editor.project = Project(tracks: [Track(name: "IR", effects: [effect])], masterEffects: [masterEffect])
+    editor.range = 1.25...8.75
+    let projectURL = root.appendingPathComponent("Saved.sounder")
+    for name in ["First IR.wav", "Second IR.wav"] {
+        let ir = root.appendingPathComponent(name)
+        var impulse = [Float](repeating: 0, count: 4800); impulse[0] = 0.8; impulse[1000] = 0.2
+        try store.write(impulse, to: ir)
+        let loaded = try SNPluginHost(path: path, classID: host.classID, state: state(selecting: ir))
+        let master = try SNPluginHost(path: path, classID: host.classID, state: state(selecting: ir))
+        try liveCheck(try containsFile(loaded.saveState(), ir), "Real Convology XT accepts the impulse file in its opaque state")
+        let parameters = loaded.parameters().compactMap { $0["value"] as? NSNumber }
+        let polled = loaded.editorSnapshot(revision: loaded.editRevision, values: parameters)
+        try liveCheck(polled?["state"] == nil, "Unchanged parameter polling does not capture Convology XT's opaque impulse selection")
+        editor.pluginHosts[effect.id] = loaded; editor.pluginHosts[masterEffect.id] = master
+        try editor.save(to: projectURL)
+        let reopened = Editor(store: try AudioStore(directory: root.appendingPathComponent("Opened")))
+        try reopened.open(from: projectURL)
+        let restoredEffect = reopened.project.tracks[0].effects[0]
+        let restored = try SNPluginHost(path: path, classID: host.classID, state: restoredEffect.state)
+        try restored.ensureStreaming(2)
+        try liveCheck(try containsFile(restored.saveState(), ir), "Save/Open restores Convology XT's selected impulse with its editor closed")
+        try liveCheck(try containsFile(reopened.project.masterEffects[0].state, ir), "Save includes the authoritative MASTER impulse state")
+        try liveCheck(reopened.range == editor.range, "Project restores the selected timeline period together with the impulse")
+    }
+}

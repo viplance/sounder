@@ -1346,6 +1346,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 if CommandLine.arguments.contains("--microphone-test") {
     do { try runMicrophoneSmokeTest(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
+if let index = CommandLine.arguments.firstIndex(of: "--plugin-persistence-test"), index + 1 < CommandLine.arguments.count {
+    do { setbuf(stdout, nil); try runPluginPersistenceTest(path: CommandLine.arguments[index + 1]); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
 if let index = CommandLine.arguments.firstIndex(of: "--live-effects-ownership-test"), index + 1 < CommandLine.arguments.count {
     do { setbuf(stdout, nil); try runLiveEffectsOwnershipTest(path: CommandLine.arguments[index + 1]); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
