@@ -438,11 +438,11 @@ final class Editor: NSObject {
         }
         importAudio(urls: panel.urls, placement: placement)
     }
-    func importAudio(urls: [URL], placement: AudioImportPlacement = .singleTrack) {
+    func importAudio(urls: [URL], placement: AudioImportPlacement = .singleTrack, destination: (track: UUID?, start: Double)? = nil) {
         guard !busy, !urls.isEmpty else { return }
         if player != nil || pausedPlayer != nil { stop() }
         importer?.close()
-        let job = AudioImportController(editor: self, urls: urls, placement: placement)
+        let job = AudioImportController(editor: self, urls: urls, placement: placement, destination: destination)
         importer = job; job.startImport()
     }
     func finishAudioImport(_ imported: [ImportedAudio], track: UUID?, start: Double, placement: AudioImportPlacement = .singleTrack) {
@@ -457,8 +457,9 @@ final class Editor: NSObject {
         case .separateTracks:
             // Use the same hierarchy order as the visible timeline, including children.
             let ordered = TrackHierarchy.orderedRows(project.tracks).map { $0.0.id }
-            let first = ordered.firstIndex(where: { $0 == track }) ?? 0
-            targets = Array(ordered.dropFirst(first).prefix(imported.count))
+            if let first = ordered.firstIndex(where: { $0 == track }) {
+                targets = Array(ordered.dropFirst(first).prefix(imported.count))
+            } else { targets = [] }
             while targets.count < imported.count {
                 let name = NameRules.normalized(imported[targets.count].name)
                 let added = Track(name: name.isEmpty ? "Audio " + String(format: "%02d", project.tracks.count + 1) : name)

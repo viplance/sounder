@@ -1,4 +1,21 @@
 import AppKit
+import UniformTypeIdentifiers
+
+/// Finder publishes file URLs; some file managers still publish a filename array.
+enum AudioFileDrop {
+    static let filenames = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+    static let types: [NSPasteboard.PasteboardType] = [.fileURL, filenames]
+    static func urls(from pasteboard: NSPasteboard) -> [URL] {
+        let modern = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        let legacy = (pasteboard.propertyList(forType: filenames) as? [String] ?? []).map { URL(fileURLWithPath: $0) }
+        var seen = Set<URL>()
+        return (modern + legacy).filter { url in
+            url.isFileURL && !url.hasDirectoryPath &&
+            UTType(filenameExtension: url.pathExtension)?.conforms(to: .audio) == true &&
+            seen.insert(url.standardizedFileURL).inserted
+        }
+    }
+}
 
 enum AudioImportPlacement { case singleTrack, separateTracks }
 
@@ -91,10 +108,12 @@ final class AudioImportController: NSObject, NSWindowDelegate {
     private var lastProgressTime = 0.0
     private var lastPhase = ""
     var completed: (() -> Void)?
-    init(editor: Editor, urls: [URL], placement: AudioImportPlacement = .singleTrack) {
+    init(editor: Editor, urls: [URL], placement: AudioImportPlacement = .singleTrack, destination: (track: UUID?, start: Double)? = nil) {
         self.editor = editor; self.urls = urls; directory = editor.audio.directory
         self.placement = placement
-        sampleRate = editor.audio.sampleRate; targetTrack = editor.selectedTrack; start = editor.cursor
+        sampleRate = editor.audio.sampleRate
+        if let destination { targetTrack = destination.track; start = destination.start }
+        else { targetTrack = editor.selectedTrack; start = editor.cursor }
         fractions = Array(repeating: 0, count: urls.count); statuses = Array(repeating: "Waiting", count: urls.count)
     }
     private var isCancelled: Bool { cancellationLock.lock(); defer { cancellationLock.unlock() }; return cancelled }

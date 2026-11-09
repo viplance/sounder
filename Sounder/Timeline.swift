@@ -812,6 +812,7 @@ final class Timeline: NSView {
     override var acceptsFirstResponder: Bool { true }
     init(_ editor: Editor) {
         self.editor = editor; super.init(frame: .zero)
+        registerForDraggedTypes(AudioFileDrop.types)
         controlsOverlay.addSubview(scrollSurface)
         controlsOverlay.addSubview(sidebarSurface); controlsOverlay.addSubview(rulerSurface)
         controlsOverlay.addSubview(playheadView); controlsOverlay.addSubview(nameField)
@@ -823,6 +824,42 @@ final class Timeline: NSView {
         nameField.font = .systemFont(ofSize: 13, weight: .semibold)
         nameField.setAccessibilityLabel("Track name")
         nameField.textChanged = { [weak self] in self?.layoutNameField() }
+    }
+    /// Uses displayed document coordinates so pinned headers/rulers never accept audio.
+    func audioDropDestination(at point: NSPoint, flags: NSEvent.ModifierFlags = []) -> (track: UUID?, start: Double)? {
+        guard !editor.busy, viewportRect.contains(point), bounds.contains(point),
+              point.x >= fragmentLeft, isTrackPoint(point) else { return nil }
+        let row = Int((point.y - ruler) / rowHeight)
+        let track = rows.indices.contains(row) ? rows[row].0.id : nil
+        return (track, timelineTime(at: point, flags: flags))
+    }
+    private func audioDropOperation(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard sender.draggingSourceOperationMask.contains(.copy),
+              audioDropDestination(at: documentPoint(fromWindow: sender.draggingLocation)) != nil,
+              !AudioFileDrop.urls(from: sender.draggingPasteboard).isEmpty else { return [] }
+        return .copy
+    }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { audioDropOperation(sender) }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { audioDropOperation(sender) }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { audioDropOperation(sender) == .copy }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard audioDropOperation(sender) == .copy else { return false }
+        synchronizeScrollPresentation()
+        return importDroppedAudio(from: sender.draggingPasteboard, at: documentPoint(fromWindow: sender.draggingLocation),
+                                  flags: NSApp.currentEvent?.modifierFlags ?? [])
+    }
+    @discardableResult func importDroppedAudio(from pasteboard: NSPasteboard, at point: NSPoint,
+                                               flags: NSEvent.ModifierFlags = []) -> Bool {
+        guard let destination = audioDropDestination(at: point, flags: flags) else { return false }
+        let urls = AudioFileDrop.urls(from: pasteboard)
+        guard !urls.isEmpty else { return false }
+        var placement = AudioImportPlacement.singleTrack
+        if urls.count > 1 {
+            guard let chosen = ImportPlacementDialog().runModal() else { return false }
+            placement = chosen
+        }
+        editor.importAudio(urls: urls, placement: placement, destination: destination)
+        return editor.isImporting
     }
     override var isOpaque: Bool { true }
     /// Displayed document coordinates; native visibleRect catches up on input.

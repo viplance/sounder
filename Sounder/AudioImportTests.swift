@@ -69,6 +69,59 @@ func runAudioImportTests() throws {
     try check(editor.project.tracks.isEmpty && cancelled.statuses.allSatisfy { $0 == "Cancelled" } && Set(try FileManager.default.contentsOfDirectory(atPath: store.directory.path)) == pathsBeforeCancel, "Cancellation removes partial copies and leaves the project untouched")
     cancelled.close()
 
+    let dropStore = try AudioStore(directory: directory.appendingPathComponent("Drop recordings"))
+    let dropEditor = Editor(store: dropStore)
+    dropEditor.project = Project(tracks: [root, tail, child]); dropEditor.selectedTrack = root.id; dropEditor.cursor = 9
+    let timeline = Timeline(dropEditor)
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 1000, height: 800))
+    scroll.documentView = timeline
+    let dropWindow = NSWindow(contentRect: scroll.frame, styleMask: [.titled], backing: .buffered, defer: false)
+    dropWindow.isReleasedWhenClosed = false; dropWindow.contentView = scroll
+    defer { dropWindow.close() }
+    timeline.refresh(); scroll.contentView.scroll(to: .zero)
+    let pasteboard = NSPasteboard.withUniqueName()
+    defer { pasteboard.releaseGlobally() }
+    pasteboard.writeObjects([source as NSURL, directory.appendingPathComponent("notes.txt") as NSURL])
+    try check(AudioFileDrop.urls(from: pasteboard) == [source] && timeline.registeredDraggedTypes.contains(.fileURL),
+              "Finder file URLs accept audio and filter unrelated files")
+    pasteboard.clearContents()
+    pasteboard.setPropertyList([source.path, source.path, directory.path + "/"], forType: AudioFileDrop.filenames)
+    try check(AudioFileDrop.urls(from: pasteboard) == [source], "Legacy file-manager drops preserve order and deduplicate files")
+    let dropPoint = NSPoint(x: timeline.header + 3.5 * dropEditor.zoom, y: timeline.ruler + timeline.rowHeight * 1.5)
+    try check(timeline.audioDropDestination(at: dropPoint)?.track == child.id,
+              "File drops resolve tracks in visible hierarchy order")
+    try check(timeline.audioDropDestination(at: NSPoint(x: 20, y: dropPoint.y)) == nil &&
+              timeline.audioDropDestination(at: NSPoint(x: dropPoint.x, y: 10)) == nil,
+              "Pinned track headers and the ruler reject file drops")
+    try check(timeline.importDroppedAudio(from: pasteboard, at: dropPoint), "Dropping audio starts the shared asynchronous import")
+    let dropped = dropEditor.importer!
+    try check(dropped.window.isVisible && dropped.targetTrack == child.id && dropped.start == 3.5 && dropEditor.cursor == 9,
+              "Drop captures its track/time without moving the playhead and shows import progress")
+    try check(timeline.audioDropDestination(at: dropPoint) == nil, "A busy editor rejects further file drops")
+    try wait(dropped)
+    try check(dropEditor.project.tracks.first(where: { $0.id == child.id })?.clips.first?.start == 3.5 &&
+              dropEditor.project.tracks.first(where: { $0.id == root.id })?.clips.isEmpty == true,
+              "Dropped audio imports at the pointer rather than the active track or playhead")
+    dropEditor.undo()
+    try check(dropEditor.project.tracks.allSatisfy { $0.clips.isEmpty }, "A dropped batch is one Undo step")
+    timeline.refresh()
+    let blankPoint = NSPoint(x: dropPoint.x, y: timeline.ruler + timeline.rowHeight * 3.5)
+    try check(timeline.audioDropDestination(at: blankPoint)?.track == nil && timeline.importDroppedAudio(from: pasteboard, at: blankPoint),
+              "Empty timeline space accepts audio on a new track")
+    try wait(dropEditor.importer!)
+    try check(dropEditor.project.tracks.count == 4 && dropEditor.project.tracks.last?.clips.first?.start == 3.5,
+              "Dropping below existing tracks creates a root track at the requested time")
+    dropEditor.undo()
+    dropEditor.finishAudioImport(prepared, track: nil, start: 2, placement: .separateTracks)
+    try check(dropEditor.project.tracks.count == 5 && dropEditor.project.tracks.prefix(3).allSatisfy { $0.clips.isEmpty } &&
+              dropEditor.project.tracks.suffix(2).allSatisfy { $0.clips.first?.start == 2 },
+              "Separate-track placement below the hierarchy creates new tracks without reusing the first track")
+    dropEditor.project.tempoMode = true; dropEditor.project.tempo = 120
+    let offBeat = NSPoint(x: timeline.header + 3.3 * dropEditor.zoom, y: dropPoint.y)
+    try check(timeline.audioDropDestination(at: offBeat)?.start == 3.5 &&
+              abs((timeline.audioDropDestination(at: offBeat, flags: .shift)?.start ?? 0) - 3.3) < 0.000001,
+              "File drops share timeline beat snapping and Shift bypass")
+
     // Opening must leave the live project/cache untouched until every source is ready.
     let document = directory.appendingPathComponent("Session.sounder")
     var savedProject = Project(tracks: [Track(name: "Saved")])
