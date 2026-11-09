@@ -471,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var projectAuxiliaryWindows: [NSWindow] {
         Array(editor.effectsWindows.values).compactMap { $0.window } +
         Array(editor.pluginWindows.values).compactMap { $0.window } +
-        [editor.importer?.window, editor.exporter?.window, audioRoutingWindow?.window].compactMap { $0 }
+        [editor.projectOpener?.window, editor.importer?.window, editor.exporter?.window, audioRoutingWindow?.window].compactMap { $0 }
     }
     func windowWillMiniaturize(_ notification: Notification) {
         guard notification.object as? NSWindow === window else { return }
@@ -1108,14 +1108,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         metronomeButton.image = NSImage(systemSymbolName: editor.project.metronomeEnabled ? "metronome.fill" : "metronome", accessibilityDescription: "Metronome")
         metronomeButton.contentTintColor = editor.project.metronomeEnabled ? .systemOrange : .secondaryLabelColor
         metronomeButton.toolTip = editor.project.metronomeEnabled ? "Metronome on" : "Metronome off"
-        tempoButton.isEnabled = !editor.isExporting && !editor.isImporting && !editor.requestingMic
+        tempoButton.isEnabled = !editor.isExporting && !editor.isImporting && !editor.isOpening && !editor.requestingMic
         bpmButton.isEnabled = tempoButton.isEnabled; metronomeButton.isEnabled = tempoButton.isEnabled
         loopButton.state = editor.project.loopEnabled ? .on : .off
         loopButton.contentTintColor = editor.project.loopEnabled ? accent : .labelColor
         loopButton.toolTip = editor.project.loopEnabled ? "Loop on" : "Loop off"
         loopButton.isEnabled = editor.canToggleLoop
         playButton.image = NSImage(systemSymbolName: (editor.isPlaying || editor.isPreparingPlayback) ? "pause.fill" : "play.fill", accessibilityDescription: "Play / pause")
-        playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isExporting && !editor.isImporting; recordButton.isEnabled = editor.canRecord
+        playButton.isEnabled = !editor.isRecording && !editor.requestingMic && !editor.isExporting && !editor.isImporting && !editor.isOpening; recordButton.isEnabled = editor.canRecord
         editButtons.forEach { $0.isEnabled = !editor.busy }
         for name in ["open", "save"] {
             projectFileButtons[name]?.isEnabled = !editor.busy
@@ -1151,6 +1151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if editor.isExporting { editor.exporter?.cancel(); return false }
         if editor.isImporting { editor.importer?.cancel(); return false }
+        if editor.isOpening { editor.projectOpener?.cancel(); return false }
         if editor.isRecording { editor.stop() }
         closingConfirmed = editor.confirmDiscard()
         if closingConfirmed {
@@ -1164,6 +1165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if editor.isExporting { editor.exporter?.cancel(); return .terminateCancel }
         if editor.isImporting { editor.importer?.cancel(); return .terminateCancel }
+        if editor.isOpening { editor.projectOpener?.cancel(); return .terminateCancel }
         if closingConfirmed { return .terminateNow }; if editor.isRecording { editor.stop() }; return editor.confirmDiscard() ? .terminateNow : .terminateCancel
     }
     func buildMenu() {
@@ -1271,7 +1273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if [#selector(restartPlayback), #selector(play), #selector(seekBackward), #selector(seekForward), #selector(seekToStart), #selector(seekToEnd), #selector(stop), #selector(record), #selector(rewind)].contains(menuItem.action) {
             return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
                 && (!editor.isRecording || menuItem.action == #selector(restartPlayback) || menuItem.action == #selector(play))
-                && !editor.requestingMic && !editor.isExporting && !editor.isImporting
+                && !editor.requestingMic && !editor.isExporting && !editor.isImporting && !editor.isOpening
         }
         return true
     }
@@ -1350,6 +1352,9 @@ if let index = CommandLine.arguments.firstIndex(of: "--playback-test"), index + 
 if CommandLine.arguments.contains("--multicore-test") {
     do { setbuf(stdout, nil); try runMulticoreTests(benchmark: !CommandLine.arguments.contains("--no-benchmark")); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if CommandLine.arguments.contains("--audio-import-test") {
+    do { try runAudioImportTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if CommandLine.arguments.contains("--self-test") {
     do { try runAudioTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }

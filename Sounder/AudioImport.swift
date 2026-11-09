@@ -190,3 +190,108 @@ final class AudioImportController: NSObject, NSWindowDelegate {
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { pressButton(); return false }
 }
+
+/// Worker-owned project and PCM, published together only after validation succeeds.
+struct PreparedProject {
+    let project: Project
+    let sources: [String: AudioData]
+    static func load(from url: URL, progress: (Double, String) -> Void = { _, _ in },
+                     cancelled: () -> Bool = { false }) throws -> PreparedProject {
+        if cancelled() { throw CancellationError() }
+        progress(0, "Reading project")
+        let project = try ProjectStorage.load(from: url)
+        let clips = project.tracks.flatMap(\.clips)
+        var sources: [String: AudioData] = [:]
+        var seen = Set<String>()
+        let paths = clips.map(\.source).filter { seen.insert($0).inserted }
+        for (index, path) in paths.enumerated() {
+            if cancelled() { throw CancellationError() }
+            sources[path] = try AudioStore.decode(URL(fileURLWithPath: path), sampleRate: project.audioFormat.sampleRate,
+                progress: { fraction, phase in
+                    progress((Double(index) + fraction) / Double(paths.count), phase + ": " + URL(fileURLWithPath: path).lastPathComponent)
+                }, isCancelled: cancelled)
+        }
+        for clip in clips {
+            if cancelled() { throw CancellationError() }
+            guard let data = sources[clip.source],
+                  clip.offset + clip.duration <= Double(data.frameCount) / project.audioFormat.sampleRate + 0.001 else {
+                throw SounderError.message("Fragment exceeds its audio file")
+            }
+        }
+        if cancelled() { throw CancellationError() }
+        return PreparedProject(project: project, sources: sources)
+    }
+}
+
+/// Matches the compact export window; all document reads and audio preparation run on its worker.
+final class ProjectOpenController: NSObject, NSWindowDelegate {
+    weak var editor: Editor?
+    let url: URL
+    private(set) var isRunning = false
+    private(set) var fraction = 0.0
+    private(set) var failure: Error?
+    private(set) var window: NSWindow!
+    private let row: AudioFileProgressRow
+    private let button = PointerButton()
+    private let queue = DispatchQueue(label: "Sounder.project.open", qos: .userInitiated)
+    private let lock = NSLock()
+    private var cancelled = false
+    // Accessed only by the worker.
+    private var lastProgressTime = 0.0
+    init(editor: Editor, url: URL) {
+        self.editor = editor; self.url = url; row = AudioFileProgressRow(url: url)
+    }
+    private var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func start() {
+        guard !isRunning, window == nil else { return }
+        isRunning = true
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 144), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Open project"; window.delegate = self; window.isReleasedWhenClosed = false
+        let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
+        row.frame.origin = NSPoint(x: 22, y: 54); root.addSubview(row)
+        row.update(fraction: 0, phase: "Reading project")
+        button.title = "Cancel"; button.bezelStyle = .rounded; button.target = self; button.action = #selector(pressButton)
+        button.frame = NSRect(x: 426, y: 12, width: 112, height: 30); root.addSubview(button)
+        window.center(); window.makeKeyAndOrderFront(nil); editor?.update()
+        DispatchQueue.main.async { [self] in queue.async { [self] in performOpen() } }
+    }
+    private func publish(_ value: Double, _ phase: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastProgressTime >= 0.04 else { return }
+        lastProgressTime = now
+        DispatchQueue.main.async { [self] in
+            fraction = max(fraction, min(0.99, value)); row.update(fraction: fraction, phase: phase)
+        }
+    }
+    private func performOpen() {
+        let result = Result { try PreparedProject.load(from: url, progress: { self.publish($0, $1) }, cancelled: { self.isCancelled }) }
+        DispatchQueue.main.async { [self] in
+            guard editor?.projectOpener === self else { return }
+            isRunning = false; button.title = "Close"; button.isEnabled = true
+            // Cancel can arrive after the worker finishes but before publication.
+            let outcome: Result<PreparedProject, Error> = isCancelled ? .failure(CancellationError()) : result
+            switch outcome {
+            case .success(let prepared):
+                fraction = 1; row.update(fraction: 1, phase: "Ready")
+                editor?.finishProjectOpen(prepared, from: url)
+            case .failure(let error):
+                failure = error
+                row.update(fraction: fraction, phase: error is CancellationError ? "Cancelled" : "Failed: " + error.localizedDescription)
+                editor?.update()
+                if !(error is CancellationError) { editor?.error(error) }
+            }
+            if failure == nil || failure is CancellationError { close() }
+        }
+    }
+    func cancel() {
+        lock.lock(); cancelled = true; lock.unlock()
+        if isRunning { button.title = "Cancelling…"; button.isEnabled = false }
+    }
+    @objc private func pressButton() { if isRunning { cancel() } else { close() } }
+    func close() {
+        guard !isRunning else { cancel(); return }
+        window?.orderOut(nil)
+        if editor?.projectOpener === self { editor?.projectOpener = nil }
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { pressButton(); return false }
+}

@@ -68,6 +68,47 @@ func runAudioImportTests() throws {
     try wait(cancelled)
     try check(editor.project.tracks.isEmpty && cancelled.statuses.allSatisfy { $0 == "Cancelled" } && Set(try FileManager.default.contentsOfDirectory(atPath: store.directory.path)) == pathsBeforeCancel, "Cancellation removes partial copies and leaves the project untouched")
     cancelled.close()
+
+    // Opening must leave the live project/cache untouched until every source is ready.
+    let document = directory.appendingPathComponent("Session.sounder")
+    var savedProject = Project(tracks: [Track(name: "Saved")])
+    savedProject.tracks[0].clips = [Clip(name: "Audio", source: source.path, start: 0, duration: 0.25, order: 0)]
+    _ = try ProjectStorage.save(savedProject, to: document)
+    func waitForOpen(_ job: ProjectOpenController) throws {
+        let deadline = Date().addingTimeInterval(10)
+        while job.isRunning && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        try check(!job.isRunning, "Project opening completes while the main run loop remains responsive")
+    }
+    let prior = editor.project
+    let priorCache = Set(store.cache.keys)
+    try editor.startProjectOpen(from: document)
+    let cancelledOpen = editor.projectOpener!
+    try check(cancelledOpen.window.isVisible && editor.isOpening && editor.busy && !editor.canRecord && !editor.canEditEffects,
+              "Project progress appears immediately and conflicting actions are disabled")
+    try check(editor.project.tracks.isEmpty, "Opening does not replace the project before loading finishes")
+    cancelledOpen.cancel(); try waitForOpen(cancelledOpen)
+    try check(cancelledOpen.failure is CancellationError && editor.project.tracks.count == prior.tracks.count && Set(store.cache.keys) == priorCache && !editor.isOpening,
+              "Cancelled opening preserves the current project and audio cache")
+    try editor.startProjectOpen(from: document)
+    let opened = editor.projectOpener!
+    try waitForOpen(opened)
+    let reopened = editor.project.tracks[0].clips[0]
+    try check(opened.failure == nil && opened.fraction == 1 && !opened.window.isVisible && editor.projectURL == document && !editor.dirty,
+              "Successful opening commits the document and dismisses progress")
+    try check(store.cache[reopened.source]?.channels[0][0] == 0.25 && store.cache[reopened.source]?.channelPeaks.count == 2,
+              "Opening publishes decoded stereo PCM and waveforms before timeline drawing")
+    editor.cursor = 0.125
+    let committedCache = Set(store.cache.keys)
+    let broken = directory.appendingPathComponent("Broken.sounder")
+    var invalid = savedProject
+    invalid.tracks[0].clips[0].duration = 10
+    _ = try ProjectStorage.save(invalid, to: broken)
+    try editor.startProjectOpen(from: broken)
+    let failedOpen = editor.projectOpener!
+    try waitForOpen(failedOpen)
+    try check(failedOpen.failure != nil && failedOpen.window.isVisible && editor.projectURL == document && editor.cursor == 0.125 && Set(store.cache.keys) == committedCache,
+              "Failed validation keeps the previous project, cursor and prepared cache intact")
+    failedOpen.close()
 }
 
 extension AppDelegate {

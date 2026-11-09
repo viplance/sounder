@@ -23,7 +23,7 @@ final class Editor: NSObject {
     var isPreparingPlayback: Bool { preparationRequest != nil }
     var isPrebuffering: Bool { preparation != nil && preparationRequest == nil }
     var canEditPlaybackBuffer: Bool {
-        !isPlaying && !isRecording && !isShuttling && !isPreparingPlayback && !isPrebuffering && !requestingMic && !isExporting && !isImporting
+        !isPlaying && !isRecording && !isShuttling && !isPreparingPlayback && !isPrebuffering && !requestingMic && !isExporting && !isImporting && !isOpening
     }
     var playbackBufferLabel: String {
         PlaybackBufferSize.durationLabel(frames: project.playbackBufferSize, sampleRate: project.audioFormat.sampleRate)
@@ -82,11 +82,11 @@ final class Editor: NSObject {
             return
         }
         guard preparesPlaybackInBackground, !isPlaying, !isRecording, !isShuttling,
-              !requestingMic, !isExporting, !isImporting, !isNormalizing, !isPreparingPlayback,
+              !requestingMic, !isExporting, !isImporting, !isOpening, !isNormalizing, !isPreparingPlayback,
               duration > 0, preparedPosition < duration, !(pausedPlayer != nil && pausedCursorIsCurrent) else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.isPlaying, !self.isRecording, !self.isShuttling,
-                  !self.requestingMic, !self.isExporting, !self.isImporting, !self.isNormalizing, !self.isPreparingPlayback else { return }
+                  !self.requestingMic, !self.isExporting, !self.isImporting, !self.isOpening, !self.isNormalizing, !self.isPreparingPlayback else { return }
             self.preparePlayback(rememberStart: false, forRecording: false, speculative: true)
         }
         idlePreparation = work
@@ -157,6 +157,8 @@ final class Editor: NSObject {
     private var pendingRecordedSources = Set<String>()
     private var recordedSourceCleanup: [String: String] = [:]
     var timer: Timer?
+    var projectOpener: ProjectOpenController?
+    var isOpening: Bool { projectOpener?.isRunning == true }
     var importer: AudioImportController?
     private(set) var isNormalizing = false
     var isImporting: Bool { importer?.isRunning == true }
@@ -165,8 +167,8 @@ final class Editor: NSObject {
     var requestingMic = false
     var isRecording: Bool { recorder != nil }
     var isPlaying: Bool { player?.isPlaying == true || shuttle?.isPlaying == true }
-    var canRecord: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
-    var busy: Bool { isPreparingPlayback || isRecording || isPlaying || isShuttling || requestingMic || isExporting || isImporting || isNormalizing }
+    var canRecord: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
+    var busy: Bool { isPreparingPlayback || isRecording || isPlaying || isShuttling || requestingMic || isExporting || isImporting || isOpening || isNormalizing }
     var canExport: Bool { !busy && duration > 0 }
     var duration: Double { project.tracks.flatMap(\.clips).map(\.end).max() ?? 0 }
     var projectName: String { project.name ?? projectURL?.deletingPathExtension().lastPathComponent ?? "MY PROJECT" }
@@ -667,13 +669,13 @@ final class Editor: NSObject {
     func effectChain(for trackID: UUID) -> [PluginEffect]? {
         trackID == Project.masterID ? project.masterEffects : project.tracks.first(where: { $0.id == trackID })?.effects
     }
-    var canEditEffects: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
+    var canEditEffects: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     func showEffects(for trackID: UUID) {
         guard canEditEffects, effectChain(for: trackID) != nil else { return }
         if trackID != Project.masterID { selectedTrack = trackID; update() }
         EffectsWindow(editor: self, trackID: trackID).run()
     }
-    var canToggleEffects: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
+    var canToggleEffects: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     func effectsBypassed(for trackID: UUID) -> Bool {
         trackID == Project.masterID ? project.masterEffectsBypassed : project.tracks.first(where: { $0.id == trackID })?.effectsBypassed ?? false
     }
@@ -710,7 +712,7 @@ final class Editor: NSObject {
         }
         return duration > 0 ? 0..<duration : nil
     }
-    var canToggleLoop: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
+    var canToggleLoop: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     func toggleLoop() {
         guard canToggleLoop else { return }
         checkpoint(); project.loopEnabled.toggle(); updateLoop(); update()
@@ -723,7 +725,7 @@ final class Editor: NSObject {
         player?.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
         recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled && player == nil)
     }
-    var canAdjustTrackMix: Bool { !isShuttling && !requestingMic && !isExporting && !isImporting && !isNormalizing }
+    var canAdjustTrackMix: Bool { !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     @discardableResult func setTrackMix(_ id: UUID, volumeDB: Double? = nil, pan: Double? = nil, checkpoint shouldCheckpoint: Bool = true) -> Bool {
         if id == Project.masterID {
             guard canAdjustTrackMix, let volumeDB, volumeDB.isFinite else { return false }
@@ -744,7 +746,7 @@ final class Editor: NSObject {
         update(); return true
     }
     func toggleMute(_ trackID: UUID) {
-        guard !isRecording, !isShuttling, !requestingMic, !isExporting, !isImporting,
+        guard !isRecording, !isShuttling, !requestingMic, !isExporting, !isImporting, !isOpening,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
         checkpoint()
         project.tracks[index].muted.toggle()
@@ -752,7 +754,7 @@ final class Editor: NSObject {
         update()
     }
     func toggleSolo(_ trackID: UUID) {
-        guard !isRecording, !isShuttling, !requestingMic, !isExporting, !isImporting,
+        guard !isRecording, !isShuttling, !requestingMic, !isExporting, !isImporting, !isOpening,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
         checkpoint()
         project.tracks[index].solo.toggle()
@@ -780,7 +782,7 @@ final class Editor: NSObject {
         cursor = stoppedPosition
     }
     func seek(to position: Double) {
-        guard !isRecording, !requestingMic, !isExporting, !isImporting, position.isFinite else { return }
+        guard !isRecording, !requestingMic, !isExporting, !isImporting, !isOpening, position.isFinite else { return }
         let target = max(0, position)
         if preparation != nil || preparationRequest != nil {
             let request = preparationRequest
@@ -816,7 +818,7 @@ final class Editor: NSObject {
             let start = recordingOrigin
             stop(); cursor = start; update(); return
         }
-        guard !requestingMic, !isExporting, !isImporting else { return }
+        guard !requestingMic, !isExporting, !isImporting && !isOpening else { return }
         if let playback = player {
             do {
                 try playback.pause()
@@ -834,7 +836,7 @@ final class Editor: NSObject {
     }
     func restartFromLastStart() {
         if isRecording { restartRecording(); return }
-        guard !requestingMic, !isExporting, !isImporting else { return }
+        guard !requestingMic, !isExporting, !isImporting && !isOpening else { return }
         let start = lastPlaybackStart ?? 0
         if !isShuttling, isPlaying { seek(to: start); return }
         endShuttle(resume: false)
@@ -865,7 +867,7 @@ final class Editor: NSObject {
         return try Self.makeGraph(project: project, store: audio, hosts: playbackHosts(), dryGraph: previous, processedCache: previous?.outputCache)
     }
     func beginShuttle(direction: Double) {
-        guard !isPreparingPlayback, !isRecording, !requestingMic, !isExporting, !isImporting, !isNormalizing, duration > 0 else { return }
+        guard !isPreparingPlayback, !isRecording, !requestingMic, !isExporting, !isImporting, !isOpening, !isNormalizing, duration > 0 else { return }
         discardPausedPlayback()
         let direction = direction < 0 ? -1.0 : 1.0
         if shuttleGesture?.direction == direction && !shuttleReleasing { return }
@@ -1274,22 +1276,29 @@ final class Editor: NSObject {
         guard !busy, confirmDiscard() else { return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.canChooseFiles = true; panel.treatsFilePackagesAsDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try open(from: url) }
+        do { try startProjectOpen(from: url) }
         catch { self.error(error) }
     }
     func open(from url: URL) throws {
         guard !busy else { throw SounderError.message("Stop the current operation before opening a project") }
+        let prepared = try PreparedProject.load(from: url)
+        finishProjectOpen(prepared, from: url)
+    }
+    func startProjectOpen(from url: URL) throws {
+        guard !busy else { throw SounderError.message("Stop the current operation before opening a project") }
+        cancelPlaybackPreparation(); discardStandbyPlayback()
+        projectOpener?.close()
+        let job = ProjectOpenController(editor: self, url: url)
+        projectOpener = job; job.start()
+    }
+    func finishProjectOpen(_ prepared: PreparedProject, from url: URL) {
         discardPausedPlayback()
-        do {
-            let loaded = try ProjectStorage.load(from: url)
-            audio.configure(loaded.audioFormat)
-            for clip in loaded.tracks.flatMap(\.clips) {
-                let data = try audio.load(clip.source)
-                guard clip.offset + clip.duration <= Double(data.frameCount) / audio.sampleRate + 0.001 else { throw SounderError.message("Fragment exceeds its audio file") }
-            }
-            pendingRecordedSources = []; recordedSourceCleanup = [:]
-            project = loaded; projectURL = url; undoStack = []; redoStack = []; selection = []; cursor = 0; lastPlaybackStart = nil; range = nil; dirty = false; reconcile(); update("Project opened")
-        } catch { audio.configure(project.audioFormat); throw error }
+        pendingRecordedSources = []; recordedSourceCleanup = [:]
+        project = prepared.project; projectURL = url
+        audio.configure(project.audioFormat); audio.cache = prepared.sources
+        undoStack = []; redoStack = []; selection = []; cursor = 0
+        lastPlaybackStart = nil; range = nil; dirty = false
+        reconcile(); update()
     }
     func export() {
         guard canExport else { return }
