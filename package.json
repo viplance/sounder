@@ -4,7 +4,7 @@
   "description": "Sounder \u2014 native macOS audio recorder and multitrack editor.",
   "private": true,
   "author": "Dzmitry Sharko",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "scripts": {
     "start": "node ./scripts/start.mjs",
     "build:icons": "node ./scripts/build-icons.mjs",

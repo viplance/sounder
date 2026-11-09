@@ -2,6 +2,14 @@
 
 A native audio recorder and editor for macOS 14+ (Apple Silicon), built with AppKit and AVFoundation. Author: Dzmitry Sharko. The Xcode project structure and npm commands follow FalconCleaner; Developer ID team: `W37L5728Y6`, bundle ID: `enotix.Sounder`.
 
+## License
+
+Sounder's original application code, documentation and assets are **source-available, not open source**. The [Sounder Source-Available License](LICENSE) permits viewing and study; copying, cloning, independent forks, modification, building and redistribution otherwise require prior written permission from Dzmitry Sharko, subject to the exceptions in that license.
+
+Public GitHub repositories permit viewing and forking within GitHub under the [GitHub Terms of Service](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service#5-license-grant-to-other-users). A license file cannot disable that permission. Preventing such forks requires private hosting with suitable access controls. Previously granted license rights are unaffected.
+
+Third-party components retain their respective licenses; see [ThirdPartyNotices.txt](Sounder/ThirdPartyNotices.txt). The standalone AudioEncoder source and build script are expressly available under GNU Library GPL v2 or later to preserve rebuilding and relinking rights for the bundled codecs; see [the codec documentation](Vendor/AudioCodecs/README.md).
+
 ## Running and building
 
 - `npm start` — terminates existing processes with the exact name `Sounder`, waits for them to exit, builds and launches the app, and verifies that exactly one process is running.
