@@ -399,6 +399,15 @@ func runPluginPersistenceTest(path: String) throws {
         let polled = loaded.editorSnapshot(revision: loaded.editRevision, values: parameters)
         try liveCheck(polled?["state"] == nil, "Unchanged parameter polling does not capture Convology XT's opaque impulse selection")
         editor.pluginHosts[effect.id] = loaded; editor.pluginHosts[masterEffect.id] = master
+        let board = NSPasteboard.withUniqueName()
+        let sourceRack = EffectsWindow(editor: editor, trackID: editor.project.tracks[0].id)
+        let targetRack = EffectsWindow(editor: editor, trackID: Project.masterID)
+        sourceRack.pasteboard = board; targetRack.pasteboard = board
+        sourceRack.run(); targetRack.run()
+        sourceRack.table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        try liveCheck(sourceRack.copySelection() && targetRack.pasteSelection(), "Copy/Paste transfers Convology XT between FX windows")
+        try liveCheck(try containsFile(targetRack.effects.last?.state, ir), "FX clipboard captures the current opaque impulse-file selection")
+        sourceRack.done(); targetRack.done(); board.releaseGlobally()
         try editor.save(to: projectURL)
         let reopened = Editor(store: try AudioStore(directory: root.appendingPathComponent("Opened")))
         try reopened.open(from: projectURL)
@@ -409,4 +418,95 @@ func runPluginPersistenceTest(path: String) throws {
         try liveCheck(try containsFile(reopened.project.masterEffects[0].state, ir), "Save includes the authoritative MASTER impulse state")
         try liveCheck(reopened.range == editor.range, "Project restores the selected timeline period together with the impulse")
     }
+}
+
+func runEffectsClipboardTest(path: String) throws {
+    _ = NSApplication.shared; NSApp.setActivationPolicy(.accessory)
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderFXClipboard-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let editor = Editor(store: try AudioStore(directory: root))
+    let board = NSPasteboard.withUniqueName(); defer { board.releaseGlobally() }
+    var source: [PluginEffect] = [], values: [Double] = [], parameter: Int = 0
+    for i in 0..<3 {
+        let host = try SNPluginHost(path: path, classID: "", state: nil)
+        let parameters = host.parameters()
+        let chosen = parameters.first { ($0["name"] as? String ?? "").lowercased().contains("output") } ?? parameters[0]
+        parameter = (chosen["index"] as! NSNumber).intValue
+        let state = try host.saveState()
+        let value = 0.25 + Double(i) * 0.2
+        host.setParameter(parameter, value: value)
+        values.append(host.parameterValue(parameter))
+        let effect = PluginEffect(name: "Effect \(i)", path: path, classID: host.classID, state: state, bypassed: i == 2)
+        source.append(effect); editor.pluginHosts[effect.id] = host
+    }
+    let track = Track(name: "Source", effects: source)
+    editor.project = Project(tracks: [track], masterEffects: [PluginEffect(name: "Existing", path: path, classID: source[0].classID)], masterEffectsBypassed: true)
+    let rack = EffectsWindow(editor: editor, trackID: track.id); rack.pasteboard = board; rack.run()
+    let master = EffectsWindow(editor: editor, trackID: Project.masterID); master.pasteboard = board; master.run()
+    defer { rack.done(); master.done(); editor.closePluginWindows(capture: false) }
+    func command(_ window: NSWindow, code: UInt16, character: String) -> Bool {
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                                    characters: character, charactersIgnoringModifiers: character, isARepeat: false, keyCode: code)!
+        return window.performKeyEquivalent(with: event)
+    }
+    rack.window.makeFirstResponder(rack.table)
+    try liveCheck(command(rack.window, code: 0, character: "a") && rack.table.selectedRowIndexes == IndexSet(integersIn: 0..<3),
+                  "Command-A selects every effect in the focused FX window")
+    func click(_ row: Int, shift: Bool) {
+        rack.table.layoutSubtreeIfNeeded()
+        let rect = rack.table.rect(ofRow: row)
+        let point = rack.table.convert(NSPoint(x: 15, y: rect.midY), to: nil)
+        let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: shift ? .shift : [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                     windowNumber: rack.window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let up = NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: shift ? .shift : [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                   windowNumber: rack.window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!
+        NSApp.postEvent(up, atStart: true); rack.window.sendEvent(down)
+        while let event = NSApp.nextEvent(matching: .leftMouseUp, until: .distantPast, inMode: .default, dequeue: true) { rack.window.sendEvent(event) }
+    }
+    click(0, shift: false); click(2, shift: true)
+    try liveCheck(rack.table.selectedRowIndexes == IndexSet(integersIn: 0..<3), "Shift-click selects a contiguous range of native FX rows")
+    rack.table.deselectRow(1)
+    let undoCount = editor.undoStack.count
+    try liveCheck(command(rack.window, code: 8, character: "c") && editor.undoStack.count == undoCount && !editor.dirty,
+                  "Command-C copies selected effects without editing the project")
+    let copyPoint = rack.table.convert(NSPoint(x: 10, y: rack.table.rect(ofRow: 0).midY), to: nil)
+    let rightClick = NSEvent.mouseEvent(with: .rightMouseDown, location: copyPoint, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                       windowNumber: rack.window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+    let copyMenu = rack.contextMenu(for: rightClick), copyItem = copyMenu.item(withTitle: "Copy")!
+    try liveCheck(rack.table.selectedRowIndexes == IndexSet([0, 2]) && copyItem.isEnabled && NSApp.sendAction(copyItem.action!, to: copyItem.target, from: copyItem),
+                  "Context-menu Copy preserves the multi-selection when right-clicking a selected row")
+    let payload = try JSONDecoder().decode([PluginEffect].self, from: board.data(forType: EffectsWindow.clipboardType)!)
+    try liveCheck(payload.map(\.name) == ["Effect 0", "Effect 2"] && payload[1].bypassed,
+                  "Clipboard preserves selected chain order and individual bypass flags")
+    try liveCheck(command(rack.window, code: 9, character: "v") && rack.effects.count == 5 && rack.table.selectedRowIndexes == IndexSet(integersIn: 3..<5),
+                  "Command-V appends copies and selects them at the end of the same chain")
+    try liveCheck(editor.undoStack.count == undoCount + 1 && Set(rack.effects.map(\.id)).count == 5,
+                  "A multi-effect paste creates fresh identities and one Undo action")
+    for (offset, expected) in [values[0], values[2]].enumerated() {
+        let effect = rack.effects[3 + offset]
+        let copied = try editor.pluginHost(effect)
+        try liveCheck(abs(copied.parameterValue(parameter) - expected) < 0.001 && copied !== editor.pluginHosts[source[offset == 0 ? 0 : 2].id],
+                      "Pasted effect has the current live settings and an independent processor")
+    }
+    editor.undo()
+    try liveCheck(rack.effects.count == 3 && abs(try editor.pluginHost(rack.effects[0]).parameterValue(parameter) - values[0]) < 0.001,
+                  "Undo removes the entire batch and preserves original live settings")
+    editor.redo(); try liveCheck(rack.effects.count == 5, "Redo restores the complete FX batch")
+    rack.done()
+    let location = master.table.convert(NSPoint(x: 10, y: master.table.bounds.maxY - 1), to: nil)
+    let event = NSEvent.mouseEvent(with: .rightMouseDown, location: location, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                  windowNumber: master.window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+    let menu = master.contextMenu(for: event), paste = menu.item(withTitle: "Paste")!
+    try liveCheck(paste.isEnabled && NSApp.sendAction(paste.action!, to: paste.target, from: paste) && master.effects.count == 3,
+                  "Context-menu Paste appends to another FX window after the source window closes")
+    try liveCheck(editor.project.masterEffectsBypassed && master.effects.suffix(2).map(\.name) == ["Effect 0", "Effect 2"],
+                  "Cross-window paste preserves destination bulk bypass and copied order")
+    let count = master.effects.count, history = editor.undoStack.count
+    var broken = payload; broken[1].path = root.appendingPathComponent("Missing.vst3").path
+    board.clearContents(); board.setData(try JSONEncoder().encode(broken), forType: EffectsWindow.clipboardType)
+    try liveCheck(!master.pasteSelection() && master.effects.count == count && editor.undoStack.count == history,
+                  "A missing plug-in fails atomically without inserting a partial batch")
+    board.clearContents(); board.setString("Unrelated text", forType: .string)
+    try liveCheck(!master.canPasteEffects && !master.pasteSelection(), "FX Paste ignores unrelated clipboard formats")
 }

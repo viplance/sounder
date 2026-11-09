@@ -171,7 +171,7 @@ final class ProjectNameView: NSView {
         field.textChanged = { [weak self] in self?.updateSize() }
     }
     required init?(coder: NSCoder) { fatalError() }
-    private var showsDirtyMark: Bool { field.isRenaming && label.stringValue.hasSuffix("  •") }
+    var isDocumentEdited = false { didSet { needsLayout = true } }
     private var editingWidth: CGFloat {
         let measurement = NSTextField(labelWithString: field.stringValue)
         measurement.font = field.font
@@ -180,7 +180,9 @@ final class ProjectNameView: NSView {
     override var intrinsicContentSize: NSSize {
         let display = NSTextField(labelWithString: label.stringValue)
         display.font = label.font
-        let width = field.isRenaming ? editingWidth + (showsDirtyMark ? dirtyMark.intrinsicContentSize.width : 0) : display.intrinsicContentSize.width + 4
+        // Keep the indicator's slot even after Save hides its dot, so the
+        // neighboring file buttons retain the same titlebar positions.
+        let width = (field.isRenaming ? editingWidth : display.intrinsicContentSize.width + 4) + dirtyMark.intrinsicContentSize.width
         return NSSize(width: min(maximumWidth, max(4, width)), height: display.intrinsicContentSize.height)
     }
     func updateSize() { nameWidth.constant = intrinsicContentSize.width; invalidateIntrinsicContentSize(); needsLayout = true }
@@ -190,10 +192,10 @@ final class ProjectNameView: NSView {
     }
     override func layout() {
         super.layout()
-        label.frame = bounds
-        let suffix = showsDirtyMark ? dirtyMark.intrinsicContentSize.width : 0
-        field.frame = NSRect(x: 0, y: 0, width: max(4, bounds.width - suffix), height: bounds.height)
-        dirtyMark.isHidden = !showsDirtyMark
+        let suffix = dirtyMark.intrinsicContentSize.width
+        label.frame = NSRect(x: 0, y: 0, width: max(4, bounds.width - suffix), height: bounds.height)
+        field.frame = label.frame
+        dirtyMark.isHidden = !isDocumentEdited
         dirtyMark.frame = NSRect(x: field.frame.maxX, y: 0, width: suffix, height: bounds.height)
     }
 }
@@ -977,6 +979,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         return alert.runModal()
     }
     func verifySettingsUI() throws {
+        let originalDirty = editor.dirty
+        editor.dirty = true; refresh()
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+        let dirtyWidth = projectNameView.frame.width
+        let positions = projectFileButtons.mapValues { $0.convert(NSPoint.zero, to: nil) }
+        editor.dirty = false; refresh()
+        window.contentView?.superview?.layoutSubtreeIfNeeded()
+        guard abs(projectNameView.frame.width - dirtyWidth) < 0.5,
+              projectFileButtons.allSatisfy({ id, button in positions[id] == button.convert(NSPoint.zero, to: nil) }) else {
+            throw SounderError.message("Saving shifts the project file buttons when the dirty dot disappears")
+        }
+        editor.dirty = originalDirty; refresh()
+        print("PASS: Open/Save/Show in Finder stay fixed when the unsaved-project dot disappears")
         window.contentView?.superview?.layoutSubtreeIfNeeded()
         let initialWidth = projectNameView.frame.width
         let qualityPosition = qualityButton.convert(NSPoint.zero, to: nil)
@@ -1127,7 +1142,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                                       active: editor.isMeteringAudio, recording: false, enabled: editor.canAdjustTrackMix, showsPeaks: true)
         masterFXButton.configure(editor: editor, track: editor.project.masterTrack, color: accent)
         titlebarItems[NSToolbarItem.Identifier("export")]?.isEnabled = editor.canExport
-        projectLabel.stringValue = editor.projectName + (editor.dirty ? "  •" : "")
+        projectLabel.stringValue = editor.projectName
+        projectNameView.isDocumentEdited = editor.dirty
         updateProjectNameWidth()
         projectNameView.updateSize()
         projectLabel.isEnabled = !editor.busy; qualityButton.isEnabled = !editor.busy
@@ -1258,6 +1274,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         if [#selector(selectAll(_:)), #selector(copy(_:)), #selector(paste(_:))].contains(menuItem.action) {
             if (NSApp.keyWindow ?? window)?.firstResponder is NSTextView { return true }
+            if let rack = activeEffectsRack {
+                if menuItem.action == #selector(selectAll(_:)) { return !rack.effects.isEmpty }
+                if menuItem.action == #selector(copy(_:)) { return rack.canCopyEffects }
+                return rack.canPasteEffects
+            }
             guard NSApp.modalWindow == nil, NSApp.keyWindow == nil || NSApp.keyWindow === window else { return false }
             if menuItem.action == #selector(selectAll(_:)) { return timeline.canSelectRange }
             if menuItem.action == #selector(copy(_:)) { return !editor.selection.isEmpty }
@@ -1284,17 +1305,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         return true
     }
+    private var activeEffectsRack: EffectsWindow? {
+        guard NSApp.modalWindow == nil, let key = NSApp.keyWindow else { return nil }
+        return editor.effectsWindows.values.first {
+            $0.window === key || ($0.plugins.popover.isShown && $0.plugins.search.window === key)
+        }
+    }
     @objc func selectAll(_ sender: Any?) {
         if let input = (NSApp.keyWindow ?? window)?.firstResponder as? NSTextView { input.selectAll(sender) }
+        else if let rack = activeEffectsRack { rack.table.selectAll(sender) }
         else if timeline.canSelectRange { editor.selectAllFragments() }
     }
     @objc func copy(_ sender: Any?) {
         if let input = (NSApp.keyWindow ?? window)?.firstResponder as? NSTextView { input.copy(sender) }
+        else if let rack = activeEffectsRack { rack.copyEffects(sender) }
         else { editor.copyFragments() }
     }
     @objc func paste(_ sender: Any?) {
+        if let rack = activeEffectsRack, rack.canPasteEffects { rack.pasteEffects(sender); return }
         if let input = (NSApp.keyWindow ?? window)?.firstResponder as? NSTextView { input.paste(sender) }
-        else { editor.pasteFragments() }
+        else if activeEffectsRack == nil { editor.pasteFragments() }
     }
     @objc func seekToStart() { timeline.seekBoundary(end: false) }
     @objc func seekToEnd() { timeline.seekBoundary(end: true) }
@@ -1345,6 +1375,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
 if CommandLine.arguments.contains("--microphone-test") {
     do { try runMicrophoneSmokeTest(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if let index = CommandLine.arguments.firstIndex(of: "--fx-clipboard-test"), index + 1 < CommandLine.arguments.count {
+    do { setbuf(stdout, nil); try runEffectsClipboardTest(path: CommandLine.arguments[index + 1]); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if let index = CommandLine.arguments.firstIndex(of: "--plugin-persistence-test"), index + 1 < CommandLine.arguments.count {
     do { setbuf(stdout, nil); try runPluginPersistenceTest(path: CommandLine.arguments[index + 1]); exit(0) }

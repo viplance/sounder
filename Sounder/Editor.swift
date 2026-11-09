@@ -1010,7 +1010,7 @@ final class Editor: NSObject {
     // Files/presets/impulse responses can change without any normalized
     // parameter or edit notification. Save the complete authoritative hosts,
     // including processors whose editors have already been closed.
-    private func capturePluginStates() throws {
+    func capturePluginStates() throws {
         var states: [(UUID, Data)] = []
         for effect in project.allEffects {
             if let host = pluginHosts[effect.id] { states.append((effect.id, try host.saveState())) }

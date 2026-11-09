@@ -310,13 +310,30 @@ final class EffectRowView: NSTableCellView {
     }
 }
 
+/// Keep rack commands in this window; text fields retain native editing keys.
+final class EffectsRackWindow: NSWindow {
+    var command: ((UInt16) -> Bool)?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        if modifiers == .command, !(firstResponder is NSTextView), command?(event.keyCode) == true { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+final class EffectsTableView: NSTableView {
+    var contextualMenu: ((NSEvent) -> NSMenu?)?
+    override func menu(for event: NSEvent) -> NSMenu? { contextualMenu?(event) }
+}
+
 final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     unowned let editor: Editor
     let trackID: UUID
     var window: NSWindow!
-    let table = NSTableView()
+    let table = EffectsTableView()
     let plugins = PluginPicker(frame: .zero)
     let allEffects = PointerButton(title: "Activate all", target: nil, action: nil)
+    static let clipboardType = NSPasteboard.PasteboardType("enotix.Sounder.effects.json")
+    var pasteboard = NSPasteboard.general
     private static let dragType = NSPasteboard.PasteboardType("enotix.Sounder.effect")
     var installed: [URL] = []
     var snapshotMode = false
@@ -334,7 +351,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         }
         snapshotMode = snapshot != nil
         editor.effectsWindows[trackID] = self
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 507, height: 399), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = EffectsRackWindow(contentRect: NSRect(x: 0, y: 0, width: 507, height: 399), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "FX · " + (trackID == Project.masterID ? "Master" : editor.project.tracks[index!].name); window.delegate = self; window.isReleasedWhenClosed = false
         let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
         window.level = .floating; window.hidesOnDeactivate = false
@@ -357,6 +374,18 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("effect")); column.width = 455
         table.addTableColumn(column); table.headerView = nil; table.rowHeight = 40
         table.style = .plain; table.intercellSpacing = .zero
+        table.allowsMultipleSelection = true
+        table.contextualMenu = { [weak self] event in self?.contextMenu(for: event) }
+        (window as? EffectsRackWindow)?.command = { [weak self] key in
+            guard let self else { return false }
+            switch key {
+            case 0: self.table.selectAll(nil)
+            case 8: self.copyEffects(nil)
+            case 9: self.pasteEffects(nil)
+            default: return false
+            }
+            return true
+        }
         table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         table.dataSource = self; table.delegate = self; table.target = self; table.doubleAction = #selector(configure)
         table.registerForDraggedTypes([Self.dragType]); table.setDraggingSourceOperationMask(.move, forLocal: true)
@@ -423,11 +452,68 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         }
         bypass.toolTip = effect.bypassed ? "Enable" : "Disable"
         bypass.setAccessibilityLabel((bypass.toolTip ?? "") + " " + effect.name)
-        return EffectRowView(name: name, controls: [(open, 26), (up, 26), (down, 26), (bypass, 26), (remove, 26)])
+        return EffectRowView(name: name, controls: [(open, 26), (up, 26), (down, 26), (remove, 26), (bypass, 26)])
+    }
+    var selectedEffects: [PluginEffect] { table.selectedRowIndexes.compactMap { effects.indices.contains($0) ? effects[$0] : nil } }
+    var canCopyEffects: Bool { exists && editor.canEditEffects && !selectedEffects.isEmpty }
+    private func clipboardEffects() -> [PluginEffect]? {
+        guard let data = pasteboard.data(forType: Self.clipboardType),
+              let items = try? JSONDecoder().decode([PluginEffect].self, from: data), !items.isEmpty,
+              items.allSatisfy({ ["vst", "vst3"].contains(URL(fileURLWithPath: $0.path).pathExtension.lowercased()) }) else { return nil }
+        return items
+    }
+    var canPasteEffects: Bool { exists && editor.canEditEffects && clipboardEffects() != nil }
+    func contextMenu(for event: NSEvent) -> NSMenu {
+        let row = table.row(at: table.convert(event.locationInWindow, from: nil))
+        if row >= 0 && !table.selectedRowIndexes.contains(row) {
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        window.makeFirstResponder(table)
+        let menu = NSMenu(); menu.autoenablesItems = false
+        let copy = NSMenuItem(title: "Copy", action: #selector(copyEffects(_:)), keyEquivalent: "c")
+        copy.target = self; copy.isEnabled = canCopyEffects; menu.addItem(copy)
+        let paste = NSMenuItem(title: "Paste", action: #selector(pasteEffects(_:)), keyEquivalent: "v")
+        paste.target = self; paste.isEnabled = canPasteEffects; menu.addItem(paste)
+        return menu
+    }
+    @objc func copyEffects(_ sender: Any?) { _ = copySelection() }
+    @discardableResult func copySelection() -> Bool {
+        guard canCopyEffects else { return false }
+        do {
+            var copied = selectedEffects
+            for index in copied.indices {
+                if let host = editor.pluginHosts[copied[index].id] { copied[index].state = try host.saveState() }
+            }
+            let data = try JSONEncoder().encode(copied)
+            pasteboard.clearContents(); return pasteboard.setData(data, forType: Self.clipboardType)
+        } catch { editor.error(error); return false }
+    }
+    @objc func pasteEffects(_ sender: Any?) { _ = pasteSelection() }
+    @discardableResult func pasteSelection() -> Bool {
+        guard exists, editor.canEditEffects, let copied = clipboardEffects() else { return false }
+        plugins.popover.close()
+        do {
+            var additions: [PluginEffect] = [], hosts: [UUID: SNPluginHost] = [:]
+            for original in copied {
+                var effect = original; effect.id = UUID()
+                let host = try SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: editor.project.audioFormat.sampleRate)
+                additions.append(effect); hosts[effect.id] = host
+            }
+            let first = effects.count
+            try editor.capturePluginStates()
+            editor.checkpoint()
+            editor.pluginHosts.merge(hosts) { current, _ in current }
+            effects.append(contentsOf: additions)
+            editor.effectsChanged(); reload()
+            table.selectRowIndexes(IndexSet(integersIn: first..<(first + additions.count)), byExtendingSelection: false)
+            table.scrollRowToVisible(first)
+            window.makeFirstResponder(table)
+            return true
+        } catch { editor.error(error); return false }
     }
     @objc func scan() { installed = PluginProcessing.installed(); plugins.setPlugins(installed) }
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-        guard effects.indices.contains(row) else { return nil }
+        guard effects.indices.contains(row), table.selectedRowIndexes.count <= 1 else { return nil }
         let item = NSPasteboardItem(); item.setString(effects[row].id.uuidString, forType: Self.dragType); return item
     }
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
