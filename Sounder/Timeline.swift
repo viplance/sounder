@@ -477,7 +477,7 @@ final class TrackMixerControls: NSView {
             rec.toolTip = track.recordArmed ? "Disarm recording" : "Arm recording"
             rec.setAccessibilityLabel("\(track.name) REC")
             let meter = editor.displayedTrackMeter(track)
-            let active = editor.isPlaying || editor.isRecording
+            let active = editor.isMeteringAudio
             volumeControl.configure(track: track, meter: meter, active: active, recording: editor.recording(for: track.id) != nil,
                                     enabled: editor.canAdjustTrackMix, showsPeaks: editor.showsTrackMeter(track.id))
         }
@@ -1152,7 +1152,7 @@ final class Timeline: NSView {
     func refreshTransportMeters() {
         for (track, _) in rows {
             guard let control = mixerControls[track.id], !control.isHidden else { continue }
-            control.volumeControl.updateMeter(editor.displayedTrackMeter(track), active: editor.isPlaying || editor.isRecording,
+            control.volumeControl.updateMeter(editor.displayedTrackMeter(track), active: editor.isMeteringAudio,
                                               recording: editor.recording(for: track.id) != nil,
                                               showsPeaks: editor.showsTrackMeter(track.id))
         }

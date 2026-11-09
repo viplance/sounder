@@ -7,6 +7,12 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) NSString *classID;
 @property(nonatomic, readonly) NSInteger latency;
 @property(nonatomic, readonly) NSInteger tail;
+@property(nonatomic, readonly) BOOL acceptsMIDI;
+@property(nonatomic, readonly) BOOL isInstrument;
+- (BOOL)ensureStreaming:(NSInteger)channels error:(NSError **)error;
+- (void)setTransportPlaying:(BOOL)playing position:(int64_t)position tempo:(double)tempo;
+- (void)sendMIDIStatus:(uint8_t)status data1:(uint8_t)data1 data2:(uint8_t)data2;
+- (void)allNotesOff;
 @property(nonatomic, readonly) uint64_t editRevision;
 - (BOOL)beginStreaming:(NSInteger)channels error:(NSError **)error;
 - (nullable NSData *)processBlock:(NSData *)audio channels:(NSInteger)channels error:(NSError **)error;

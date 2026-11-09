@@ -21,6 +21,13 @@ struct Effect {
     void (*processDoubleReplacing)(Effect *, double **, double **, int32_t);
     char future[56];
 };
+struct MidiEvent {
+    int32_t type = 1, byteSize = 32, deltaFrames = 0, flags = 1;
+    int32_t noteLength = 0, noteOffset = 0;
+    uint8_t midiData[4] = {};
+    int8_t detune = 0; uint8_t noteOffVelocity = 0, reserved1 = 0, reserved2 = 0;
+};
+struct MidiEvents { int32_t numEvents = 0; intptr_t reserved = 0; MidiEvent *events[2080] = {}; };
 struct Rect { int16_t top, left, bottom, right; };
 struct TimeInfo {
     double samplePos, sampleRate, nanoSeconds, ppqPos, tempo, barStartPos, cycleStartPos, cycleEndPos;

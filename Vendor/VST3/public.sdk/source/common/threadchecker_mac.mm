@@ -32,7 +32,9 @@ class MacThreadChecker : public ThreadChecker
 public:
 	bool test (const char* failmessage = nullptr, bool exit = false) override
 	{
-		if (threadID == pthread_self ())
+		// Sounder prepares processors off-thread, then opens their Cocoa editors
+		// on AppKit. Preserve initialization handshakes and allow UI messages.
+		if (threadID == pthread_self () || [NSThread isMainThread])
 			return true;
 		if (failmessage)
 			NSLog (@"%s", failmessage);

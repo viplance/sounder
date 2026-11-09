@@ -60,6 +60,162 @@ final class Editor: NSObject {
     // App controllers opt into nonblocking preparation; synchronous operation
     // remains available for deterministic offline audio clients/tests.
     var preparesPlaybackInBackground = false { didSet { if preparesPlaybackInBackground { scheduleIdlePreparation() } else { idlePreparation?.cancel() } } }
+    var keepsPluginsRunning = false {
+        didSet {
+            if keepsPluginsRunning {
+                do {
+                    midiInput = try LiveMIDIInput(received: { [weak self] messages in
+                        DispatchQueue.main.async { self?.receiveMIDI(messages) }
+                    }, disconnected: { [weak self] source in self?.releaseMIDI(source: source) })
+                } catch { self.error(error) }
+                scheduleLiveEffects()
+            } else { midiInput = nil; releaseMIDI(); discardLiveEffects() }
+        }
+    }
+    private var midiInput: LiveMIDIInput?
+    private var midiRecipients: [UInt64: [UUID: SNPluginHost]] = [:]
+    private var effectsJob: PlaybackPreparation?
+    private var effectsJobKey: Data?
+    private(set) var liveEffectsPlayer: LivePlayback?
+    private var liveEffectsKey: Data?
+    private struct LiveEffectsConfiguration: Equatable {
+        let format: ProjectAudioFormat
+        let output: AudioEndpoint
+        let buffer: Int
+    }
+    private var liveEffectsConfiguration: LiveEffectsConfiguration?
+    private var failedEffectsKey: Data?
+    private var effectsMeterTimer: Timer?
+    var isMeteringAudio: Bool { isPlaying || isRecording || liveEffectsPlayer?.isProcessingLiveEffects == true || pausedPlayer?.isProcessingLiveEffects == true }
+    func shutdownLivePlugins() { keepsPluginsRunning = false }
+    private func cancelEffectsPreparation() { effectsJob?.cancel(); effectsJob = nil; effectsJobKey = nil }
+    private func discardLiveEffects() {
+        cancelEffectsPreparation(); effectsMeterTimer?.invalidate(); effectsMeterTimer = nil
+        let previous = liveEffectsPlayer; liveEffectsPlayer = nil; liveEffectsKey = nil; liveEffectsConfiguration = nil
+        previous?.stop()
+    }
+    private func releaseMIDI(source: UInt32? = nil) {
+        let keys = midiRecipients.keys.filter { source == nil || $0 >> 4 == UInt64(source!) }
+        for key in keys { midiRecipients.removeValue(forKey: key)?.values.forEach { $0.allNotesOff() } }
+    }
+    func receiveMIDI(_ messages: [LiveMIDIMessage]) {
+        let targets = Set(recordingTargets)
+        var recipients: [UUID: SNPluginHost] = [:]
+        for track in project.tracks where targets.contains(track.id) && !track.effectsBypassed {
+            for effect in track.effects where !effect.bypassed {
+                if let host = pluginHosts[effect.id], host.acceptsMIDI { recipients[effect.id] = host }
+            }
+        }
+        if !project.masterEffectsBypassed {
+            for effect in project.masterEffects where !effect.bypassed {
+                if let host = pluginHosts[effect.id], host.acceptsMIDI { recipients[effect.id] = host }
+            }
+        }
+        for message in messages {
+            let key = UInt64(message.source) << 4 | UInt64(message.status & 15)
+            var hosts = midiRecipients[key] ?? [:]
+            for (id, host) in recipients { hosts[id] = host }
+            let noteOn = message.status & 0xF0 == 0x90 && message.data2 > 0
+            for host in (noteOn ? recipients : hosts).values { host.sendMIDIStatus(message.status, data1: message.data1, data2: message.data2) }
+            midiRecipients[key] = hosts
+        }
+    }
+    private func startEffectsMeters() {
+        guard effectsMeterTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in
+            guard let self, !self.isPlaying, !self.isRecording,
+                  let monitor = self.liveEffectsPlayer ?? self.pausedPlayer, monitor.isProcessingLiveEffects else { return }
+            self.updateTrackMeters(monitor.consumeEffectsPeaks())
+            self.transportChanged?()
+        }
+        effectsMeterTimer = timer; RunLoop.main.add(timer, forMode: .common); RunLoop.main.add(timer, forMode: .modalPanel)
+    }
+    private func watchLiveEffects(_ playback: LivePlayback, key: Data) {
+        playback.finished = { [weak self, weak playback] error in
+            guard let self, let playback, self.liveEffectsPlayer === playback, let error else { return }
+            self.liveEffectsPlayer = nil; self.liveEffectsKey = nil; self.failedEffectsKey = key
+            playback.stop(); self.stopTrackMeters(); self.error(error)
+        }
+        startEffectsMeters()
+    }
+    private func scheduleLiveEffects() {
+        guard keepsPluginsRunning, !isPlaying, !isRecording, !isShuttling, !requestingMic,
+              !isImporting, !isOpening, !isExporting, !isNormalizing,
+              preparation == nil, preparationRequest == nil else { return }
+        if let pausedPlayer, pausedPlayer.isAuditioningEffects { startEffectsMeters(); return }
+        guard !project.activeEffects.isEmpty else { discardLiveEffects(); return }
+        guard let key = try? mixCacheKey(), failedEffectsKey != key else { return }
+        let config = LiveEffectsConfiguration(format: project.audioFormat, output: project.defaultOutput, buffer: project.playbackBufferSize)
+        if liveEffectsKey == key, let liveEffectsPlayer, liveEffectsPlayer.isProcessingLiveEffects {
+            liveEffectsPlayer.setEffectsPosition(cursor, tempo: project.tempo); return
+        }
+        guard effectsJobKey != key else { return }
+        cancelEffectsPreparation()
+        let job = PlaybackPreparation(), snapshot = project, directory = audio.directory
+        let hosts = pluginHosts, position = cursor
+        effectsJob = job; effectsJobKey = key
+        preparationQueue.async { [weak self] in
+            do {
+                try job.check()
+                let store = try AudioStore(directory: directory); store.configure(snapshot.audioFormat)
+                var processors: [UUID: SNPluginHost] = [:]
+                for effect in snapshot.activeEffects {
+                    try job.check()
+                    processors[effect.id] = try hosts[effect.id] ?? SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: snapshot.audioFormat.sampleRate)
+                }
+                let graph = try Self.makeGraph(project: snapshot, store: store, hosts: processors, cancelled: { job.isCancelled }, preservePluginState: true, includeAudioSources: false)
+                try job.check()
+                let ready = processors
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.effectsJob === job, !job.isCancelled else { return }
+                    guard (try? self.mixCacheKey()) == key, !self.isPlaying, !self.isRecording, self.preparationRequest == nil,
+                          !ready.contains(where: { id, host in self.pluginHosts[id].map { $0 !== host } ?? false }) else {
+                        self.cancelEffectsPreparation(); self.scheduleLiveEffects(); return
+                    }
+                    self.pluginHosts.merge(ready) { current, _ in current }
+                    if self.liveEffectsConfiguration == config, let existing = self.liveEffectsPlayer, existing.isProcessingLiveEffects {
+                        existing.replaceEffectsGraph(graph, at: self.cursor, hosts: Array(ready.values), tempo: snapshot.tempo)
+                        self.liveEffectsKey = key; self.effectsJob = nil; self.effectsJobKey = nil; self.startEffectsMeters()
+                        return
+                    }
+                    let previous = self.liveEffectsPlayer, factory = self.makePlayback
+                    self.preparationQueue.async { [weak self] in
+                        var playback: LivePlayback?
+                        do {
+                            try job.check(); previous?.stop(); try job.check()
+                            let monitor = try factory(graph, snapshot.audioFormat, position); playback = monitor
+                            monitor.finished = { [weak self, weak monitor] failure in
+                                guard let self, let monitor, let failure, self.effectsJob === job else { return }
+                                self.cancelEffectsPreparation(); self.failedEffectsKey = key
+                                monitor.stop(); self.error(failure)
+                            }
+                            try monitor.configureBufferSize(snapshot.playbackBufferSize); try monitor.configureOutput(snapshot.defaultOutput)
+                            try job.check(); try monitor.startEffects(at: position, hosts: Array(ready.values), tempo: snapshot.tempo); try job.check()
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, self.effectsJob === job, !job.isCancelled else { DispatchQueue.global().async { monitor.stop() }; return }
+                                self.effectsJob = nil; self.effectsJobKey = nil
+                                self.liveEffectsPlayer = monitor; self.liveEffectsKey = key; self.liveEffectsConfiguration = config
+                                self.watchLiveEffects(monitor, key: key)
+                            }
+                        } catch {
+                            playback?.stop()
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, self.effectsJob === job else { return }
+                                self.effectsJob = nil; self.effectsJobKey = nil
+                                if !job.isCancelled { self.failedEffectsKey = key; self.error(error) }
+                            }
+                        }
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.effectsJob === job else { return }
+                    self.effectsJob = nil; self.effectsJobKey = nil
+                    if !job.isCancelled { self.failedEffectsKey = key; self.error(error) }
+                }
+            }
+        }
+    }
     private let preparationQueue = DispatchQueue(label: "Sounder.playback.prepare", qos: .userInitiated)
     private var preparation: PlaybackPreparation?
     private var preparationTarget: (key: Data, start: Double)?
@@ -134,6 +290,10 @@ final class Editor: NSObject {
             idlePreparation = work
             DispatchQueue.main.async(execute: work)
             return
+        }
+        if keepsPluginsRunning {
+            scheduleLiveEffects()
+            if !project.activeEffects.isEmpty { return }
         }
         guard preparesPlaybackInBackground, !isPlaying, !isRecording, !isShuttling,
               !requestingMic, !isExporting, !isImporting, !isOpening, !isNormalizing, !isPreparingPlayback,
@@ -316,6 +476,7 @@ final class Editor: NSObject {
     func undo() { guard !busy else { return }; flushPluginEdits(); guard let previous = undoStack.popLast() else { return }; redoStack.append(project); project = previous; dirty = true; reconcile(); update("Undo") }
     func redo() { guard !busy else { return }; flushPluginEdits(); guard let next = redoStack.popLast() else { return }; undoStack.append(project); project = next; dirty = true; reconcile(); update("Redo") }
     func reconcile() {
+        discardLiveEffects(); releaseMIDI()
         invalidateMixCache()
         closePluginWindows(capture: false)
         pluginHosts = [:]
@@ -334,6 +495,7 @@ final class Editor: NSObject {
     func setAudioFormat(_ format: ProjectAudioFormat) throws {
         guard !busy, format != project.audioFormat else { return }
         try format.validate()
+        discardLiveEffects(); releaseMIDI()
         flushPluginEdits(); checkpoint(); closePluginWindows(capture: false); pluginHosts = [:]
         project.audioFormat = format; audio.configure(format)
         update("Audio format: " + format.label)
@@ -851,6 +1013,7 @@ final class Editor: NSObject {
             guard volume != project.masterVolumeDB else { return false }
             if shouldCheckpoint { checkpoint() } else { invalidateMixCache(); dirty = true }
             project.masterVolumeDB = volume; player?.setTrackMix(project.masterTrack)
+            liveEffectsPlayer?.setTrackMix(project.masterTrack)
             update(); return true
         }
         guard canAdjustTrackMix, let i = project.tracks.firstIndex(where: { $0.id == id }) else { return false }
@@ -861,6 +1024,7 @@ final class Editor: NSObject {
         if shouldCheckpoint { checkpoint() }
         else { invalidateMixCache(); dirty = true }
         project.tracks[i] = track; player?.setTrackMix(track)
+        liveEffectsPlayer?.setTrackMix(track)
         update(); return true
     }
     func toggleMute(_ trackID: UUID) {
@@ -869,6 +1033,8 @@ final class Editor: NSObject {
         checkpoint()
         project.tracks[index].muted.toggle()
         player?.setMuted(project.tracks[index].muted, trackID: trackID)
+        liveEffectsPlayer?.setMuted(project.tracks[index].muted, trackID: trackID)
+        if pausedPlayer?.isAuditioningEffects == true { pausedPlayer?.setMuted(project.tracks[index].muted, trackID: trackID) }
         update()
     }
     func toggleSolo(_ trackID: UUID) {
@@ -877,6 +1043,7 @@ final class Editor: NSObject {
         checkpoint()
         project.tracks[index].solo.toggle()
         player?.setSolo(Set(project.tracks.filter(\.solo).map(\.id)))
+        liveEffectsPlayer?.setSolo(Set(project.tracks.filter(\.solo).map(\.id)))
         update()
     }
     func effectsChanged() {
@@ -885,17 +1052,29 @@ final class Editor: NSObject {
         if isRecording || isShuttling { stop() }
         else if player != nil || pausedPlayer != nil { stopPlayback() }
         let ids = Set(project.allEffects.map(\.id))
+        let active = Set(project.activeEffects.map(\.id))
+        for key in Array(midiRecipients.keys) {
+            for (id, host) in midiRecipients[key] ?? [:] where !active.contains(id) { host.allNotesOff() }
+            midiRecipients[key] = midiRecipients[key]?.filter { active.contains($0.key) }
+        }
         pluginHosts = pluginHosts.filter { ids.contains($0.key) }
         if playing { startPlayback(rememberStart: false) } else { update() }
     }
-    // Explicit Stop destroys active and paused transports; Space retains only
-    // an unchanged prepared transport, with cursor as the source of truth.
-    private func stopPlayback(at position: Double? = nil) {
+    // Stop detaches timeline transport. Its live FX graph can keep rendering
+    // silence on the same engine, independently of the visible cursor.
+    private func stopPlayback(at position: Double? = nil, preserveEffects: Bool = false) {
         timer?.invalidate(); timer = nil
         guard let playback = player ?? pausedPlayer else { return }
         let stoppedPosition = position ?? (player != nil || pausedCursorIsCurrent ? playback.currentTime : cursor)
         player = nil; pausedPlayer = nil; pausedMixKey = nil; followsPausedCursor = false // Detach before callbacks.
-        playback.stop()
+        if preserveEffects && keepsPluginsRunning && !project.activeEffects.isEmpty {
+            cancelEffectsPreparation()
+            liveEffectsPlayer?.stop(); liveEffectsPlayer = playback
+            liveEffectsKey = try? mixCacheKey()
+            liveEffectsConfiguration = LiveEffectsConfiguration(format: project.audioFormat, output: project.defaultOutput, buffer: project.playbackBufferSize)
+            playback.auditionEffects(at: stoppedPosition, hosts: project.activeEffects.compactMap { pluginHosts[$0.id] }, tempo: project.tempo)
+            if let key = liveEffectsKey { watchLiveEffects(playback, key: key) }
+        } else { playback.stop() }
         stopTrackMeters()
         cursor = stoppedPosition
     }
@@ -911,7 +1090,7 @@ final class Editor: NSObject {
         }
         if !isShuttling, let playback = player, playback.isPlaying {
             guard loopRange.map({ target <= $0.upperBound }) == true || target < Double(playback.graph.totalFrames) / audio.sampleRate else {
-                stopPlayback(at: target); update(); return
+                stopPlayback(at: target, preserveEffects: true); update(); return
             }
             playback.seek(to: target)
             playbackScrollRequest &+= 1
@@ -967,11 +1146,12 @@ final class Editor: NSObject {
         for effect in project.activeEffects { hosts[effect.id] = try pluginHost(effect) }
         return hosts
     }
-    private static func makeGraph(project: Project, store: AudioStore, hosts: [UUID: SNPluginHost], dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, progress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }) throws -> StreamingGraph {
-        try StreamingGraph(project: project, store: store, dryGraph: dryGraph, processedCache: processedCache, preparationProgress: progress, cancelled: cancelled) { effect in
+    private static func makeGraph(project: Project, store: AudioStore, hosts: [UUID: SNPluginHost], dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, progress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, preservePluginState: Bool = false, includeAudioSources: Bool = true) throws -> StreamingGraph {
+        try StreamingGraph(project: project, store: store, dryGraph: dryGraph, processedCache: processedCache, preparationProgress: progress, cancelled: cancelled, includeAudioSources: includeAudioSources) { effect in
             guard !cancelled() else { throw CancellationError() }
             guard let host = hosts[effect.id] else { throw SounderError.message("Effect processor is unavailable") }
-            try host.beginStreaming(project.audioFormat.channels)
+            if preservePluginState { try host.ensureStreaming(project.audioFormat.channels) }
+            else { try host.beginStreaming(project.audioFormat.channels) }
             guard host.latency <= Int(store.sampleRate * 30) else { throw SounderError.message("Plug-in latency exceeds the supported 30-second maximum") }
             let channels = project.audioFormat.channels
             return StreamingEffect(latency: host.latency, tail: host.tail) { samples in
@@ -1074,7 +1254,7 @@ final class Editor: NSObject {
                 if rememberStart { lastPlaybackStart = playback.start; if !forRecording { playbackScrollRequest &+= 1 } }
                 cursor = playback.currentTime; startTimer(); update(); return
             }
-            if preparesPlaybackInBackground {
+            if preparesPlaybackInBackground || keepsPluginsRunning {
                 preparePlayback(rememberStart: rememberStart, forRecording: forRecording); return
             }
             discardPausedPlayback()
@@ -1090,7 +1270,12 @@ final class Editor: NSObject {
     }
     private func activatePlayback(_ playback: LivePlayback, key: Data, rememberStart: Bool, forRecording: Bool, alreadyStarted: Bool) throws {
             playback.finished = { [weak self, weak playback] failure in
-                guard let self, let playback, self.player === playback else { return }
+                guard let self, let playback else { return }
+                if self.pausedPlayer === playback {
+                    if let failure { self.stopPlayback(); self.error(failure); self.update() }
+                    return
+                }
+                guard self.player === playback else { return }
                 if self.isRecording {
                     guard let failure else { return } // An older natural-end callback cannot stop a new take.
                     self.stop(); self.error(failure)
@@ -1108,12 +1293,14 @@ final class Editor: NSObject {
                     return
                 }
                 let returnPosition = self.lastPlaybackStart ?? playback.start
-                self.stopPlayback(at: failure == nil ? returnPosition : playback.currentTime)
+                self.stopPlayback(at: failure == nil ? returnPosition : playback.currentTime, preserveEffects: failure == nil)
                 self.update()
                 if let failure { self.error(failure) }
             }
             player = playback
             mixCache = (key, playback.graph)
+            playback.continuesEffectsWhenPaused = keepsPluginsRunning
+            playback.configureLiveHosts(project.activeEffects.compactMap { pluginHosts[$0.id] })
             playback.setMetronome(tempo: project.tempo, enabled: project.metronomeIsAudible)
             playback.setLoop(loopRange)
             if alreadyStarted {
@@ -1154,6 +1341,13 @@ final class Editor: NSObject {
             }
             return
         }
+        cancelEffectsPreparation()
+        if let pausedPlayer, pausedPlayer.isAuditioningEffects {
+            liveEffectsPlayer = pausedPlayer; liveEffectsKey = pausedMixKey
+            self.pausedPlayer = nil; pausedMixKey = nil; followsPausedCursor = false
+        }
+        let audition = keepsPluginsRunning ? liveEffectsPlayer : nil
+        let liveState = keepsPluginsRunning
         cancelPlaybackPreparation(); discardStandbyPlayback(); discardPausedPlayback()
         let job = PlaybackPreparation(), snapshot = project
         let cached = audio.cache, directory = audio.directory, existingHosts = pluginHosts
@@ -1163,6 +1357,7 @@ final class Editor: NSObject {
         let previous = mixCache?.key == key ? mixCache?.graph : nil
         preparation = job; update()
         preparationQueue.async { [weak self] in
+            defer { if audition != nil { DispatchQueue.main.async { self?.scheduleLiveEffects() } } }
             var playback: LivePlayback?
             do {
                 try job.check()
@@ -1189,7 +1384,7 @@ final class Editor: NSObject {
                     try job.check()
                     hosts[effect.id] = try existingHosts[effect.id] ?? SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: snapshot.audioFormat.sampleRate)
                 }
-                let graph = try Self.makeGraph(project: snapshot, store: store, hosts: hosts, dryGraph: previous, processedCache: previous?.outputCache, progress: { job.advance(frames: Double($0)) }, cancelled: { job.isCancelled })
+                let graph = try Self.makeGraph(project: snapshot, store: store, hosts: hosts, dryGraph: previous, processedCache: previous?.outputCache, progress: { job.advance(frames: Double($0)) }, cancelled: { job.isCancelled }, preservePluginState: liveState)
                 try job.check()
                 guard forRecording || loop.map({ start <= $0.upperBound }) == true || start < Double(graph.totalFrames) / snapshot.audioFormat.sampleRate else {
                     DispatchQueue.main.async { [weak self] in
@@ -1206,10 +1401,12 @@ final class Editor: NSObject {
                 prepared.setMetronome(tempo: snapshot.tempo, enabled: snapshot.metronomeIsAudible)
                 prepared.setLoop(loop)
                 if forRecording { try prepared.prepareForRecording() }
-                let history = prepared.graph.needsHistory ? Double(Int((start * rate).rounded()) + prepared.graph.latency) : 0
+                let history = prepared.graph.needsHistory && !liveState ? Double(Int((start * rate).rounded()) + prepared.graph.latency) : 0
                 let ahead = Double(snapshot.playbackBufferSize)
                 job.beginRendering(frames: history + ahead)
-                try prepared.startPlayback(playImmediately: false, cancelled: { job.isCancelled }, progress: { job.advance(frames: Double($0)) })
+                try job.check(); audition?.stop(); try job.check()
+                if liveState { for host in hosts.values { host.setTransportPlaying(true, position: Int64((start * rate).rounded()), tempo: snapshot.tempo) } }
+                try prepared.startPlayback(playImmediately: false, continueEffects: liveState, cancelled: { job.isCancelled }, progress: { job.advance(frames: Double($0)) })
                 try job.check()
                 let readyHosts = hosts, readySources = store.cache
                 DispatchQueue.main.async { [weak self] in
@@ -1238,6 +1435,7 @@ final class Editor: NSObject {
                     self.preparation = nil; self.preparationTarget = nil; self.preparationRequest = nil
                     self.audio.cache.merge(readySources) { current, _ in current }
                     self.pluginHosts.merge(readyHosts) { _, prepared in prepared }
+                    if self.liveEffectsPlayer === audition { self.liveEffectsPlayer = nil; self.liveEffectsKey = nil }
                     self.mixCache = (key, prepared.graph)
                     guard let request else {
                         self.standbyPlayer = prepared; self.standbyKey = key
@@ -1266,7 +1464,7 @@ final class Editor: NSObject {
     func stop() {
         cancelPlaybackPreparation()
         endShuttle(resume: false)
-        stopPlayback()
+        stopPlayback(preserveEffects: true)
         if !recordings.isEmpty {
             let takes = recordings
             let failures = takes.map { $0.recorder.stop() }

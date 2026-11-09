@@ -198,12 +198,24 @@ final class StreamingGraph {
             children.forEach { $0.resetDelays() }
         }
         var output: [Float] = []
-        func render(position: Int, frames: Int) throws -> [Float] {
+        func render(position: Int, frames: Int, includeDry: Bool = true, sourceFadeRemaining: Int = 0, sourceFadeLength: Int = 1, sourceFadeInFrame: Int? = nil) throws -> [Float] {
             var input = [Float](repeating: 0, count: frames * channels)
             let first = position * channels
-            if soloDry && first < dry.count {
+            if includeDry && soloDry && first < dry.count {
                 let count = min(input.count, dry.count - first)
                 input.replaceSubrange(0..<count, with: dry[first..<(first + count)])
+            }
+            if sourceFadeRemaining > 0 {
+                for frame in 0..<frames {
+                    let gain = Float(max(0, sourceFadeRemaining - frame)) / Float(max(1, sourceFadeLength))
+                    for channel in 0..<channels { input[frame * channels + channel] *= gain }
+                }
+            }
+            if let first = sourceFadeInFrame {
+                for frame in 0..<frames {
+                    let gain = Float(min(1, Double(first + frame) / Double(max(1, sourceFadeLength - 1))))
+                    for channel in 0..<channels { input[frame * channels + channel] *= gain }
+                }
             }
             input = dryDelay.apply(input)
             for (index, child) in children.enumerated() {
@@ -243,7 +255,7 @@ final class StreamingGraph {
     let outputCache: ProcessedMixCache
     var needsHistory: Bool { tracks.contains { $0.effects.contains { !$0.bypassed } } }
     private(set) var position = 0
-    init(project: Project, store: AudioStore, dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, parallel: Bool = true, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
+    init(project: Project, store: AudioStore, dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, preparationProgress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, parallel: Bool = true, includeAudioSources: Bool = true, makeEffect: (PluginEffect) throws -> StreamingEffect) throws {
         let processingTracks = project.processingTracks
         tracks = processingTracks
         parents = Dictionary(uniqueKeysWithValues: processingTracks.compactMap { track in track.parent.map { (track.id, $0) } })
@@ -253,7 +265,7 @@ final class StreamingGraph {
         // Source preparation has no graph dependencies. Give each track its own
         // store so mutable decode caches never cross worker boundaries.
         let sourceTracks = project.tracks
-        for path in Set(sourceTracks.flatMap(\.clips).filter { !$0.muted }.map(\.source)) {
+        for path in includeAudioSources ? Set(sourceTracks.flatMap(\.clips).filter { !$0.muted }.map(\.source)) : [] {
             if cancelled() { throw CancellationError() }
             if dryGraph == nil { _ = try store.load(path) }
         }
@@ -263,6 +275,7 @@ final class StreamingGraph {
             var independent = track; independent.parent = nil; return independent
         }, parallel: parallel, minimumCost: 0.001)
         try sourcePlan.perform { index in
+            guard includeAudioSources else { return }
             if cancelled() { throw CancellationError() }
             let track = sourcePlan.tracks[index]
             if let previous = dryGraph?.buses[track.id], previous.channels == channelCount {
@@ -323,6 +336,31 @@ final class StreamingGraph {
         let target = position + latency
         while position < target { _ = try render(frames: min(512, target - position)) }
     }
+    var hasEffects: Bool { needsHistory }
+    /// Same ordered buses and latency compensation, but no timeline/cache work.
+    func renderEffects(frames: Int, sourceFadeRemaining: Int = 0, sourceFadeLength: Int = 1, sourceFadeInFrame: Int? = nil) throws -> [Float] {
+        precondition(frames > 0 && frames <= 512)
+        var mix = [Float](repeating: 0, count: frames * channels)
+        try renderPlan.perform { index in
+            let bus = orderedBuses[index]
+            bus.output = try bus.render(position: position, frames: frames, includeDry: sourceFadeRemaining > 0 || sourceFadeInFrame != nil,
+                                        sourceFadeRemaining: sourceFadeRemaining, sourceFadeLength: sourceFadeLength, sourceFadeInFrame: sourceFadeInFrame)
+        }
+        for (index, root) in roots.enumerated() {
+            let output = delays[index].apply(root.output)
+            for i in mix.indices { mix[i] += output[i] }
+        }
+        for (id, bus) in buses {
+            var ancestor: UUID? = id, audible = true
+            while let current = ancestor {
+                if let node = buses[current], node.muted || !node.soloBus { audible = false; break }
+                ancestor = parents[current]
+            }
+            trackPeaks[id] = audible ? bus.peak : StereoLevels()
+        }
+        position += sourceFadeInFrame == nil ? min(frames, sourceFadeRemaining) : frames
+        return mix.map { $0.isFinite ? min(1, max(-1, $0)) : 0 }
+    }
     func render(frames: Int) throws -> [Float] {
         precondition(frames > 0 && frames <= 512)
         var mix = [Float](repeating: 0, count: frames * channels)
@@ -372,6 +410,15 @@ final class LivePlayback {
     let queue = DispatchQueue(label: "Sounder.playback", qos: .userInteractive)
     private let meterBuffer = PlaybackMeterBuffer()
     private var running = false
+    private var effectsOnly = false
+    private var effectsFadeRemaining = 0
+    private var effectsFadeLength = 1
+    private var effectHosts: [SNPluginHost] = []
+    private var auditionRequested = false
+    private var auditionPosition = 0.0
+    var continuesEffectsWhenPaused = false
+    var isAuditioningEffects: Bool { transportLock.lock(); defer { transportLock.unlock() }; return auditionRequested }
+    var isProcessingLiveEffects: Bool { isAuditioningEffects && engine.isRunning && node.isPlaying }
     private var scheduled = 0
     private var streamGeneration = 0
     private var pausing = false
@@ -422,9 +469,11 @@ final class LivePlayback {
     var finished: ((Error?) -> Void)?
     private var firstFrame: Int
     private var lastKnownFrame = 0
-    var isPlaying: Bool { !isPaused && engine.isRunning && (node.isPlaying || resumeRequested) }
+    var isPlaying: Bool { !isAuditioningEffects && !isPaused && engine.isRunning && (node.isPlaying || resumeRequested) }
     var renderedFrames: Int { queue.sync { graph.position } }
     var currentTime: Double {
+        transportLock.lock(); let frozen = auditionRequested ? auditionPosition : nil; transportLock.unlock()
+        if let frozen { return frozen }
         if pauseComplete { return pausePosition }
         var renderedClock: Int?
         if let time = node.lastRenderTime, time.isSampleTimeValid || time.isHostTimeValid,
@@ -492,13 +541,13 @@ final class LivePlayback {
             }
         }
     }
-    func startPlayback(playImmediately: Bool = true, cancelled: () -> Bool = { false }, progress: (Int) -> Void = { _ in }) throws {
+    func startPlayback(playImmediately: Bool = true, continueEffects: Bool = false, cancelled: () -> Bool = { false }, progress: (Int) -> Void = { _ in }) throws {
         let pcmFormat = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
         // Warm effects from project zero and discard compensated latency when seeking.
         try queue.sync {
             resetLoopPosition(nextFrame)
             let skip = nextFrame + graph.latency
-            if !graph.needsHistory { try graph.seek(to: nextFrame) }
+            if continueEffects || !graph.needsHistory { try graph.seek(to: nextFrame) }
             while graph.position < skip {
                 if cancelled() { throw CancellationError() }
                 let count = min(512, skip - graph.position)
@@ -573,12 +622,22 @@ final class LivePlayback {
         isPaused = false; resumeRequested = true
         try queue.sync {
             let frame = Int((start * format.sampleRate).rounded())
-            if pausing { try resumeAtQueuedBoundary(at: frame) }
+            if effectsOnly {
+                effectsOnly = false
+                let stationary = ShuttleMotion(start: start, direction: 1, end: Double(Int.max / 4) / format.sampleRate, initialSpeed: 0, target: 0)
+                transportLock.lock(); auditionRequested = false
+                transportMotions = [(lastKnownFrame, stationary)]; transportLock.unlock()
+                for host in effectHosts { host.setTransportPlaying(true, position: Int64(frame), tempo: tempo) }
+                try resumeAtQueuedBoundary(at: frame)
+            } else if pausing { try resumeAtQueuedBoundary(at: frame) }
             else { try restartPausedNode(at: frame) }
         }
     }
     private func finishPause() throws {
-        node.pause(); running = false; pausing = false; pauseComplete = true
+        if continuesEffectsWhenPaused && graph.hasEffects {
+            try configureEffects(position: pausePosition, hosts: effectHosts, tempo: tempo, fadeSource: false)
+        } else { node.pause(); running = false }
+        pausing = false; pauseComplete = true
         let position = pausePosition, generation = streamGeneration
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isPaused, self.streamGeneration == generation else { return }
@@ -778,6 +837,22 @@ final class LivePlayback {
     }
     private func enqueue(format pcmFormat: AVAudioFormat, bridgeFrames: Int? = nil) throws {
         guard running else { return }
+        if effectsOnly {
+            let count = bufferBlocks[bufferBlockIndex]; bufferBlockIndex = (bufferBlockIndex + 1) % bufferBlocks.count
+            let values = try graph.renderEffects(frames: count, sourceFadeRemaining: effectsFadeRemaining, sourceFadeLength: effectsFadeLength)
+            effectsFadeRemaining = max(0, effectsFadeRemaining - count)
+            let buffer = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(count))!
+            buffer.frameLength = AVAudioFrameCount(count)
+            let scale: Float = format.bitDepth == 16 ? 32768 : 8388608
+            for frame in 0..<count { for channel in 0..<format.channels {
+                let value = values[frame * format.channels + channel]
+                buffer.floatChannelData![channel][frame] = format.bitDepth == 32 ? value : min(scale - 1, (value * scale).rounded()) / scale
+            } }
+            meterBuffer.append(frame: outputFrames + count, peaks: graph.trackPeaks)
+            outputFrames += count; scheduled += 1
+            schedule(buffer, last: false, format: pcmFormat)
+            return
+        }
         let blockFrames = bridgeFrames ?? bufferBlocks[bufferBlockIndex]
         let requestedFrames = pausing ? min(blockFrames, pauseFadeFrames - pauseFadeFrame) : blockFrames
         guard requestedFrames > 0 else { return }
@@ -832,7 +907,13 @@ final class LivePlayback {
                 appendLoopPosition(nextFrame, at: outputFrames + positions.count)
             }
             let count = min(frames - positions.count, loop.map { $0.upperBound - nextFrame } ?? frames)
-            samples.append(contentsOf: try graph.render(frames: count))
+            if pausing && continuesEffectsWhenPaused && graph.hasEffects {
+                samples.append(contentsOf: try graph.renderEffects(frames: count,
+                    sourceFadeRemaining: pauseFadeFrames - pauseFadeFrame - positions.count, sourceFadeLength: pauseFadeFrames))
+            } else if let first = resumeFadeFrame, continuesEffectsWhenPaused && graph.hasEffects {
+                samples.append(contentsOf: try graph.renderEffects(frames: count,
+                    sourceFadeLength: Int(format.sampleRate * 0.010), sourceFadeInFrame: first + positions.count))
+            } else { samples.append(contentsOf: try graph.render(frames: count)) }
             if let loop {
                 let fade = Double(max(1, min(Int(format.sampleRate * 0.010), loop.count / 2)))
                 for i in 0..<count {
@@ -858,8 +939,13 @@ final class LivePlayback {
                 let blend = Float(fadeFrame) / Float(max(1, seekFade.count / format.channels - 1))
                 value = seekFade[fadeFrame * format.channels + channel] * (1 - blend) + value * blend
             }
-            let gain = transportGain(at: frame) * loopGains[frame]
-            value = min(1, max(-1, value * gain))
+            let transport = transportGain(at: frame)
+            if (pausing || resumeFadeFrame != nil) && continuesEffectsWhenPaused && graph.hasEffects {
+                // Fade only dry timeline audio; existing voices and FX tails
+                // must not dip and then jump back up when idle DSP takes over.
+                value -= click * (1 - transport)
+                value = min(1, max(-1, value * loopGains[frame]))
+            } else { value = min(1, max(-1, value * transport * loopGains[frame])) }
             buffer.floatChannelData![channel][frame] = format.bitDepth == 32 ? value : min(scale - 1, (value * scale).rounded()) / scale
         } }
         seekFadeFrame += frames
@@ -936,6 +1022,50 @@ final class LivePlayback {
     }
     func setSolo(_ ids: Set<UUID>) { queue.async { self.graph.setSolo(ids) } }
     func setTrackMix(_ track: Track) { queue.async { self.graph.setTrackMix(track) } }
+    func configureLiveHosts(_ hosts: [SNPluginHost]) { queue.async { [self] in effectHosts = hosts } }
+    private func configureEffects(position: Double, hosts: [SNPluginHost], tempo: Double, fadeSource: Bool) throws {
+        effectsOnly = true; effectHosts = hosts
+        effectsFadeLength = max(1, Int(format.sampleRate * 0.010))
+        effectsFadeRemaining = fadeSource ? effectsFadeLength : 0
+        pausing = false; resumeRequested = false; metronomeEnabled = false; shuttleRenderer = nil
+        running = true; streamGeneration += 1; scheduled = 0; bufferFill.reset()
+        let stationary = ShuttleMotion(start: position, direction: 1, end: Double(Int.max / 4) / format.sampleRate, initialSpeed: 0, target: 0)
+        transportLock.lock(); auditionRequested = true; auditionPosition = position; seekRequest = nil
+        transportMotions.append((outputFrames, stationary)); transportLock.unlock()
+        for host in hosts { host.setTransportPlaying(false, position: Int64((position * format.sampleRate).rounded()), tempo: tempo) }
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
+        for _ in 0..<bufferBlockCount { try enqueue(format: pcm) }
+    }
+    func auditionEffects(at position: Double, hosts: [SNPluginHost], tempo: Double) {
+        transportLock.lock(); auditionRequested = true; auditionPosition = position; transportLock.unlock()
+        queue.async { [self] in
+            do { try configureEffects(position: position, hosts: hosts, tempo: tempo, fadeSource: true) }
+            catch { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(error) } }
+        }
+    }
+    /// Called only by the preparation worker, with private/new graph ownership.
+    func startEffects(at position: Double, hosts: [SNPluginHost], tempo: Double) throws {
+        try queue.sync { try configureEffects(position: position, hosts: hosts, tempo: tempo, fadeSource: false) }
+        engine.prepare(); try engine.start(); node.play()
+    }
+    func replaceEffectsGraph(_ graph: StreamingGraph, at position: Double, hosts: [SNPluginHost], tempo: Double) {
+        queue.async { [self] in
+            self.graph = graph; effectHosts = hosts
+            transportLock.lock(); auditionPosition = position; transportLock.unlock()
+            for host in hosts { host.setTransportPlaying(false, position: Int64((position * format.sampleRate).rounded()), tempo: tempo) }
+        }
+    }
+    func setEffectsPosition(_ position: Double, tempo: Double) {
+        transportLock.lock(); auditionPosition = position; transportLock.unlock()
+        queue.async { [self] in
+            for host in effectHosts { host.setTransportPlaying(false, position: Int64((position * format.sampleRate).rounded()), tempo: tempo) }
+        }
+    }
+    func consumeEffectsPeaks() -> [UUID: StereoLevels] {
+        guard let stamp = node.lastRenderTime, stamp.isSampleTimeValid || stamp.isHostTimeValid,
+              let played = node.playerTime(forNodeTime: stamp), played.isSampleTimeValid, played.sampleRate > 0 else { return [:] }
+        return meterBuffer.consume(through: Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded()))
+    }
     func stop() {
         bufferFill.reset()
         cancelReturn(); queue.sync { running = false; streamGeneration += 1; pausing = false }

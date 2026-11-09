@@ -520,14 +520,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         timeline.refreshTransportMeters()
         let master = editor.project.masterTrack
-        masterVolumeControl.updateMeter(editor.displayedTrackMeter(master), active: editor.isPlaying || editor.isRecording, recording: false,
+        masterVolumeControl.updateMeter(editor.displayedTrackMeter(master), active: editor.isMeteringAudio, recording: false,
                                         showsPeaks: true)
         // Recording peaks arrive at 25 Hz. The display link moves only the transport.
         timeline.invalidateRecordingPreview()
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         for app in NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "enotix.Sounder") where app.processIdentifier != ProcessInfo.processInfo.processIdentifier { app.terminate() }
-        do { editor = Editor(store: try AudioStore(), preferences: CommandLine.arguments.contains("--ui-test") ? nil : .standard); editor.preparesPlaybackInBackground = !CommandLine.arguments.contains("--ui-test") }
+        do { editor = Editor(store: try AudioStore(), preferences: CommandLine.arguments.contains("--ui-test") ? nil : .standard); editor.preparesPlaybackInBackground = !CommandLine.arguments.contains("--ui-test"); editor.keepsPluginsRunning = !CommandLine.arguments.contains("--ui-test") }
         catch { NSAlert(error: error).runModal(); NSApp.terminate(nil); return }
         NSApp.appearance = NSAppearance(named: .darkAqua)
         let editorWindow = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 790), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
@@ -1124,7 +1124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         projectFileButtons["reveal"]?.isEnabled = editor.projectURL != nil
         exportButton.isEnabled = editor.canExport
         masterVolumeControl.configure(track: editor.project.masterTrack, meter: editor.displayedTrackMeter(editor.project.masterTrack),
-                                      active: editor.isPlaying || editor.isRecording, recording: false, enabled: editor.canAdjustTrackMix, showsPeaks: true)
+                                      active: editor.isMeteringAudio, recording: false, enabled: editor.canAdjustTrackMix, showsPeaks: true)
         masterFXButton.configure(editor: editor, track: editor.project.masterTrack, color: accent)
         titlebarItems[NSToolbarItem.Identifier("export")]?.isEnabled = editor.canExport
         projectLabel.stringValue = editor.projectName + (editor.dirty ? "  •" : "")
@@ -1157,6 +1157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if editor.isRecording { editor.stop() }
         closingConfirmed = editor.confirmDiscard()
         if closingConfirmed {
+            editor.shutdownLivePlugins()
             if let panel = audioRoutingWindow { _ = panel.windowShouldClose(panel.window) }
             editor.stop(); editor.closePluginWindows(capture: false)
             for panel in Array(editor.effectsWindows.values) { panel.done() }
@@ -1169,7 +1170,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if editor.isExporting { editor.exporter?.cancel(); return .terminateCancel }
         if editor.isImporting { editor.importer?.cancel(); return .terminateCancel }
         if editor.isOpening { editor.projectOpener?.cancel(); return .terminateCancel }
-        if closingConfirmed { return .terminateNow }; if editor.isRecording { editor.stop() }; return editor.confirmDiscard() ? .terminateNow : .terminateCancel
+        if closingConfirmed { editor.shutdownLivePlugins(); return .terminateNow }
+        if editor.isRecording { editor.stop() }
+        if editor.confirmDiscard() { editor.shutdownLivePlugins(); return .terminateNow }
+        return .terminateCancel
     }
     func buildMenu() {
         let main = NSMenu(); NSApp.mainMenu = main
@@ -1341,6 +1345,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
 if CommandLine.arguments.contains("--microphone-test") {
     do { try runMicrophoneSmokeTest(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if let index = CommandLine.arguments.firstIndex(of: "--live-plugin-test"), index + 1 < CommandLine.arguments.count {
+    let reverbIndex = CommandLine.arguments.firstIndex(of: "--live-reverb-test")
+    let reverb = reverbIndex.flatMap { $0 + 1 < CommandLine.arguments.count ? CommandLine.arguments[$0 + 1] : nil }
+    do { setbuf(stdout, nil); try runLiveInstrumentTest(path: CommandLine.arguments[index + 1], reverb: reverb); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if let index = CommandLine.arguments.firstIndex(of: "--plugin-test"), index + 1 < CommandLine.arguments.count {
     do { try runPluginTest(path: CommandLine.arguments[index + 1], editorTest: CommandLine.arguments.contains("--editor-test")); exit(0) }

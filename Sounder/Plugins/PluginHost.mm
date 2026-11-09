@@ -9,12 +9,14 @@
 #include "public.sdk/source/common/memorystream.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/base/funknownimpl.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <set>
 #include <memory>
 #include <vector>
 #include <mutex>
@@ -54,6 +56,13 @@ public:
 class HostContext : public HostApplication {
     tresult PLUGIN_API getName(String128 name) override { const char16_t *text = u"Sounder"; std::copy(text, text + 8, name); return kResultOk; }
 };
+// Pass each host's context explicitly; concurrent preparation must not race
+// through the SDK test helper's process-global PluginContextFactory.
+class ContextPlugProvider : public PlugProvider {
+public:
+    using PlugProvider::PlugProvider;
+    bool initializeWithContext(FUnknown *host) { return setupPlugin(host); }
+};
 struct Engine {
     double rate;
     std::recursive_mutex mutex;
@@ -61,7 +70,7 @@ struct Engine {
     int64 streamingPosition = 0;
     VST3::Hosting::Module::Ptr module;
     IPtr<HostContext> context = owned(new HostContext());
-    IPtr<PlugProvider> provider;
+    IPtr<ContextPlugProvider> provider;
     IPtr<IComponent> component;
     IPtr<IEditController> controller;
     IPtr<IAudioProcessor> processor;
@@ -70,7 +79,24 @@ struct Engine {
     IPtr<IPlugView> view;
     HostProcessData buffers;
     ParameterChanges changes;
-    EventList events;
+    EventList events {4096};
+    bool heldNotes[16][128] {};
+    struct Midi { uint8_t status, data1, data2; };
+    std::mutex midiMutex;
+    std::vector<Midi> pendingMIDI;
+    bool midiPanic = false, midiInput = false, instrument = false, transportPlaying = true;
+    int64 continuousPosition = 0;
+    void enqueueMIDI(uint8_t status, uint8_t data1, uint8_t data2) {
+        std::lock_guard<std::mutex> lock(midiMutex);
+        if (pendingMIDI.size() >= 2048) { pendingMIDI.clear(); midiPanic = true; }
+        pendingMIDI.push_back({status, uint8_t(data1 & 127), uint8_t(data2 & 127)});
+    }
+    std::vector<Midi> drainMIDI() {
+        std::lock_guard<std::mutex> lock(midiMutex);
+        std::vector<Midi> result; result.swap(pendingMIDI);
+        if (midiPanic) { for (int ch = 0; ch < 16; ++ch) result.insert(result.begin(), {uint8_t(0xB0 | ch), 123, 0}); midiPanic = false; }
+        return result;
+    }
     ProcessContext clock {};
     CFBundleRef legacyBundle = nullptr;
     LegacyVST::Effect *legacy = nullptr;
@@ -110,7 +136,7 @@ struct Engine {
             case 32: if (ptr) std::strcpy((char *)ptr, "Sounder"); return 1;
             case 33: if (ptr) std::strcpy((char *)ptr, "Sounder"); return 1;
             case 34: return 1000;
-            case 37: if (ptr) { std::string capability((char *)ptr); return capability == "sizeWindow" || capability == "sendVstTimeInfo" || capability == "startStopProcess"; } return 0;
+            case 37: if (ptr) { std::string capability((char *)ptr); return capability == "sizeWindow" || capability == "sendVstTimeInfo" || capability == "startStopProcess" || capability == "sendVstEvents" || capability == "sendVstMidiEvent"; } return 0;
             case 15: if (self && self->legacyParent && index > 0 && value > 0) { [self->legacyParent setFrameSize:NSMakeSize(index, value)]; [self->legacyParent.window setContentSize:NSMakeSize(index, value)]; return 1; } return 0;
             case 38: return 1; // English
             default: return 0;
@@ -135,7 +161,9 @@ struct Engine {
         if (!effect || effect->magic != 0x56737450 || !effect->dispatch) { fail(error, @"Invalid VST effect."); return false; }
         legacy = effect; legacy->user = this;
         legacy->dispatch(legacy, 0, 0, 0, nullptr, 0);
-        if (legacy->numInputs < 1 || legacy->numInputs > 64 || legacy->numOutputs < 1 || legacy->numOutputs > 64 || !legacy->processReplacing || (legacy->flags & (1 << 8))) { fail(error, @"Only audio-effect VST plug-ins with float processing are supported (no instruments)."); return false; }
+        if (legacy->numInputs < 0 || legacy->numInputs > 64 || legacy->numOutputs < 1 || legacy->numOutputs > 64 || !legacy->processReplacing) { fail(error, @"The VST plug-in needs float processing and an audio output."); return false; }
+        instrument = (legacy->flags & (1 << 8)) != 0;
+        midiInput = instrument || legacy->dispatch(legacy, 51, 0, 0, (void *)"receiveVstMidiEvent", 0) > 0;
         legacy->dispatch(legacy, 10, 0, 0, nullptr, rate);
         legacy->dispatch(legacy, 11, 0, blockSize, nullptr, 0);
         // Cocoa editor support, as specified by VST 2.4's Cockos extension.
@@ -147,26 +175,42 @@ struct Engine {
     bool loadVST3(NSString *path, NSString *identifier, NSError **error) {
         std::string message;
         static auto *modules = new std::map<std::string, VST3::Hosting::Module::Ptr>();
-        auto found = modules->find(path.UTF8String);
-        if (found != modules->end()) module = found->second;
-        else {
-            module = VST3::Hosting::Module::create(path.UTF8String, message);
-            if (module) (*modules)[path.UTF8String] = module;
+        static std::mutex modulesMutex;
+        {
+            std::lock_guard<std::mutex> lock(modulesMutex);
+            auto found = modules->find(path.UTF8String);
+            if (found != modules->end()) module = found->second;
+        }
+        if (!module) {
+            // Module entry can initialize process-wide Cocoa/JUCE event handling.
+            // Only first load belongs on the UI thread; DSP setup/rendering and
+            // subsequent instances stay on their preparation/audio workers.
+            auto load = [&] {
+                std::lock_guard<std::mutex> lock(modulesMutex);
+                auto found = modules->find(path.UTF8String);
+                if (found != modules->end()) module = found->second;
+                else {
+                    module = VST3::Hosting::Module::create(path.UTF8String, message);
+                    if (module) (*modules)[path.UTF8String] = module;
+                }
+            };
+            if ([NSThread isMainThread]) load();
+            else dispatch_sync(dispatch_get_main_queue(), ^{ load(); });
         }
         if (!module) { fail(error, [NSString stringWithFormat:@"Cannot load VST3: %s", message.c_str()]); return false; }
         auto factory = module->getFactory(); factory.setHostContext(context);
-        PluginContextFactory::instance().setPluginContext(context);
         for (const auto& info : factory.classInfos()) {
             if (info.category() != kVstAudioEffectClass) continue;
             if (identifier.length && info.ID().toString() != identifier.UTF8String) continue;
-            if (info.subCategoriesString().find("Instrument") != std::string::npos) continue;
-            provider = owned(new PlugProvider(factory, info, true));
-            if (!provider->initialize()) { fail(error, @"VST3 initialization failed."); return false; }
+            instrument = info.subCategoriesString().find("Instrument") != std::string::npos;
+            provider = owned(new ContextPlugProvider(factory, info, true));
+            if (!provider->initializeWithContext(context)) { fail(error, @"VST3 initialization failed."); return false; }
             component = provider->getComponentPtr(); controller = provider->getControllerPtr();
+            midiInput = component->getBusCount(kEvent, kInput) > 0;
             processor = FUnknownPtr<IAudioProcessor>(component);
             name = info.name(); classID = info.ID().toString(); break;
         }
-        if (!component || !processor) { fail(error, @"No compatible VST3 audio effect found in this bundle."); return false; }
+        if (!component || !processor) { fail(error, @"No compatible VST3 processor found in this bundle."); return false; }
         if (processor->canProcessSampleSize(kSample32) != kResultOk) { fail(error, @"This effect does not support 32-bit float audio."); return false; }
         if (controller) {
             controller->setComponentHandler(handler);
@@ -207,30 +251,31 @@ struct Engine {
             legacy->dispatch(legacy, 12, 0, 1, nullptr, 0); legacy->dispatch(legacy, 71, 0, 0, nullptr, 0); return true;
         }
         const int ins = component->getBusCount(kAudio, kInput), outs = component->getBusCount(kAudio, kOutput);
-        if (ins < 1 || outs < 1 || ins > 64 || outs > 64) { fail(error, @"The plug-in has no usable audio input/output."); return false; }
+        if (ins < 0 || outs < 1 || ins > 64 || outs > 64) { fail(error, @"The plug-in has no usable audio input/output."); return false; }
         // Negotiate the project layout. If unsupported, adapt through the effect's
         // original layout (e.g. a mono-only effect on a stereo project).
         std::vector<SpeakerArrangement> originalInputs(ins), originalOutputs(outs);
         for (int i = 0; i < ins; ++i) processor->getBusArrangement(kInput, i, originalInputs[i]);
         for (int i = 0; i < outs; ++i) processor->getBusArrangement(kOutput, i, originalOutputs[i]);
         auto inputs = originalInputs, outputs = originalOutputs;
-        inputs[0] = outputs[0] = channels == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
+        outputs[0] = channels == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
+        if (ins > 0) inputs[0] = outputs[0];
         if (processor->setBusArrangements(inputs.data(), ins, outputs.data(), outs) != kResultOk)
             processor->setBusArrangements(originalInputs.data(), ins, originalOutputs.data(), outs);
         // Auxiliary buses receive silence.
         for (auto direction : {kInput, kOutput}) {
             for (int bus = 0; bus < component->getBusCount(kAudio, direction); ++bus) component->activateBus(kAudio, direction, bus, bus == 0);
-            for (int bus = 0; bus < component->getBusCount(kEvent, direction); ++bus) component->activateBus(kEvent, direction, bus, false);
+            for (int bus = 0; bus < component->getBusCount(kEvent, direction); ++bus) component->activateBus(kEvent, direction, bus, direction == kInput && bus == 0);
         }
         ProcessSetup setup {kRealtime, kSample32, blockSize, rate};
         if (processor->setupProcessing(setup) != kResultOk) { fail(error, @"VST3 rejected the audio processing configuration."); return false; }
-        if (!buffers.prepare(*component, blockSize, kSample32) || buffers.inputs[0].numChannels < 1 || buffers.outputs[0].numChannels < 1) { fail(error, @"VST3 audio buffers could not be configured."); return false; }
+        if (!buffers.prepare(*component, blockSize, kSample32) || (ins > 0 && buffers.inputs[0].numChannels < 1) || buffers.outputs[0].numChannels < 1) { fail(error, @"VST3 audio buffers could not be configured."); return false; }
         if (component->setActive(true) != kResultOk) { fail(error, @"VST3 could not be activated."); return false; }
         active = true;
         // setProcessing is optional for some older effects.
         processor->setProcessing(true); processing = true;
         clock.sampleRate = rate; clock.tempo = 120; clock.timeSigNumerator = 4; clock.timeSigDenominator = 4;
-        clock.state = ProcessContext::kPlaying | ProcessContext::kTempoValid | ProcessContext::kTimeSigValid | ProcessContext::kProjectTimeMusicValid;
+        clock.state = ProcessContext::kPlaying | ProcessContext::kContTimeValid | ProcessContext::kTempoValid | ProcessContext::kTimeSigValid | ProcessContext::kProjectTimeMusicValid;
         return true;
     }
     bool block(const std::vector<std::vector<float>>& input, std::vector<std::vector<float>>& output, int count, int64 position, NSError **error) {
@@ -247,8 +292,19 @@ struct Engine {
                 else { output[0][i] = sample(0); output[1][i] = sample(channels > 1 ? 1 : 0); }
             }
         };
+        auto midi = drainMIDI();
         if (legacy) {
-            legacyClock.samplePos = position; legacyClock.ppqPos = double(position) / rate * 2; legacyClock.flags |= 2;
+            legacyClock.samplePos = position; legacyClock.ppqPos = double(position) / rate * legacyClock.tempo / 60;
+            legacyClock.flags = (legacyClock.flags & ~2) | (transportPlaying ? 2 : 0);
+            if (!midi.empty()) {
+                LegacyVST::MidiEvents list; std::vector<LegacyVST::MidiEvent> messages(midi.size());
+                list.numEvents = int32_t(std::min(size_t(2080), midi.size()));
+                for (int i = 0; i < list.numEvents; ++i) {
+                    messages[i].midiData[0] = midi[i].status; messages[i].midiData[1] = midi[i].data1; messages[i].midiData[2] = midi[i].data2;
+                    list.events[i] = &messages[i];
+                }
+                legacy->dispatch(legacy, 25, 0, 0, &list, 0);
+            }
             for (int ch = 0; ch < legacy->numInputs; ++ch) feed(legacyInputs[ch].data(), ch, legacy->numInputs);
             for (auto& channel : legacyOutputs) std::fill(channel.begin(), channel.end(), 0);
             legacy->processReplacing(legacy, inputPointers.data(), outputPointers.data(), count);
@@ -265,7 +321,39 @@ struct Engine {
         for (int bus = 0; bus < buffers.numOutputs; ++bus) { auto& b = buffers.outputs[bus]; b.silenceFlags = 0; for (int ch = 0; ch < b.numChannels; ++ch) std::fill(b.channelBuffers32[ch], b.channelBuffers32[ch] + count, 0); }
         changes.clearQueue();
         for (const auto& pair : handler->drain()) { int32 index = 0; auto *queue = changes.addParameterData(pair.first, index); queue->addPoint(0, pair.second, index); }
-        clock.projectTimeSamples = position; clock.continousTimeSamples = position; clock.projectTimeMusic = double(position) / rate * 2;
+        events.clear();
+        FUnknownPtr<IMidiMapping> mapping(controller);
+        for (const auto& message : midi) {
+            const int channel = message.status & 15, type = message.status & 0xF0;
+            Event event {}; event.busIndex = 0; event.sampleOffset = 0; event.flags = Event::kIsLive;
+            if (type == 0x90 && message.data2 > 0) {
+                event.type = Event::kNoteOnEvent; event.noteOn.channel = channel; event.noteOn.pitch = message.data1;
+                event.noteOn.velocity = message.data2 / 127.f; event.noteOn.noteId = -1; events.addEvent(event); heldNotes[channel][message.data1] = true;
+            } else if (type == 0x80 || type == 0x90) {
+                event.type = Event::kNoteOffEvent; event.noteOff.channel = channel; event.noteOff.pitch = message.data1;
+                event.noteOff.velocity = message.data2 / 127.f; event.noteOff.noteId = -1; events.addEvent(event); heldNotes[channel][message.data1] = false;
+            } else if (type == 0xA0) {
+                event.type = Event::kPolyPressureEvent; event.polyPressure.channel = channel; event.polyPressure.pitch = message.data1;
+                event.polyPressure.pressure = message.data2 / 127.f; event.polyPressure.noteId = -1; events.addEvent(event);
+            } else if (type == 0xB0 && (message.data1 == 123 || message.data1 == 120)) {
+                for (int pitch = 0; pitch < 128; ++pitch) if (heldNotes[channel][pitch]) {
+                    event.type = Event::kNoteOffEvent; event.noteOff.channel = channel; event.noteOff.pitch = pitch;
+                    event.noteOff.velocity = 0; event.noteOff.noteId = -1; events.addEvent(event); heldNotes[channel][pitch] = false;
+                }
+            }
+            if (mapping) {
+                int controller = type == 0xB0 ? message.data1 : type == 0xE0 ? kPitchBend : type == 0xD0 ? kAfterTouch : -1;
+                ParamID id;
+                if (controller >= 0 && mapping->getMidiControllerAssignment(0, channel, controller, id) == kResultOk) {
+                    const double value = type == 0xE0 ? (message.data1 + 128 * message.data2) / 16383.0 : (type == 0xD0 ? message.data1 : message.data2) / 127.0;
+                    int32 index = 0; auto *queue = changes.addParameterData(id, index); queue->addPoint(0, value, index);
+                }
+            }
+        }
+        clock.state = (clock.state & ~ProcessContext::kPlaying) | (transportPlaying ? ProcessContext::kPlaying : 0);
+        clock.projectTimeSamples = position; clock.continousTimeSamples = continuousPosition;
+        clock.projectTimeMusic = double(position) / rate * clock.tempo / 60;
+        continuousPosition += count;
         buffers.numSamples = count; buffers.processMode = kRealtime; buffers.processContext = &clock;
         buffers.inputParameterChanges = &changes; buffers.inputEvents = &events;
         auto result = processor->process(buffers);
@@ -283,9 +371,29 @@ struct Engine {
 - (instancetype)initWithPath:(NSString *)path classID:(NSString *)classID state:(NSData *)state sampleRate:(double)sampleRate error:(NSError **)error {
     if (!(self = [super init])) return nil;
     if (!std::isfinite(sampleRate) || sampleRate < 8000 || sampleRate > 192000) { fail(error, @"Unsupported plug-in sample rate."); return nil; }
+    // Some plug-in frameworks bind their process-wide Cocoa message manager
+    // when the first processor is constructed, rather than at module entry.
+    // Bootstrap each bundle on AppKit's thread. Later instances and all DSP
+    // preparation/rendering remain on workers. Callers must not block AppKit
+    // while awaiting first-time background plug-in initialization.
+    static std::mutex bootstrapMutex;
+    static std::set<std::string> bootstrapped;
+    const std::string bundlePath(path.UTF8String);
+    bool ready;
+    { std::lock_guard<std::mutex> lock(bootstrapMutex); ready = bootstrapped.count(bundlePath) != 0; }
+    if (!ready && ![NSThread isMainThread]) {
+        __block SNPluginHost *host = nil;
+        __block NSError *failure = nil;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            host = [[SNPluginHost alloc] initWithPath:path classID:classID state:state sampleRate:sampleRate error:&failure];
+        });
+        if (error) *error = failure;
+        return host;
+    }
     _engine = std::make_unique<Engine>(sampleRate);
     bool success = [path.pathExtension.lowercaseString isEqualToString:@"vst3"] ? _engine->loadVST3(path, classID, error) : _engine->loadLegacy(path, error);
     if (!success) return nil;
+    { std::lock_guard<std::mutex> lock(bootstrapMutex); bootstrapped.insert(bundlePath); }
     if (classID.length && _engine->classID != classID.UTF8String) { fail(error, @"This is a different plug-in from the one saved in the project."); return nil; }
     if (!_engine->restore(state, error)) return nil;
     return self;
@@ -331,6 +439,20 @@ struct Engine {
     return [NSData dataWithBytes:result.data() + delay * channels length:(total - delay) * channels * sizeof(float)];
 }
 - (uint64_t)editRevision { return _engine->handler->revision.load(); }
+- (BOOL)acceptsMIDI { return _engine->midiInput; }
+- (BOOL)isInstrument { return _engine->instrument; }
+- (void)sendMIDIStatus:(uint8_t)status data1:(uint8_t)data1 data2:(uint8_t)data2 { _engine->enqueueMIDI(status, data1, data2); }
+- (void)allNotesOff { for (int ch = 0; ch < 16; ++ch) { _engine->enqueueMIDI(0xB0 | ch, 64, 0); _engine->enqueueMIDI(0xB0 | ch, 123, 0); } }
+- (void)setTransportPlaying:(BOOL)playing position:(int64_t)position tempo:(double)tempo {
+    std::lock_guard<std::recursive_mutex> lock(_engine->mutex);
+    _engine->transportPlaying = playing; _engine->streamingPosition = std::max(int64_t(0), position);
+    _engine->clock.tempo = _engine->legacyClock.tempo = std::isfinite(tempo) ? std::clamp(tempo, 20., 300.) : 120.;
+}
+- (BOOL)ensureStreaming:(NSInteger)channels error:(NSError **)error {
+    std::lock_guard<std::recursive_mutex> lock(_engine->mutex);
+    if (_engine->streamingChannels == channels && (_engine->legacy || _engine->processing)) return YES;
+    return [self beginStreaming:channels error:error];
+}
 - (BOOL)beginStreaming:(NSInteger)channels error:(NSError **)error {
     std::lock_guard<std::recursive_mutex> lock(_engine->mutex);
     if (channels != 1 && channels != 2) { fail(error, @"Invalid streaming channel count."); return NO; }
@@ -340,6 +462,8 @@ struct Engine {
     _engine->active = _engine->processing = false;
     if (!_engine->prepare((int)channels, error)) return NO;
     _engine->streamingChannels = (int)channels; _engine->streamingPosition = 0;
+    _engine->continuousPosition = 0; _engine->transportPlaying = true;
+    std::memset(_engine->heldNotes, 0, sizeof(_engine->heldNotes));
     return YES;
 }
 - (NSData *)processBlock:(NSData *)audio channels:(NSInteger)channels error:(NSError **)error {
@@ -350,7 +474,7 @@ struct Engine {
     const auto *samples = (const float *)audio.bytes;
     for (int i = 0; i < count; ++i) for (int ch = 0; ch < channels; ++ch) input[ch][i] = samples[i * channels + ch];
     if (!_engine->block(input, output, count, _engine->streamingPosition, error)) return nil;
-    _engine->streamingPosition += count;
+    if (_engine->transportPlaying) _engine->streamingPosition += count;
     std::vector<float> result(count * channels);
     for (int i = 0; i < count; ++i) for (int ch = 0; ch < channels; ++ch) result[i * channels + ch] = std::isfinite(output[ch][i]) ? output[ch][i] : 0;
     return [NSData dataWithBytes:result.data() length:result.size() * sizeof(float)];
