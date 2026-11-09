@@ -1604,11 +1604,6 @@ final class Timeline: NSView {
     override func draw(_ dirtyRect: NSRect) {
         fill(bounds, background)
         let dimmed = dimmedTrackIDs()
-        for tick in rulerTicks(in: dirtyRect) {
-            let x = header + tick.time * editor.zoom
-            let alpha = editor.project.tempoMode ? (tick.isBar ? 0.10 : 0.035) : 0.045
-            line(NSPoint(x: x, y: ruler), NSPoint(x: x, y: bounds.height), NSColor.white.withAlphaComponent(alpha))
-        }
         for (index, item) in rows.enumerated() {
             let track = item.0; let y = ruler + CGFloat(index) * rowHeight
             let trackDimmed = dimmed.contains(track.id)
@@ -1637,6 +1632,12 @@ final class Timeline: NSView {
         }
         if let range = editor.range {
             fill(NSRect(x: header + range.lowerBound * editor.zoom, y: ruler, width: (range.upperBound - range.lowerBound) * editor.zoom, height: bounds.height - ruler), accent.withAlphaComponent(0.09))
+        }
+        // Composite the grid over static fragment tiles and live capture alike.
+        for tick in rulerTicks(in: dirtyRect) {
+            let x = header + tick.time * editor.zoom
+            let alpha = editor.project.tempoMode ? (tick.isBar ? 0.10 : 0.035) : 0.045
+            line(NSPoint(x: x, y: ruler), NSPoint(x: x, y: bounds.height), NSColor.white.withAlphaComponent(alpha))
         }
         if let fragmentSnapTime {
             NSGraphicsContext.saveGraphicsState()
