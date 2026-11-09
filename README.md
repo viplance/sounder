@@ -198,3 +198,7 @@ CPU reports total Sounder process CPU time divided by the available logical CPU 
 `--multicore-test` verifies dependency order, exact serial/parallel output, live mix and metering, cancellation, shared-pool concurrency, and export progress; it also benchmarks lightweight and CPU-heavy synthetic graphs. Add `--no-benchmark` for a focused Thread Sanitizer run. Real `--plugin-test /path/to/effect.vst3 --editor-test` also checks concurrent independent processors and serial/parallel export audio.
 
 Global **Bypass all / Activate all** stores a separate bypass setting for each track and MASTER. It preserves individual plug-in power states and restores only the previously enabled effects. A dot after [VST] or [VST3] marks an individually enabled plug-in, including while the entire chain is bypassed. Row tooltips use Open plugin, Enable and Disable. Bulk toggles stay available during background buffer preparation, and the separate global/individual settings survive project Save and affect playback and export.
+
+## Downloadable plug-ins
+
+The FX picker includes nine free VST3 plug-ins from the local [JSON catalog](Sounder/Plugins/PluginCatalog.json). Missing entries show **Install** on the right. Installation shows cancellable progress, installs the native bundle to the user's VST3 folder, then adds it to the chain and opens its editor. Installed entries no longer show Install. See [catalog sources, review links and maintenance notes](Sounder/Plugins/CATALOG.md).

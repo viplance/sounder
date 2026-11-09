@@ -471,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var projectAuxiliaryWindows: [NSWindow] {
         Array(editor.effectsWindows.values).compactMap { $0.window } +
         Array(editor.pluginWindows.values).compactMap { $0.window } +
-        [editor.projectOpener?.window, editor.importer?.window, editor.exporter?.window, audioRoutingWindow?.window].compactMap { $0 }
+        [editor.pluginInstaller?.window, editor.projectOpener?.window, editor.importer?.window, editor.exporter?.window, audioRoutingWindow?.window].compactMap { $0 }
     }
     func windowWillMiniaturize(_ notification: Notification) {
         guard notification.object as? NSWindow === window else { return }
@@ -745,6 +745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--physical-shortcuts-ui-test") { try verifyPhysicalShortcutsUI() }
             if CommandLine.arguments.contains("--tap-tempo-ui-test") { try verifyTapTempoUI() }
             if CommandLine.arguments.contains("--tempo-ui-test") { try verifyTempoUI() }
+            if CommandLine.arguments.contains("--plugin-catalog-ui-test") { try verifyPluginCatalogUI() }
             if CommandLine.arguments.contains("--export-progress-ui-test") { try verifyExportProgressUI() }
             if CommandLine.arguments.contains("--export-ui-test") { try verifyExportUI() }
             if CommandLine.arguments.contains("--restart-ui-test") { try verifyRestartUI() }
@@ -1149,6 +1150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func windowDidResize(_ notification: Notification) { updateProjectNameWidth(); timeline?.refresh() }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if editor.isInstallingPlugin { editor.pluginInstaller?.cancel(); return false }
         if editor.isExporting { editor.exporter?.cancel(); return false }
         if editor.isImporting { editor.importer?.cancel(); return false }
         if editor.isOpening { editor.projectOpener?.cancel(); return false }
@@ -1163,6 +1165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if editor.isInstallingPlugin { editor.pluginInstaller?.cancel(); return .terminateCancel }
         if editor.isExporting { editor.exporter?.cancel(); return .terminateCancel }
         if editor.isImporting { editor.importer?.cancel(); return .terminateCancel }
         if editor.isOpening { editor.projectOpener?.cancel(); return .terminateCancel }
@@ -1359,6 +1362,11 @@ if CommandLine.arguments.contains("--audio-import-test") {
 if let index = CommandLine.arguments.firstIndex(of: "--recording-clock-hardware-test"), index + 1 < CommandLine.arguments.count {
     do { try runRecordingClockHardwareTest(deviceName: CommandLine.arguments[index + 1]); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if CommandLine.arguments.contains("--plugin-install-test") {
+    let archiveIndex = CommandLine.arguments.firstIndex(of: "--plugin-archives")
+    let directory = archiveIndex.flatMap { $0 + 1 < CommandLine.arguments.count ? URL(fileURLWithPath: CommandLine.arguments[$0 + 1]) : nil }
+    do { try runPluginInstallationTests(archives: directory); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if CommandLine.arguments.contains("--self-test") {
     do { try runAudioTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }

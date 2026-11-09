@@ -254,6 +254,7 @@ func runAudioTests() throws {
     try runResamplingTests()
     try runNotificationTests()
     try runAudioImportTests()
+    try runPluginInstallationTests()
     print("All audio/editor tests passed")
 }
 

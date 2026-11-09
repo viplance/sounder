@@ -225,6 +225,33 @@ final class Editor: NSObject {
     var timer: Timer?
     var projectOpener: ProjectOpenController?
     var isOpening: Bool { projectOpener?.isRunning == true }
+    var pluginInstaller: PluginInstallController?
+    private var pendingPluginActivations: [() -> Void] = []
+    func activateInstalledPlugin(_ url: URL, completed: @escaping (URL) -> Void) {
+        if canEditEffects { completed(url) }
+        else { pendingPluginActivations.append { completed(url) } }
+    }
+    var isInstallingPlugin: Bool { pluginInstaller?.isRunning == true }
+    func installPlugin(_ plugin: CatalogPlugin, completed: @escaping (URL) -> Void) {
+        guard canEditEffects, !isInstallingPlugin else { return }
+        if let installed = plugin.installed(in: PluginProcessing.installed()) { completed(installed); return }
+        pluginInstaller?.close()
+        let job = PluginInstallController(plugin: plugin); pluginInstaller = job
+        job.stateChanged = { [weak self] in self?.update() }
+        job.completed = { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let url):
+                for window in self.effectsWindows.values { window.scan() }
+                self.activateInstalledPlugin(url, completed: completed)
+            case .failure(let error): if !(error is CancellationError) { self.error(error) }
+            }
+        }
+        job.closed = { [weak self, weak job] in
+            if self?.pluginInstaller === job { self?.pluginInstaller = nil; self?.update() }
+        }
+        job.start()
+    }
     var importer: AudioImportController?
     private(set) var isNormalizing = false
     var isImporting: Bool { importer?.isRunning == true }
@@ -234,7 +261,7 @@ final class Editor: NSObject {
     var isRecording: Bool { recorder != nil }
     var isPlaying: Bool { player?.isPlaying == true || shuttle?.isPlaying == true }
     var canRecord: Bool { !isPreparingPlayback && !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
-    var busy: Bool { isPreparingPlayback || isRecording || isPlaying || isShuttling || requestingMic || isExporting || isImporting || isOpening || isNormalizing }
+    var busy: Bool { isInstallingPlugin || isPreparingPlayback || isRecording || isPlaying || isShuttling || requestingMic || isExporting || isImporting || isOpening || isNormalizing }
     var canExport: Bool { !busy && duration > 0 }
     var duration: Double { project.tracks.flatMap(\.clips).map(\.end).max() ?? 0 }
     var projectName: String { project.name ?? projectURL?.deletingPathExtension().lastPathComponent ?? "MY PROJECT" }
@@ -251,14 +278,20 @@ final class Editor: NSObject {
         audio.configure(project.audioFormat)
         selectedTrack = project.tracks.first?.id
     }
+    private func activatePendingPlugins() {
+        guard canEditEffects && !pendingPluginActivations.isEmpty else { return }
+        let pending = pendingPluginActivations; pendingPluginActivations = []
+        pending.forEach { $0() }
+    }
     func update(_ text: String? = nil) {
+        activatePendingPlugins()
         if let text { notifications.show(text, style: .success) }
         for window in effectsWindows.values { window.refreshAvailability() }
         changed?()
         scheduleIdlePreparation()
     }
     func hint(_ key: UXHint, _ text: String) { notifications.hint(key, text) }
-    func error(_ error: Error) { notifications.show(error.localizedDescription, style: .error); changed?() }
+    func error(_ error: Error) { notifications.show(error.localizedDescription, style: .error); activatePendingPlugins(); changed?() }
     func setAudioInput(_ input: AudioEndpoint?, trackID: UUID? = nil) {
         guard !busy else { return }
         do {

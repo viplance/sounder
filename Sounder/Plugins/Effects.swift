@@ -1,6 +1,12 @@
 import AppKit
 import UniformTypeIdentifiers
 
+private let effectsControlFont = NSFont.systemFont(ofSize: 12)
+private func applyEffectsButtonFont(_ button: NSButton) {
+    button.font = effectsControlFont
+    button.attributedTitle = NSAttributedString(string: button.title, attributes: [.font: effectsControlFont, .foregroundColor: NSColor.labelColor])
+}
+
 struct PluginEffect: Codable, Identifiable {
     var id = UUID()
     var name: String
@@ -126,13 +132,34 @@ final class PluginNameRow: NSTableCellView {
     init(name: String) {
         super.init(frame: .zero)
         let label = NSTextField(labelWithString: name)
-        label.font = .systemFont(ofSize: 13); label.lineBreakMode = .byTruncatingTail
+        label.font = effectsControlFont; label.lineBreakMode = .byTruncatingTail
         textField = label; addSubview(label)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func layout() {
         super.layout()
         textField?.frame = NSRect(x: 8, y: bounds.midY - 9, width: max(0, bounds.width - 16), height: 18)
+    }
+}
+
+final class CatalogPluginRow: NSTableCellView {
+    let name: NSTextField
+    let install: EffectActionButton
+    init(plugin: CatalogPlugin, enabled: Bool, action: @escaping () -> Void) {
+        name = NSTextField(labelWithString: plugin.name + "  [VST3]")
+        install = EffectActionButton("Install", invoke: action)
+        super.init(frame: .zero)
+        name.font = effectsControlFont; name.lineBreakMode = .byTruncatingTail; textField = name
+        toolTip = plugin.maker + " · " + plugin.category + " · " + plugin.version + "\n" + plugin.description
+        install.isEnabled = enabled; applyEffectsButtonFont(install)
+        install.setAccessibilityLabel("Install " + plugin.name)
+        addSubview(name); addSubview(install)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() {
+        super.layout()
+        install.frame = NSRect(x: bounds.maxX - 72, y: bounds.midY - 12, width: 64, height: 24)
+        name.frame = NSRect(x: 8, y: bounds.midY - 9, width: max(0, install.frame.minX - 16), height: 18)
     }
 }
 
@@ -144,18 +171,24 @@ final class PluginPicker: PointerButton, NSSearchFieldDelegate, NSTableViewDataS
     let popover = NSPopover()
     private(set) var installed: [URL] = []
     private(set) var matches: [URL] = []
+    var catalog: [CatalogPlugin] = (try? PluginCatalog.bundled.get()) ?? []
+    private(set) var catalogMatches: [CatalogPlugin] = []
+    var canInstall = true { didSet { if canInstall != oldValue { results.reloadData() } } }
+    var onInstall: ((CatalogPlugin) -> Void)?
+    private var resultCount: Int { matches.count + catalogMatches.count }
     private(set) var selectedURL: URL?
     var onChoose: ((URL) -> Void)?
     private var prepared = false
     override init(frame: NSRect) {
         super.init(frame: frame)
-        title = "Choose plug-in…"; bezelStyle = .rounded
+        title = "Choose plug-in…"; bezelStyle = .rounded; font = effectsControlFont
+        search.font = effectsControlFont
         alignment = .left; lineBreakMode = .byTruncatingTail
         image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil); imagePosition = .imageTrailing
         target = self; action = #selector(showPicker)
         setAccessibilityLabel("Search installed VST and VST3 plug-ins")
         vst3Only.setButtonType(.switch); vst3Only.state = .on
-        vst3Only.font = .systemFont(ofSize: 12)
+        applyEffectsButtonFont(vst3Only)
         vst3Only.target = self; vst3Only.action = #selector(toggleVST3Only)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -165,7 +198,8 @@ final class PluginPicker: PointerButton, NSSearchFieldDelegate, NSTableViewDataS
     private func updateSelection() {
         let urls = available
         if !urls.contains(where: { $0 == selectedURL }) { selectedURL = urls.first }
-        title = selectedURL.map(Self.displayName) ?? (vst3Only.state == .on ? "No installed VST3 effects found" : "No installed VST / VST3 effects found")
+        title = selectedURL.map(Self.displayName) ?? (catalog.isEmpty ? (vst3Only.state == .on ? "No installed VST3 effects found" : "No installed VST / VST3 effects found") : "Choose plug-in…")
+        applyEffectsButtonFont(self)
     }
     func setPlugins(_ urls: [URL]) {
         installed = urls; updateSelection(); filter(search.stringValue)
@@ -175,8 +209,10 @@ final class PluginPicker: PointerButton, NSSearchFieldDelegate, NSTableViewDataS
     func filter(_ query: String) {
         let words = query.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         matches = available.filter { url in words.allSatisfy { Self.displayName(url).range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) != nil } }
+        catalogMatches = catalog.filter { plugin in plugin.installed(in: installed) == nil && words.allSatisfy { plugin.searchText.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) != nil } }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         results.reloadData()
-        if !matches.isEmpty { results.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
+        if resultCount > 0 { results.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
     }
     @objc func showPicker() {
         if !prepared {
@@ -203,26 +239,38 @@ final class PluginPicker: PointerButton, NSSearchFieldDelegate, NSTableViewDataS
         popover.show(relativeTo: bounds, of: self, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeFirstResponder(search)
     }
-    func numberOfRows(in tableView: NSTableView) -> Int { matches.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { resultCount }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard matches.indices.contains(row) else { return nil }
-        return PluginNameRow(name: Self.displayName(matches[row]))
+        if matches.indices.contains(row) { return PluginNameRow(name: Self.displayName(matches[row])) }
+        let index = row - matches.count
+        guard catalogMatches.indices.contains(index) else { return nil }
+        let plugin = catalogMatches[index]
+        return CatalogPluginRow(plugin: plugin, enabled: canInstall) { [weak self] in self?.install(plugin) }
     }
     func controlTextDidChange(_ obj: Notification) { filter(search.stringValue) }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         if selector == #selector(NSResponder.moveDown(_:)) || selector == #selector(NSResponder.moveUp(_:)) {
-            guard !matches.isEmpty else { return true }
-            let row = max(0, min(matches.count - 1, results.selectedRow + (selector == #selector(NSResponder.moveDown(_:)) ? 1 : -1)))
+            guard resultCount > 0 else { return true }
+            let row = max(0, min(resultCount - 1, results.selectedRow + (selector == #selector(NSResponder.moveDown(_:)) ? 1 : -1)))
             results.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false); results.scrollRowToVisible(row); return true
         }
         if selector == #selector(NSResponder.insertNewline(_:)) { choose(); return true }
         if selector == #selector(NSResponder.cancelOperation(_:)) { popover.close(); return true }
         return false
     }
+    func selectInstalled(_ url: URL) {
+        guard available.contains(url) else { return }
+        selectedURL = url; title = Self.displayName(url); applyEffectsButtonFont(self)
+    }
+    private func install(_ plugin: CatalogPlugin) {
+        guard canInstall else { return }
+        popover.close(); onInstall?(plugin)
+    }
     @objc func choose() {
+        // A catalog row selects only; installation requires its Install button.
         guard matches.indices.contains(results.selectedRow) else { return }
         let url = matches[results.selectedRow]
-        selectedURL = url; title = Self.displayName(url)
+        selectInstalled(url)
         popover.close(); onChoose?(url)
     }
 }
@@ -233,7 +281,7 @@ final class EffectActionButton: PointerButton {
         self.invoke = invoke
         super.init(frame: .zero)
         self.title = title; identifier = NSUserInterfaceItemIdentifier(title); bezelStyle = .rounded; controlSize = .small
-        font = .systemFont(ofSize: 11); target = self; action = #selector(invokeAction)
+        font = effectsControlFont; target = self; action = #selector(invokeAction)
     }
     required init?(coder: NSCoder) { fatalError() }
     @objc private func invokeAction() { invoke() }
@@ -292,10 +340,18 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         window.level = .floating; window.hidesOnDeactivate = false
         plugins.frame = NSRect(x: 16, y: 353, width: 221, height: 30); root.addSubview(plugins)
         plugins.onChoose = { [weak self] url in self?.add(url) }
-        let browse = PointerButton(title: "Browse…", target: self, action: #selector(browse)); browse.bezelStyle = .rounded; browse.frame = NSRect(x: 243, y: 352, width: 78, height: 32); root.addSubview(browse)
-        let rescan = PointerButton(title: "Rescan", target: self, action: #selector(scan)); rescan.bezelStyle = .rounded; rescan.frame = NSRect(x: 327, y: 352, width: 66, height: 32); root.addSubview(rescan)
+        plugins.onInstall = { [weak self] plugin in
+            guard let self else { return }
+            self.editor.installPlugin(plugin) { [weak self] url in
+                guard let self, self.exists else { return }
+                self.scan(); self.plugins.selectInstalled(url); self.add(url)
+            }
+        }
+        if case .failure(let error) = PluginCatalog.bundled { editor.error(error) }
+        let browse = PointerButton(title: "Open", target: self, action: #selector(browse)); browse.bezelStyle = .rounded; applyEffectsButtonFont(browse); browse.frame = NSRect(x: 243, y: 352, width: 78, height: 32); root.addSubview(browse)
+        let rescan = PointerButton(title: "Rescan", target: self, action: #selector(scan)); rescan.bezelStyle = .rounded; applyEffectsButtonFont(rescan); rescan.frame = NSRect(x: 327, y: 352, width: 66, height: 32); root.addSubview(rescan)
         allEffects.target = self; allEffects.action = #selector(toggleAll)
-        allEffects.bezelStyle = .rounded; allEffects.font = .systemFont(ofSize: 11)
+        allEffects.bezelStyle = .rounded; allEffects.font = effectsControlFont
         allEffects.frame = NSRect(x: 399, y: 352, width: 92, height: 32); root.addSubview(allEffects)
         let scroll = NSScrollView(frame: NSRect(x: 16, y: 16, width: 475, height: 326)); scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("effect")); column.width = 455
@@ -334,7 +390,9 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         if notifyEditor { editor.update() }
     }
     func refreshAvailability() {
+        plugins.canInstall = exists && editor.canEditEffects && !editor.isInstallingPlugin
         allEffects.title = editor.effectsBypassed(for: trackID) ? "Activate all" : "Bypass all"
+        applyEffectsButtonFont(allEffects)
         allEffects.isEnabled = exists && !effects.isEmpty && editor.canToggleEffects
     }
     func numberOfRows(in tableView: NSTableView) -> Int { effects.count }
@@ -345,7 +403,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         let chainBypassed = editor.effectsBypassed(for: trackID)
         let enabledMark = effect.bypassed ? "" : " •"
         let name = NSTextField(labelWithString: "\(row + 1).  \(effect.name)  [\(effect.format)]\(enabledMark)" + (missing ? " · missing" : ""))
-        name.lineBreakMode = .byTruncatingTail; name.font = .systemFont(ofSize: 12)
+        name.lineBreakMode = .byTruncatingTail; name.font = effectsControlFont
         name.textColor = effect.bypassed || chainBypassed ? .secondaryLabelColor : .labelColor
         name.toolTip = effect.name + "\n" + effect.path
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -442,7 +500,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     func remove(id: UUID) {
         guard exists, let row = effects.firstIndex(where: { $0.id == id }) else { return }
         editor.pluginWindows[id]?.close(); editor.checkpoint(); effects.remove(at: row); editor.effectsChanged(); reload()
-        editor.notifications.show("Effect removed", style: .success)
+        editor.notifications.show("Effect removed", style: .error)
     }
     func move(id: UUID, by delta: Int) {
         guard let row = effects.firstIndex(where: { $0.id == id }), effects.indices.contains(row + delta) else { return }
