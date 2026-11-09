@@ -157,7 +157,7 @@ func runOverdubTests() throws {
             try playback.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
             return playback
         })
-        editor.project = Project(tracks: [bed, target], audioFormat: format, metronomeEnabled: true)
+        editor.project = Project(tracks: [bed, target], audioFormat: format, tempoMode: true, metronomeEnabled: true)
         editor.selectedTrack = target.id
         return editor
     }

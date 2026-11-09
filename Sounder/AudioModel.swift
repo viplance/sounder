@@ -339,6 +339,7 @@ struct Project: Codable {
     var tempo = 120.0
     var tempoMode = false
     var metronomeEnabled = false
+    var metronomeIsAudible: Bool { tempoMode && metronomeEnabled }
     var loopEnabled = false
     var defaultInput = AudioEndpoint()
     var defaultOutput = AudioEndpoint()

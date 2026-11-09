@@ -549,7 +549,7 @@ final class Editor: NSObject {
         update()
     }
     func activateRecording(_ recorder: LiveRecorder) {
-        recorder.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled && player == nil, start: cursor)
+        recorder.metronome.configure(bpm: project.tempo, enabled: project.metronomeIsAudible && player == nil, start: cursor)
         recordingPeaks = []; recordingPartialPeak = nil
         recordingChannelPeaks = Array(repeating: [], count: recorder.format.channels); recordingPartialChannelPeaks = Array(repeating: nil, count: recorder.format.channels)
         recordingURL = recorder.url; recordingTrack = selectedTrack; recordingStart = cursor
@@ -700,7 +700,7 @@ final class Editor: NSObject {
     }
     func flushPluginEdits() { for window in Array(pluginWindows.values) { window.captureChanges() } }
     func closePluginWindows(capture: Bool = true) { for window in Array(pluginWindows.values) { window.close(capture: capture) } }
-    func toggleTempoMode() { checkpoint(); project.tempoMode.toggle(); update() }
+    func toggleTempoMode() { checkpoint(); project.tempoMode.toggle(); updateMetronome(); update() }
     func setTempo(_ bpm: Double) {
         guard bpm.isFinite, (20...300).contains(bpm), bpm != project.tempo else { return }
         checkpoint(); project.tempo = bpm; updateMetronome(); update("Tempo updated")
@@ -723,8 +723,8 @@ final class Editor: NSObject {
         checkpoint(); project.metronomeEnabled.toggle(); updateMetronome(); update()
     }
     private func updateMetronome() {
-        player?.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
-        recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeEnabled && player == nil)
+        player?.setMetronome(tempo: project.tempo, enabled: project.metronomeIsAudible)
+        recorder?.metronome.configure(bpm: project.tempo, enabled: project.metronomeIsAudible && player == nil)
     }
     var canAdjustTrackMix: Bool { !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     @discardableResult func setTrackMix(_ id: UUID, volumeDB: Double? = nil, pan: Double? = nil, checkpoint shouldCheckpoint: Bool = true) -> Bool {
@@ -947,7 +947,7 @@ final class Editor: NSObject {
                 guard loopRange.map({ position <= $0.upperBound }) == true || position < Double(playback.graph.totalFrames) / audio.sampleRate else { update(); return }
                 pausedPlayer = nil; pausedMixKey = nil; followsPausedCursor = false
                 player = playback
-                playback.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
+                playback.setMetronome(tempo: project.tempo, enabled: project.metronomeIsAudible)
                 playback.setLoop(loopRange)
                 try playback.resume(to: position)
                 playback.didResume = { [weak self, weak playback] in
@@ -997,7 +997,7 @@ final class Editor: NSObject {
             }
             player = playback
             mixCache = (key, playback.graph)
-            playback.setMetronome(tempo: project.tempo, enabled: project.metronomeEnabled)
+            playback.setMetronome(tempo: project.tempo, enabled: project.metronomeIsAudible)
             playback.setLoop(loopRange)
             if alreadyStarted {
                 if !forRecording { playback.beginPreparedPlayback() }
@@ -1086,7 +1086,7 @@ final class Editor: NSObject {
                 try prepared.configureBufferSize(snapshot.playbackBufferSize)
                 job.setPhase("Preparing playback audio")
                 try prepared.configureOutput(snapshot.defaultOutput)
-                prepared.setMetronome(tempo: snapshot.tempo, enabled: snapshot.metronomeEnabled)
+                prepared.setMetronome(tempo: snapshot.tempo, enabled: snapshot.metronomeIsAudible)
                 prepared.setLoop(loop)
                 if forRecording { try prepared.prepareForRecording() }
                 let history = prepared.graph.needsHistory ? Double(Int((start * rate).rounded()) + prepared.graph.latency) : 0

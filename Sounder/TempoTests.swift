@@ -68,6 +68,31 @@ func runTempoTests() throws {
         let afterSeek = try render(sought, seconds: 0.4)
         try check(energy(afterSeek, at: 0, length: 0.2) == 0 && energy(afterSeek, at: 0.25) > 0.001, "Seeking halfway through a beat keeps the click aligned to the absolute timeline grid")
         sought.stop()
+        let editor = Editor(store: store, makePlayback: { graph, format, start in
+            let live = LivePlayback(graph: graph, format: format, start: start)
+            try live.engine.enableManualRenderingMode(.offline,
+                format: AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2)!, maximumFrameCount: 512)
+            return live
+        })
+        editor.project = project; editor.project.tempoMode = false
+        editor.playPause()
+        guard let live = editor.player else { throw SounderError.message("Tempo-gated playback failed") }
+        let withoutTempo = try render(live, seconds: 0.65)
+        try check(withoutTempo.allSatisfy { $0 == 0 } && editor.project.metronomeEnabled,
+                  "Playback is silent with Tempo off even when the saved metronome choice is enabled")
+        editor.toggleTempoMode()
+        let withTempo = try render(live, seconds: 0.65)
+        try check(withTempo.contains { abs($0) > 0.1 } && editor.player === live,
+                  "Enabling Tempo restores the selected metronome on the same playback engine")
+        editor.toggleTempoMode()
+        let mutedTempo = try render(live, seconds: 0.65)
+        try check(mutedTempo.suffix(Int(rate * 0.3)).allSatisfy { $0 == 0 } && editor.player === live,
+                  "Disabling Tempo silences the metronome during playback without restarting audio")
+        editor.toggleTempoMode()
+        let restoredTempo = try render(live, seconds: 0.65)
+        try check(restoredTempo.contains { abs($0) > 0.1 } && editor.project.metronomeEnabled,
+                  "Re-enabling Tempo retains the user's metronome choice")
+        editor.stop()
         let path = directory.appendingPathComponent("NoClick-\(Int(rate)).wav")
         var settings = ExportSettings(projectFormat: format); settings.format = .wav
         try AudioExporter.write(project: project, store: store, settings: settings, to: path)
