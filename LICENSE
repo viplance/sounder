@@ -1,0 +1,52 @@
+Sounder Source-Available License
+Copyright (c) 2026 Dzmitry Sharko. All rights reserved.
+
+1. Scope
+
+This license applies to the original Sounder source code, documentation and
+assets owned by Dzmitry Sharko, except for the materials identified in section 4.
+It is a custom, restrictive source-available license, not an open-source license.
+
+2. Viewing and permissions
+
+The source code is made available for viewing and study only. Temporary copies
+strictly necessary for that viewing are permitted. No other permission is
+granted to copy, clone, fork, modify, compile, incorporate into another work,
+redistribute, sublicense, sell or otherwise exploit the covered materials,
+in whole or in part, without prior written permission from Dzmitry Sharko.
+Public access to the repository does not itself grant these permissions.
+Permission requests should be addressed to Dzmitry Sharko through the project's
+repository contact channels.
+
+3. Existing rights and hosting terms
+
+These restrictions do not override rights that cannot be restricted under
+applicable law, rights already granted under an earlier license, or rights
+granted by the copyright holder under the applicable hosting platform's terms.
+In particular, publishing this repository publicly on GitHub permits viewing
+and forking within GitHub as provided by GitHub's Terms of Service. This license
+cannot eliminate that permission; use private hosting with appropriate access
+controls if such platform-level copying must not be permitted.
+
+4. Third-party materials and AudioEncoder exception
+
+Third-party materials retain their own licenses. In particular, Vendor/VST3,
+the upstream codec source archives in Vendor/AudioCodecs, and materials
+identified in Sounder/ThirdPartyNotices.txt are not made subject to the
+restrictions in section 2. Their applicable notices and license terms continue
+to govern their use, copying, modification and redistribution.
+
+The standalone AudioEncoder helper source (scripts/audio-encoder.c) and its
+build script (scripts/build-codecs.mjs) are licensed under the GNU Library
+General Public License, version 2 or, at your option, any later version. This
+exception preserves the ability to rebuild, modify and relink the helper with
+the bundled LAME library. The version 2 license text is included in
+Sounder/ThirdPartyNotices.txt. This exception does not license the remaining
+Sounder application under those terms.
+
+5. Warranty and liability
+
+No warranty is provided for the covered materials. To the extent permitted by
+applicable law, the copyright holder is not responsible for losses or damages
+arising from access to or use of them. Mandatory rights under applicable law
+are unaffected.
