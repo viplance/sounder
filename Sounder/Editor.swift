@@ -599,6 +599,10 @@ final class Editor: NSObject {
             else { startPlayback(forRecording: true) }
             guard let player else { throw SounderError.message("Cannot start recording playback") }
             let origin = position ?? (wasPlaying ? player.currentTime : player.start)
+            let captureClock = RecordingHostClock()
+            // Freeze the output cycle before input setup can cross a loop wrap.
+            let liveHost = wasPlaying ? player.recordingPresentationHostTime(at: origin) : nil
+            if let liveHost { captureClock.set(hostTime: liveHost) }
             for id in targets {
                 guard let track = project.tracks.first(where: { $0.id == id }) else { continue }
                 let url = audio.freshURL()
@@ -609,11 +613,25 @@ final class Editor: NSObject {
                 pending.append(TrackRecording(track: id, recorder: capture, start: origin))
                 if let loopRange { try capture.configureLoop(loopRange, start: origin) }
                 capture.metronome.configure(bpm: project.tempo, enabled: false, start: origin)
+                if !player.engine.isInManualRenderingMode { capture.configureSynchronization(clock: captureClock) }
             }
             guard !pending.isEmpty else { throw SounderError.message("Select a track for recording") }
+            let timedCapture = pending.contains { $0.recorder.usesHardwareClock } && !player.engine.isInManualRenderingMode
+            if wasPlaying && timedCapture {
+                guard liveHost != nil else { throw SounderError.message("The playback audio clock is not ready for recording. Try Record again.") }
+            }
             for take in pending { try take.recorder.start() }
-            if !wasPlaying { player.beginPreparedPlayback() }
-            cursor = pending[0].recorder.writer.isLoopRecording ? origin : (position ?? (wasPlaying ? player.currentTime : player.start))
+            if !wasPlaying {
+                if timedCapture {
+                    // Capture is ready first. Schedule both timelines from a
+                    // common future instant; discard microphone pre-roll.
+                    let startSeconds = AVAudioTime.seconds(forHostTime: mach_absolute_time()) + 0.010
+                    let host = AVAudioTime.hostTime(forSeconds: startSeconds)
+                    captureClock.set(hostTime: AVAudioTime.hostTime(forSeconds: startSeconds + player.recordingOutputLatency))
+                    player.beginPreparedPlayback(at: host)
+                } else { player.beginPreparedPlayback() }
+            }
+            cursor = origin
             for take in pending { take.start = cursor; take.end = cursor; take.cursor = cursor }
             activateRecordings(pending)
         } catch {

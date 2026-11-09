@@ -119,6 +119,23 @@ private final class LoopRecordingBuffer {
     }
 }
 
+/// Shared DAC presentation instant of the recording trigger. Input writers
+/// compare hardware sample timestamps against it, never callback arrival time.
+final class RecordingHostClock {
+    private let lock = NSLock()
+    private var reference: Double?
+    func set(hostTime: UInt64) {
+        lock.lock(); reference = AVAudioTime.seconds(forHostTime: hostTime); lock.unlock()
+    }
+    func inputFrameOffset(hostTime: UInt64, latency: Double, sampleRate: Double) -> Int? {
+        lock.lock(); let anchor = reference; lock.unlock()
+        guard let anchor else { return nil }
+        let seconds = AVAudioTime.seconds(forHostTime: hostTime) - max(0, latency) - anchor
+        guard seconds.isFinite, abs(seconds * sampleRate) < Double(Int.max / 4) else { return nil }
+        return Int((seconds * sampleRate).rounded())
+    }
+}
+
 struct RecordingUpdate {
     let channelPeaks: [[Float]]
     let partialChannelPeaks: [Float?]
@@ -162,6 +179,12 @@ final class RecordingWriter {
     private var publishedFrames = 0
     private var publishedFailure: Error?
 
+    private var alignment: (clock: RecordingHostClock, latency: Double)?
+    private var aligned = false
+    private var trimInputFrames = 0
+    func configureSynchronization(clock: RecordingHostClock, inputLatency: Double) {
+        queue.sync { alignment = (clock, inputLatency) }
+    }
     init(url: URL, format: ProjectAudioFormat, inputFormat: AVAudioFormat, inputChannels: [Int]? = nil) throws {
         try format.validate()
         self.url = url
@@ -211,8 +234,10 @@ final class RecordingWriter {
     private func openFile() throws {
         if file == nil { file = try AVAudioFile(forWriting: url, settings: format.recordingSettings, commonFormat: .pcmFormatFloat32, interleaved: false) }
     }
-    func append(_ buffer: AVAudioPCMBuffer) {
+    func append(_ buffer: AVAudioPCMBuffer, hostTime: UInt64? = nil) {
         guard buffer.frameLength > 0 else { return }
+        // Capture fallback timing before queueing; a slow writer is not device latency.
+        let stamp = hostTime ?? AVAudioTime.hostTime(forSeconds: max(0, AVAudioTime.seconds(forHostTime: mach_absolute_time()) - Double(buffer.frameLength) / buffer.format.sampleRate))
         // Audio taps may reuse their buffers after the callback returns.
         guard buffer.format == captureFormat, let source = buffer.floatChannelData,
               let copy = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: buffer.frameLength),
@@ -229,8 +254,35 @@ final class RecordingWriter {
         guard accepting else { return }
         queue.async { [self] in
             guard failure == nil else { return }
-            do { try convert(copy, ending: false) }
+            do {
+                if let alignment, !aligned {
+                    guard let offset = alignment.clock.inputFrameOffset(hostTime: stamp, latency: alignment.latency, sampleRate: sourceFormat.sampleRate) else { return }
+                    aligned = true
+                    if offset < 0 { trimInputFrames = -offset }
+                    else if offset > 0 { try padInput(frames: offset) }
+                }
+                if trimInputFrames > 0 {
+                    let skip = min(trimInputFrames, Int(copy.frameLength))
+                    trimInputFrames -= skip
+                    let remaining = Int(copy.frameLength) - skip
+                    guard remaining > 0 else { return }
+                    for channel in 0..<Int(copy.format.channelCount) {
+                        memmove(copy.floatChannelData![channel], copy.floatChannelData![channel].advanced(by: skip), remaining * MemoryLayout<Float>.size)
+                    }
+                    copy.frameLength = AVAudioFrameCount(remaining)
+                }
+                try convert(copy, ending: false)
+            }
             catch { fail(error) }
+        }
+    }
+    private func padInput(frames: Int) throws {
+        let silence = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: 4096)!
+        for channel in 0..<Int(sourceFormat.channelCount) { silence.floatChannelData![channel].initialize(repeating: 0, count: 4096) }
+        var remaining = frames
+        while remaining > 0 {
+            silence.frameLength = AVAudioFrameCount(min(remaining, 4096))
+            try convert(silence, ending: false); remaining -= Int(silence.frameLength)
         }
     }
     func inputFailed(_ status: OSStatus) { enqueueFailure(SounderError.message("Audio input failed (audio error \(status)).")) }
@@ -345,6 +397,7 @@ final class LiveRecorder {
     let writer: RecordingWriter
     let metronome: MetronomeVoice
     private var capture: HardwareAudioCapture?
+    var usesHardwareClock: Bool { capture != nil }
     private var stopped = false
     private var started = false
     private var lastFailure: Error?
@@ -357,11 +410,15 @@ final class LiveRecorder {
         else {
             let capture = try HardwareAudioCapture(input: input)
             writer = try RecordingWriter(url: url, format: format, inputFormat: capture.format, inputChannels: input.channels)
-            capture.received = { [writer] in writer.append($0) }
+            capture.received = { [writer] buffer, hostTime in writer.append(buffer, hostTime: hostTime) }
             capture.failed = { [writer] in writer.inputFailed($0) }
             self.capture = capture
         }
         self.format = writer.format
+    }
+    func configureSynchronization(clock: RecordingHostClock) {
+        guard let capture else { return }
+        writer.configureSynchronization(clock: clock, inputLatency: capture.presentationLatency)
     }
     func start() throws {
         guard !started, !stopped else { return }

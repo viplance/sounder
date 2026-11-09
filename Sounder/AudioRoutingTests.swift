@@ -119,3 +119,49 @@ extension AppDelegate {
         }
     }
 }
+
+/// Opt-in device smoke test: uses a temporary project, silent backing output,
+/// and the explicitly named interface; never changes system default devices.
+func runRecordingClockHardwareTest(deviceName: String) throws {
+    _ = NSApplication.shared
+    let devices = AudioDevices.available()
+    guard let device = devices.first(where: { $0.name == deviceName && $0.inputs > 0 && $0.outputs > 0 }) else {
+        throw SounderError.message("Requested duplex interface is unavailable: " + deviceName)
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderHardwareClock-" + UUID().uuidString)
+    let store = try AudioStore(directory: directory)
+    let editor = Editor(store: store)
+    defer { editor.stop(); try? FileManager.default.removeItem(at: directory) }
+    editor.project.audioFormat = ProjectAudioFormat(sampleRate: 48_000, bitDepth: 32)
+    editor.project.defaultInput = AudioEndpoint(deviceUID: device.uid, channels: [0])
+    editor.project.defaultOutput = AudioEndpoint(deviceUID: device.uid, channels: Array(0..<min(2, device.outputs)))
+    editor.cursor = 1
+    func waitForPCM() throws {
+        let deadline = Date().addingTimeInterval(3)
+        while editor.isRecording && editor.recordingEnd - editor.recordingStart < 0.25 && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        guard editor.isRecording, editor.recordingEnd - editor.recordingStart >= 0.25,
+              !editor.recordingPeaks.isEmpty else { throw SounderError.message("Hardware clock produced no aligned capture") }
+    }
+    try editor.startRecording(); try waitForPCM()
+    guard let playback = editor.player, editor.recorder?.usesHardwareClock == true,
+          playback.recordingPresentationHostTime(at: playback.currentTime) != nil else {
+        throw SounderError.message("Hardware capture/output timestamps are unavailable")
+    }
+    print("PASS: \(deviceName) captures timestamp-aligned mono PCM alongside silent native output")
+    let oldURL = editor.recordingURL!
+    editor.restartFromLastStart(); try waitForPCM()
+    guard editor.player === playback, editor.recordingStart == 1,
+          !FileManager.default.fileExists(atPath: oldURL.path) else {
+        throw SounderError.message("Hardware Enter restart lost the shared transport clock")
+    }
+    print("PASS: \(deviceName) restarts capture at the queued seek boundary on the same engine")
+    editor.playPause()
+    guard !editor.isRecording, editor.cursor == 1, let clip = editor.project.tracks[0].clips.first,
+          clip.start == 1, clip.duration >= 0.25,
+          try store.load(clip.source).channels.count == 1 else {
+        throw SounderError.message("Hardware capture did not finalize the aligned take")
+    }
+    print("PASS: \(deviceName) finalizes the synchronized take; temporary captured audio is removed after the test")
+}

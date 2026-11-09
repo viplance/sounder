@@ -516,7 +516,33 @@ final class LivePlayback {
         engine.prepare(); try engine.start()
         if playImmediately { node.play() }
     }
-    func beginPreparedPlayback() { node.play() }
+    func beginPreparedPlayback(at hostTime: UInt64? = nil) {
+        if let hostTime { node.play(at: AVAudioTime(hostTime: hostTime)) } else { node.play() }
+    }
+    var recordingOutputLatency: Double { engine.isInManualRenderingMode ? 0 : max(0, node.outputPresentationLatency) }
+    /// Map the recording trigger to the DAC clock without changing the existing
+    /// transport clock. Render-ahead PCM and declared FX latency are already
+    /// accounted for by the player timeline and must not be subtracted again.
+    func recordingPresentationHostTime(at sourceTime: Double) -> UInt64? {
+        guard !engine.isInManualRenderingMode, let stamp = node.lastRenderTime, stamp.isHostTimeValid,
+              let played = node.playerTime(forNodeTime: stamp), played.isSampleTimeValid, played.sampleRate > 0 else { return nil }
+        let frame = Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded())
+        transportLock.lock()
+        let delta: Double
+        if let seekRequest, abs(seekRequest.time - sourceTime) < 0.5 / format.sampleRate,
+           let targetFrame = seekRequest.outputFrame {
+            // Enter can restart a take while its seek is still queued for output.
+            delta = Double(targetFrame - frame) / format.sampleRate
+        } else if let segment = transportMotions.last(where: { $0.frame <= frame }) {
+            delta = sourceTime - segment.motion.position(at: Double(frame - segment.frame) / format.sampleRate)
+        } else {
+            delta = sourceTime - Double(firstFrame + frame) / format.sampleRate
+        }
+        transportLock.unlock()
+        let seconds = AVAudioTime.seconds(forHostTime: stamp.hostTime) + delta + recordingOutputLatency
+        guard seconds.isFinite, seconds >= 0 else { return nil }
+        return AVAudioTime.hostTime(forSeconds: seconds)
+    }
     // Only the player pauses. Keep the engine, decoded PCM and live processors
     // ready, and finish the short fade at its audible completion, not consumption.
     func pause() throws {

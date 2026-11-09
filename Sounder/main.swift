@@ -1356,6 +1356,10 @@ if CommandLine.arguments.contains("--multicore-test") {
 if CommandLine.arguments.contains("--audio-import-test") {
     do { try runAudioImportTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
+if let index = CommandLine.arguments.firstIndex(of: "--recording-clock-hardware-test"), index + 1 < CommandLine.arguments.count {
+    do { try runRecordingClockHardwareTest(deviceName: CommandLine.arguments[index + 1]); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
 if CommandLine.arguments.contains("--self-test") {
     do { try runAudioTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }

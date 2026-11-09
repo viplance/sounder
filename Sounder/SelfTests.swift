@@ -249,6 +249,7 @@ func runAudioTests() throws {
     try runExportTests()
     try runLiveRecordingTests()
     try runMultitrackRecordingTests()
+    try runRecordingSynchronizationTests()
     try runOverdubTests()
     try runResamplingTests()
     try runNotificationTests()

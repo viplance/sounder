@@ -39,8 +39,8 @@ enum AudioDevices {
         guard AudioObjectGetPropertyData(object, &property, 0, nil, &size, &value) == noErr else { return nil }
         return value?.takeRetainedValue() as String?
     }
-    private static func integer(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
-        var property = address(selector), value: UInt32 = 0, size = UInt32(MemoryLayout<UInt32>.size)
+    private static func integer(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> UInt32? {
+        var property = address(selector, scope: scope), value: UInt32 = 0, size = UInt32(MemoryLayout<UInt32>.size)
         return AudioObjectGetPropertyData(object, &property, 0, nil, &size, &value) == noErr ? value : nil
     }
     private static func channels(_ device: AudioDeviceID, _ direction: AudioDirection) -> Int {
@@ -85,6 +85,29 @@ enum AudioDevices {
     private static func check(_ status: OSStatus, _ operation: String) throws {
         guard status == noErr else { throw SounderError.message("\(operation) failed (audio error \(status)).") }
     }
+    /// HAL input timestamps already account for IO buffering and the safety
+    /// offset. Only the device/selected-stream hardware delay remains to remove.
+    static func inputPresentationLatency(device: AudioDeviceID, channels: [Int]?, sampleRate: Double) -> Double {
+        guard sampleRate > 0 else { return 0 }
+        let deviceFrames = integer(device, kAudioDevicePropertyLatency, scope: kAudioDevicePropertyScopeInput) ?? 0
+        var property = address(kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeInput), size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &property, 0, nil, &size) == noErr, size > 0 else { return Double(deviceFrames) / sampleRate }
+        var streams = [AudioStreamID](repeating: 0, count: Int(size) / MemoryLayout<AudioStreamID>.size)
+        let status = streams.withUnsafeMutableBytes { AudioObjectGetPropertyData(device, &property, 0, nil, &size, $0.baseAddress!) }
+        var streamFrames: UInt32 = 0
+        if status == noErr {
+            for stream in streams {
+                if let channels, let first = integer(stream, kAudioStreamPropertyStartingChannel) {
+                    var format = AudioStreamBasicDescription(), formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+                    var formatProperty = address(kAudioStreamPropertyVirtualFormat)
+                    if AudioObjectGetPropertyData(stream, &formatProperty, 0, nil, &formatSize, &format) == noErr,
+                       !channels.contains(where: { $0 >= Int(first) - 1 && $0 < Int(first) - 1 + Int(format.mChannelsPerFrame) }) { continue }
+                }
+                streamFrames = max(streamFrames, integer(stream, kAudioStreamPropertyLatency) ?? 0)
+            }
+        }
+        return (Double(deviceFrames) + Double(streamFrames)) / sampleRate
+    }
     static func outputMap(channels: [Int], hardwareChannels: Int) -> [Int32] {
         var map = [Int32](repeating: -1, count: hardwareChannels)
         for (source, destination) in channels.enumerated() where map.indices.contains(destination) { map[destination] = Int32(source) }
@@ -122,7 +145,8 @@ final class HardwareAudioCapture {
     private var unit: AudioUnit?
     private(set) var format: AVAudioFormat!
     private var buffer: AVAudioPCMBuffer!
-    var received: ((AVAudioPCMBuffer) -> Void)?
+    private(set) var presentationLatency = 0.0
+    var received: ((AVAudioPCMBuffer, UInt64?) -> Void)?
     var failed: ((OSStatus) -> Void)?
     private var running = false
     init(input: AudioEndpoint) throws {
@@ -149,6 +173,7 @@ final class HardwareAudioCapture {
             format = AVAudioFormat(standardFormatWithSampleRate: hardware.mSampleRate, channelLayout: layout)
         } else { format = AVAudioFormat(standardFormatWithSampleRate: hardware.mSampleRate, channels: hardware.mChannelsPerFrame) }
         guard let format else { throw SounderError.message("Unsupported input format") }
+        presentationLatency = AudioDevices.inputPresentationLatency(device: device.id, channels: endpoint.channels ?? Array(0..<min(2, Int(format.channelCount))), sampleRate: format.sampleRate)
         var client = format.streamDescription.pointee
         try check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &client, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "Configuring input PCM")
         var maximum: UInt32 = 4096
@@ -168,7 +193,10 @@ final class HardwareAudioCapture {
         guard let unit, let buffer, frames <= buffer.frameCapacity else { failed?(kAudioUnitErr_TooManyFramesToProcess); return kAudioUnitErr_TooManyFramesToProcess }
         buffer.frameLength = frames
         let status = AudioUnitRender(unit, flags, timestamp, 1, frames, buffer.mutableAudioBufferList)
-        if status == noErr { received?(buffer) } else { failed?(status) }
+        if status == noErr {
+            let host = timestamp.pointee.mFlags.contains(.hostTimeValid) ? timestamp.pointee.mHostTime : nil
+            received?(buffer, host)
+        } else { failed?(status) }
         return status
     }
     func start() throws { guard !running, let unit else { return }; try check(AudioOutputUnitStart(unit), "Starting audio input"); running = true }

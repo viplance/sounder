@@ -495,3 +495,93 @@ func runMultitrackRecordingTests() throws {
     try check(editor.undoStack.count == beforeLoop + 1 && editor.project.tracks.filter(\.recordArmed).allSatisfy { abs(($0.clips.last?.duration ?? 0) - 0.3) < 1e-8 },
               "Stopping loop capture writes all armed tracks as one take and one Undo action")
 }
+
+func runRecordingSynchronizationTests() throws {
+    func check(_ condition: Bool, _ message: String) throws {
+        guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderCaptureClock-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let outputDelay = 0.037, inputDelay = 0.023 // A simulated 60 ms round trip.
+    let reference = 100 + outputDelay
+    for rate in [44_100.0, 48_000, 96_000] {
+        for inputRate in [44_100.0, 48_000] {
+            for channels in [1, 2] {
+                let input = AVAudioFormat(standardFormatWithSampleRate: inputRate, channels: AVAudioChannelCount(channels))!
+                let format = ProjectAudioFormat(sampleRate: rate, bitDepth: 32)
+                let url = store.freshURL()
+                let writer = try RecordingWriter(url: url, format: format, inputFormat: input)
+                let clock = RecordingHostClock(); clock.set(hostTime: AVAudioTime.hostTime(forSeconds: reference))
+                writer.configureSynchronization(clock: clock, inputLatency: inputDelay)
+                let pre = Int((outputDelay * inputRate).rounded())
+                let pulse = pre + Int((0.12 * inputRate).rounded())
+                let total = pre + Int(0.4 * inputRate)
+                let firstPhysical = reference - Double(pre) / inputRate
+                for first in stride(from: 0, to: total, by: 257) {
+                    let count = min(257, total - first)
+                    let buffer = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(count))!
+                    buffer.frameLength = AVAudioFrameCount(count)
+                    for channel in 0..<channels { for frame in 0..<count {
+                        buffer.floatChannelData![channel][frame] = first + frame == pulse ? (channel == 0 ? 0.8 : -0.3) : 0
+                    } }
+                    // Deliberately unrelated to callback delivery/wall time.
+                    let stamp = firstPhysical + Double(first) / inputRate + inputDelay
+                    writer.append(buffer, hostTime: AVAudioTime.hostTime(forSeconds: stamp))
+                }
+                writer.waitForPendingWrites()
+                let preview = writer.consumeUpdate()
+                if let failure = writer.finish() { throw failure }
+                let data = try AudioStore.decode(url, sampleRate: rate)
+                let maximum = data.channels[0].indices.max { abs(data.channels[0][$0]) < abs(data.channels[0][$1]) }!
+                let expected = Int((Double(pulse - pre) * rate / inputRate).rounded())
+                try check(abs(maximum - expected) <= 3 && data.channels.count == channels,
+                          "60 ms interface delay aligns the pulse within resampling precision at \(Int(inputRate))→\(Int(rate)) Hz, \(channels) channel(s)")
+                let peakBucket = preview.channelPeaks[0].indices.max { preview.channelPeaks[0][$0] < preview.channelPeaks[0][$1] }!
+                try check(abs(peakBucket - maximum / 128) <= 1,
+                          "Live waveform and finalized compensated PCM use the same sample timeline")
+            }
+        }
+    }
+    let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+    let delayedURL = store.freshURL()
+    let delayed = try RecordingWriter(url: delayedURL, format: ProjectAudioFormat(bitDepth: 32), inputFormat: input)
+    let clock = RecordingHostClock(); clock.set(hostTime: AVAudioTime.hostTime(forSeconds: reference))
+    delayed.configureSynchronization(clock: clock, inputLatency: inputDelay)
+    let impulse = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: 4800)!
+    impulse.frameLength = 4800; impulse.floatChannelData![0].initialize(repeating: 0, count: 4800); impulse.floatChannelData![0][0] = 0.75
+    delayed.append(impulse, hostTime: AVAudioTime.hostTime(forSeconds: reference + inputDelay + 0.025))
+    if let failure = delayed.finish() { throw failure }
+    let padded = try AudioStore.decode(delayedURL, sampleRate: 48_000).channels[0]
+    try check(padded.prefix(1200).allSatisfy { $0 == 0 } && abs(padded[1200] - 0.75) < 1e-6,
+              "Late capture startup preserves the real gap instead of shifting recorded sound early")
+
+    let alignedURL = store.freshURL(), expectedURL = store.freshURL()
+    let aligned = try RecordingWriter(url: alignedURL, format: ProjectAudioFormat(bitDepth: 32), inputFormat: input)
+    let expected = try RecordingWriter(url: expectedURL, format: ProjectAudioFormat(bitDepth: 32), inputFormat: input)
+    try aligned.configureLoop(0.1..<0.3, start: 0); try expected.configureLoop(0.1..<0.3, start: 0)
+    aligned.configureSynchronization(clock: clock, inputLatency: inputDelay)
+    let pre = 1776, frames = 22_560
+    for first in stride(from: 0, to: pre + frames, by: 512) {
+        let count = min(512, pre + frames - first)
+        let buffer = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(count))!
+        buffer.frameLength = AVAudioFrameCount(count)
+        for frame in 0..<count {
+            let source = first + frame - pre
+            buffer.floatChannelData![0][frame] = source < 0 ? 0.99 : Float(sin(Double(source) * 0.031) * 0.4)
+        }
+        aligned.append(buffer, hostTime: AVAudioTime.hostTime(forSeconds: reference - Double(pre) / 48_000 + Double(first) / 48_000 + inputDelay))
+    }
+    for first in stride(from: 0, to: frames, by: 512) {
+        let count = min(512, frames - first)
+        let buffer = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(count))!
+        buffer.frameLength = AVAudioFrameCount(count)
+        for frame in 0..<count { buffer.floatChannelData![0][frame] = Float(sin(Double(first + frame) * 0.031) * 0.4) }
+        expected.append(buffer)
+    }
+    if let failure = aligned.finish() { throw failure }; if let failure = expected.finish() { throw failure }
+    let actual = try AudioStore.decode(alignedURL, sampleRate: 48_000)
+    let target = try AudioStore.decode(expectedURL, sampleRate: 48_000)
+    try check(actual.channels == target.channels && actual.frameCount == 14_400,
+              "Latency compensation precedes loop overwrites/crossfades and preserves the first-pass lead-in exactly")
+}
