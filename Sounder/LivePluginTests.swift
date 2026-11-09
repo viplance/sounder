@@ -273,3 +273,67 @@ func runLiveInstrumentTest(path: String, reverb: String? = nil) throws {
         try liveCheck(tail > 0.001, "Real reverb continues its existing tail with transport stopped")
     }
 }
+
+/// A paused node still owns its live processor while its queued fade is audible.
+/// Hold the offline device clock still to expose preparation races deterministically.
+func runLiveEffectsOwnershipTest(path: String) throws {
+    _ = NSApplication.shared; NSApp.setActivationPolicy(.accessory)
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderFXOwnership-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try AudioStore(directory: root), url = store.freshURL()
+    try store.write([Float](repeating: 0.1, count: 96_000), to: url)
+    let host = try SNPluginHost(path: path, classID: "", state: nil)
+    let effect = PluginEffect(name: host.pluginName, path: path, classID: host.classID)
+    let track = Track(name: "FX", clips: [Clip(name: "Tone", source: url.path, start: 0, duration: 2, order: 1)], effects: [effect])
+    let lock = NSLock(); var players: [LivePlayback] = []
+    let editor = Editor(store: store, makePlayback: { graph, format, start in
+        let playback = LivePlayback(graph: graph, format: format, start: start)
+        try playback.engine.enableManualRenderingMode(.offline, format: AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!, maximumFrameCount: 512)
+        lock.lock(); players.append(playback); lock.unlock()
+        return playback
+    })
+    editor.project = Project(tracks: [track], audioFormat: ProjectAudioFormat(bitDepth: 32))
+    editor.selectedTrack = track.id; editor.pluginHosts[effect.id] = host
+    editor.keepsPluginsRunning = true
+    defer {
+        editor.shutdownLivePlugins(); editor.stop()
+        lock.lock(); let all = players; lock.unlock(); all.forEach { $0.stop() }
+    }
+    func wait(_ condition: () -> Bool) throws {
+        let deadline = Date().addingTimeInterval(10)
+        while !condition(), Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+        guard condition() else { throw SounderError.message("FX ownership test timed out") }
+    }
+    try wait { editor.liveEffectsPlayer != nil }
+    editor.playPause(); try wait { editor.isPlaying }
+    guard let active = editor.player else { throw SounderError.message("Missing active transport") }
+    lock.lock(); let before = players.count; lock.unlock()
+    editor.playPause()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+    lock.lock(); let after = players.count; let running = players.filter { $0.engine.isRunning }.count; lock.unlock()
+    print("FX OWNERSHIP \(host.pluginName): engines before pause=\(before), after=\(after), running=\(running), latency=\(host.latency)")
+    try liveCheck(after == before && editor.liveEffectsPlayer == nil,
+                  "Pause fade never creates a second engine processing the same live FX host")
+    let buffer = AVAudioPCMBuffer(pcmFormat: active.engine.manualRenderingFormat, frameCapacity: 512)!
+    for _ in 0..<32 {
+        _ = try active.engine.renderOffline(512, to: buffer)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.003)); active.queue.sync {}
+        if active.pauseComplete { break }
+    }
+    try liveCheck(active.pauseComplete && active.isProcessingLiveEffects && editor.liveEffectsPlayer == nil,
+                  "Paused FX remain owned by the original transport after its audible fade")
+    editor.playPause()
+    try liveCheck(editor.player === active && editor.pluginHosts[effect.id] === host,
+                  "Resume retains one engine and one authoritative effect processor")
+    for _ in 0..<8 {
+        editor.stopAndReturnToStart()
+        editor.toggleAllEffects(for: track.id); editor.toggleAllEffects(for: track.id)
+        // Play as soon as ownership is published; the idle engine can still be
+        // starting on its worker, before the completion callback is delivered.
+        try wait { editor.liveEffectsPlayer != nil }
+        editor.playPause(); try wait { editor.isPlaying }
+        lock.lock(); let all = players; lock.unlock()
+        try liveCheck(all.filter { $0.engine.isRunning && $0.node.isPlaying }.count == 1,
+                      "Play during idle-FX startup leaves exactly one running audio producer")
+    }
+}

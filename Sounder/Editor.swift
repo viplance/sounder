@@ -142,7 +142,10 @@ final class Editor: NSObject {
         guard keepsPluginsRunning, !isPlaying, !isRecording, !isShuttling, !requestingMic,
               !isImporting, !isOpening, !isExporting, !isNormalizing,
               preparation == nil, preparationRequest == nil else { return }
-        if let pausedPlayer, pausedPlayer.isAuditioningEffects { startEffectsMeters(); return }
+        // Pause owns the processor even while its audible source fade is still
+        // queued. isAuditioningEffects becomes true only after that fade drains.
+        if pausedPlayer != nil { cancelEffectsPreparation(); startEffectsMeters(); return }
+        guard player == nil else { return }
         guard !project.activeEffects.isEmpty else { discardLiveEffects(); return }
         guard let key = try? mixCacheKey(), failedEffectsKey != key else { return }
         let config = LiveEffectsConfiguration(format: project.audioFormat, output: project.defaultOutput, buffer: project.playbackBufferSize)
@@ -168,7 +171,8 @@ final class Editor: NSObject {
                 let ready = processors
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.effectsJob === job, !job.isCancelled else { return }
-                    guard (try? self.mixCacheKey()) == key, !self.isPlaying, !self.isRecording, self.preparationRequest == nil,
+                    guard (try? self.mixCacheKey()) == key, self.player == nil, self.pausedPlayer == nil,
+                          !self.isRecording, self.preparation == nil, self.preparationRequest == nil,
                           !ready.contains(where: { id, host in self.pluginHosts[id].map { $0 !== host } ?? false }) else {
                         self.cancelEffectsPreparation(); self.scheduleLiveEffects(); return
                     }
@@ -178,27 +182,53 @@ final class Editor: NSObject {
                         self.liveEffectsKey = key; self.effectsJob = nil; self.effectsJobKey = nil; self.startEffectsMeters()
                         return
                     }
-                    let previous = self.liveEffectsPlayer, factory = self.makePlayback
-                    self.preparationQueue.async { [weak self] in
-                        var playback: LivePlayback?
+                    let previous = self.liveEffectsPlayer, factory = self.makePlayback, worker = self.preparationQueue
+                    worker.async { [weak self] in
                         do {
                             try job.check(); previous?.stop(); try job.check()
-                            let monitor = try factory(graph, snapshot.audioFormat, position); playback = monitor
-                            monitor.finished = { [weak self, weak monitor] failure in
-                                guard let self, let monitor, let failure, self.effectsJob === job else { return }
-                                self.cancelEffectsPreparation(); self.failedEffectsKey = key
-                                monitor.stop(); self.error(failure)
-                            }
+                            let monitor = try factory(graph, snapshot.audioFormat, position)
                             try monitor.configureBufferSize(snapshot.playbackBufferSize); try monitor.configureOutput(snapshot.defaultOutput)
-                            try job.check(); try monitor.startEffects(at: position, hosts: Array(ready.values), tempo: snapshot.tempo); try job.check()
+                            try job.check()
                             DispatchQueue.main.async { [weak self] in
-                                guard let self, self.effectsJob === job, !job.isCancelled else { DispatchQueue.global().async { monitor.stop() }; return }
-                                self.effectsJob = nil; self.effectsJobKey = nil
+                                guard let self, self.effectsJob === job, !job.isCancelled,
+                                      self.player == nil, self.pausedPlayer == nil, self.preparationRequest == nil else {
+                                    worker.async { monitor.stop() }; return
+                                }
+                                // Publish ownership BEFORE starting DSP. Play/Stop
+                                // can now cancel/join this engine even if its ready
+                                // callback has not yet reached the main thread.
                                 self.liveEffectsPlayer = monitor; self.liveEffectsKey = key; self.liveEffectsConfiguration = config
-                                self.watchLiveEffects(monitor, key: key)
+                                monitor.finished = { [weak self, weak monitor] failure in
+                                    guard let self, let monitor, let failure, self.effectsJob === job else { return }
+                                    self.cancelEffectsPreparation(); self.failedEffectsKey = key
+                                    if self.liveEffectsPlayer === monitor { self.liveEffectsPlayer = nil; self.liveEffectsKey = nil }
+                                    worker.async { monitor.stop() }; self.error(failure)
+                                }
+                                worker.async { [weak self] in
+                                    do {
+                                        try job.check()
+                                        try monitor.startEffects(at: position, hosts: Array(ready.values), tempo: snapshot.tempo)
+                                        try job.check()
+                                        DispatchQueue.main.async { [weak self] in
+                                            guard let self, self.effectsJob === job, !job.isCancelled,
+                                                  self.liveEffectsPlayer === monitor else {
+                                                worker.async { monitor.stop() }; return
+                                            }
+                                            self.effectsJob = nil; self.effectsJobKey = nil
+                                            self.watchLiveEffects(monitor, key: key)
+                                        }
+                                    } catch {
+                                        monitor.stop()
+                                        DispatchQueue.main.async { [weak self] in
+                                            guard let self, self.effectsJob === job else { return }
+                                            self.effectsJob = nil; self.effectsJobKey = nil
+                                            if self.liveEffectsPlayer === monitor { self.liveEffectsPlayer = nil; self.liveEffectsKey = nil }
+                                            if !job.isCancelled { self.failedEffectsKey = key; self.error(error) }
+                                        }
+                                    }
+                                }
                             }
                         } catch {
-                            playback?.stop()
                             DispatchQueue.main.async { [weak self] in
                                 guard let self, self.effectsJob === job else { return }
                                 self.effectsJob = nil; self.effectsJobKey = nil
