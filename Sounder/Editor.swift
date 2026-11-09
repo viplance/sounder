@@ -1351,7 +1351,7 @@ final class Editor: NSObject {
             if let target = saved.sources[source], source != target { recordedSourceCleanup[source] = target }
         }
         pendingRecordedSources.subtract(saved.sources.keys)
-        projectURL = url; dirty = false; update("Saved \(url.lastPathComponent)")
+        projectURL = url; dirty = false; notifications.show("Saved \(url.lastPathComponent)", style: .saved); update()
         preferences?.set(project.playbackBufferSize, forKey: Self.playbackBufferPreference)
         // Commit paths before removing temporary takes: saved media always survives a failure.
         for (source, target) in recordedSourceCleanup {

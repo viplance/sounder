@@ -3,7 +3,7 @@ import QuartzCore
 
 private let toastMovementDuration: TimeInterval = 0.2
 
-enum ToastStyle { case success, hint, error }
+enum ToastStyle { case success, saved, hint, error }
 enum UXHint: String {
     case nestTracks, selectFragments
 }
@@ -65,6 +65,7 @@ private final class ToastCard: NSView {
         wantsLayer = true; layer?.cornerRadius = 5
         switch message.style {
         case .success: layer?.backgroundColor = NSColor(calibratedRed: 0.12, green: 0.54, blue: 0.31, alpha: 0.8).cgColor
+        case .saved: layer?.backgroundColor = NSColor(calibratedRed: 0.15, green: 0.40, blue: 0.85, alpha: 0.8).cgColor
         case .hint: layer?.backgroundColor = NSColor(calibratedRed: 0.98, green: 0.76, blue: 0.18, alpha: 0.8).cgColor
         case .error: layer?.backgroundColor = NSColor(calibratedRed: 0.78, green: 0.17, blue: 0.20, alpha: 0.8).cgColor
         }
