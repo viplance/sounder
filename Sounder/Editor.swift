@@ -86,7 +86,10 @@ final class Editor: NSObject {
     private var liveEffectsConfiguration: LiveEffectsConfiguration?
     private var failedEffectsKey: Data?
     private var effectsMeterTimer: Timer?
-    var isMeteringAudio: Bool { isPlaying || isRecording || liveEffectsPlayer?.isProcessingLiveEffects == true || pausedPlayer?.isProcessingLiveEffects == true }
+    var isMeteringAudio: Bool {
+        isPlaying || isRecording || liveEffectsPlayer?.isAuditioningEffects == true ||
+            pausedPlayer.map { !$0.pauseComplete || $0.isAuditioningEffects } == true
+    }
     func shutdownLivePlugins() { keepsPluginsRunning = false }
     private func cancelEffectsPreparation() { effectsJob?.cancel(); effectsJob = nil; effectsJobKey = nil }
     private func discardLiveEffects() {
@@ -125,7 +128,9 @@ final class Editor: NSObject {
         let timer = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in
             guard let self, !self.isPlaying, !self.isRecording,
                   let monitor = self.liveEffectsPlayer ?? self.pausedPlayer, monitor.isProcessingLiveEffects else { return }
-            self.updateTrackMeters(monitor.consumeEffectsPeaks())
+            let peaks = monitor.consumeEffectsPeaks()
+            guard !peaks.isEmpty else { return } // No new output yet; retain the last real sample.
+            self.updateTrackMeters(peaks, effectsOnly: true)
             self.transportChanged?()
         }
         effectsMeterTimer = timer; RunLoop.main.add(timer, forMode: .common); RunLoop.main.add(timer, forMode: .modalPanel)
@@ -149,7 +154,7 @@ final class Editor: NSObject {
         guard !project.activeEffects.isEmpty else { discardLiveEffects(); return }
         guard let key = try? mixCacheKey(), failedEffectsKey != key else { return }
         let config = LiveEffectsConfiguration(format: project.audioFormat, output: project.defaultOutput, buffer: project.playbackBufferSize)
-        if liveEffectsKey == key, let liveEffectsPlayer, liveEffectsPlayer.isProcessingLiveEffects {
+        if liveEffectsKey == key, let liveEffectsPlayer, liveEffectsPlayer.isAuditioningEffects {
             liveEffectsPlayer.setEffectsPosition(cursor, tempo: project.tempo); return
         }
         guard effectsJobKey != key else { return }
@@ -906,21 +911,39 @@ final class Editor: NSObject {
         }
         return meter
     }
-    private func updateTrackMeters(_ peaks: [UUID: StereoLevels], at time: Double = ProcessInfo.processInfo.systemUptime) {
+    private func updateTrackMeters(_ peaks: [UUID: StereoLevels], at time: Double = ProcessInfo.processInfo.systemUptime, effectsOnly: Bool = false) {
         let ids = Set(project.tracks.map(\.id)).union([Project.masterID])
         trackMeters = trackMeters.filter { ids.contains($0.key) }
         for id in ids {
             var meter = trackMeters[id] ?? StereoTrackLevelMeter()
             meter.update(peaks[id] ?? StereoLevels(), at: time); trackMeters[id] = meter
+            if effectsOnly {
+                // Idle DSP already contains the real tails. A meter release
+                // must not invent a tail for a silent dry bus or a finished FX.
+                trackMeters[id]?.left.level = Double(peaks[id]?.left ?? 0)
+                trackMeters[id]?.right.level = Double(peaks[id]?.right ?? 0)
+            }
         }
     }
+    private var effectMeterTracks: Set<UUID> {
+        let tracks = project.processingTracks
+        let parents = Dictionary(uniqueKeysWithValues: tracks.compactMap { track in track.parent.map { (track.id, $0) } })
+        var ids = Set<UUID>()
+        for track in tracks where track.effects.contains(where: { !$0.bypassed }) {
+            var current: UUID? = track.id
+            while let id = current, ids.insert(id).inserted { current = parents[id] }
+        }
+        return ids
+    }
     private var meterStopRevision: UInt64 = 0
-    private func stopTrackMeters() {
+    private func stopTrackMeters(preserving ids: Set<UUID> = []) {
         meterStopRevision &+= 1
         let revision = meterStopRevision
-        for id in Array(trackMeters.keys) { trackMeters[id]?.clearLevels() }
+        for id in Array(trackMeters.keys) where !ids.contains(id) { trackMeters[id]?.clearLevels() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, !self.isPlaying, !self.isRecording, self.meterStopRevision == revision else { return }
+            // Expire held readouts without disturbing a live DSP handoff.
+            guard self.liveEffectsPlayer == nil, self.pausedPlayer?.isAuditioningEffects != true else { return }
             self.updateTrackMeters([:])
             if let notify = self.transportChanged { notify() } else { self.changed?() }
         }
@@ -948,6 +971,7 @@ final class Editor: NSObject {
             }
         } else if let shuttle { cursor = shuttle.currentTime }
         else if followsPausedCursor, let pausedPlayer {
+            if !pausedPlayer.pauseComplete { updateTrackMeters(pausedPlayer.consumeTrackPeaks(at: pausedPlayer.currentTime)) }
             if pausedCursorIsCurrent { cursor = pausedPlayer.currentTime; pausedCursorSnapshot = cursor }
             else { followsPausedCursor = false; timer?.invalidate(); timer = nil }
         }
@@ -1116,7 +1140,7 @@ final class Editor: NSObject {
             playback.auditionEffects(at: stoppedPosition, hosts: project.activeEffects.compactMap { pluginHosts[$0.id] }, tempo: project.tempo)
             if let key = liveEffectsKey { watchLiveEffects(playback, key: key) }
         } else { playback.stop() }
-        stopTrackMeters()
+        stopTrackMeters(preserving: liveEffectsPlayer === playback ? effectMeterTracks : [])
         cursor = stoppedPosition
     }
     func seek(to position: Double) {
@@ -1163,10 +1187,12 @@ final class Editor: NSObject {
                 pausedMixKey = try mixCacheKey(); pausedPlayer = playback; player = nil
                 followsPausedCursor = true; cursor = playback.currentTime; pausedCursorSnapshot = cursor
                 playback.didPause = { [weak self, weak playback] position in
-                    guard let self, let playback, self.pausedPlayer === playback, self.pausedCursorIsCurrent else { return }
+                    guard let self, let playback, self.pausedPlayer === playback else { return }
+                    self.stopTrackMeters(preserving: playback.isAuditioningEffects ? self.effectMeterTracks : [])
+                    guard self.pausedCursorIsCurrent else { self.update(); return }
                     self.cursor = position; self.pausedCursorSnapshot = position; self.timer?.invalidate(); self.timer = nil; self.update()
                 }
-                stopTrackMeters(); update()
+                update()
             } catch { stopPlayback(); self.error(error) }
             return
         }
@@ -1539,7 +1565,9 @@ final class Editor: NSObject {
             }
             for error in errors { self.error(error) }
         }
-        clearRecordingState(); stopTrackMeters(); update()
+        clearRecordingState()
+        stopTrackMeters(preserving: liveEffectsPlayer != nil ? effectMeterTracks : [])
+        update()
     }
     func split() {
         guard !busy else { return }

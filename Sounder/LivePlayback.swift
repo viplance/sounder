@@ -425,6 +425,7 @@ final class LivePlayback {
     private var effectsOnly = false
     private var effectHosts: [SNPluginHost] = []
     private var auditionRequested = false
+    private var effectsMetersReady = false
     private var auditionPosition = 0.0
     var continuesEffectsWhenPaused = false
     var isAuditioningEffects: Bool { transportLock.lock(); defer { transportLock.unlock() }; return auditionRequested }
@@ -1043,6 +1044,7 @@ final class LivePlayback {
     func setTrackMix(_ track: Track) { queue.async { self.graph.setTrackMix(track) } }
     func configureLiveHosts(_ hosts: [SNPluginHost]) { queue.async { [self] in effectHosts = hosts } }
     private func configureEffects(position: Double, hosts: [SNPluginHost], tempo: Double) throws {
+        meterBuffer.clear()
         effectsOnly = true; effectHosts = hosts
         graph.clearRoutingDelays()
         pausing = false; resumeRequested = false; metronomeEnabled = false; shuttleRenderer = nil
@@ -1053,9 +1055,10 @@ final class LivePlayback {
         for host in hosts { host.setTransportPlaying(false, position: Int64((position * format.sampleRate).rounded()), tempo: tempo) }
         let pcm = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
         for _ in 0..<bufferBlockCount { try enqueue(format: pcm) }
+        transportLock.lock(); effectsMetersReady = true; transportLock.unlock()
     }
     func auditionEffects(at position: Double, hosts: [SNPluginHost], tempo: Double) {
-        transportLock.lock(); auditionRequested = true; auditionPosition = position; transportLock.unlock()
+        transportLock.lock(); auditionRequested = true; auditionPosition = position; effectsMetersReady = false; transportLock.unlock()
         cancelReturn()
         // Flush already scheduled timeline PCM now, without waiting behind a
         // heavy plug-in block. Keep the hardware engine and processors alive.
@@ -1090,6 +1093,8 @@ final class LivePlayback {
         }
     }
     func consumeEffectsPeaks() -> [UUID: StereoLevels] {
+        transportLock.lock(); let ready = effectsMetersReady; transportLock.unlock()
+        guard ready, node.isPlaying else { return [:] }
         guard let stamp = node.lastRenderTime, stamp.isSampleTimeValid || stamp.isHostTimeValid,
               let played = node.playerTime(forNodeTime: stamp), played.isSampleTimeValid, played.sampleRate > 0 else { return [:] }
         return meterBuffer.consume(through: Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded()))

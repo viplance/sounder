@@ -21,7 +21,8 @@ func runLiveEffectsTests() throws {
     try store.write(AudioSignal(channels: [Array(repeating: 0.1, count: 96_000), Array(repeating: 0.1, count: 96_000)]), to: url)
     let effect = PluginEffect(name: "Tail", path: "test", classID: "tail")
     let track = Track(name: "Tail", clips: [Clip(name: "Dry", source: url.path, start: 0, duration: 2, order: 1)], effects: [effect])
-    let project = Project(tracks: [track], audioFormat: format)
+    let dry = Track(name: "Dry only", clips: [Clip(name: "Dry", source: url.path, start: 0, duration: 2, order: 1)])
+    let project = Project(tracks: [track, dry], audioFormat: format)
     var state: Float = 0
     let graph = try StreamingGraph(project: project, store: store) { _ in
         StreamingEffect(latency: 0, tail: 48_000) { samples in
@@ -45,18 +46,55 @@ func runLiveEffectsTests() throws {
         return (0..<512).map { abs(buffer.floatChannelData![0][$0]) }.max() ?? 0
     }
     for _ in 0..<8 { _ = try block() }
-    live.auditionEffects(at: 0.25, hosts: [], tempo: 120); live.queue.sync {}
+    let editor = Editor(store: store)
+    live.continuesEffectsWhenPaused = true
+    editor.project = project; editor.player = live; editor.keepsPluginsRunning = true
+    defer { editor.shutdownLivePlugins() }
+    editor.updateTransportPosition()
+    for _ in 0..<2 {
+        let level = editor.trackMeters[track.id]?.level ?? 0
+        editor.playPause()
+        try liveCheck(level > 0 && editor.trackMeters[track.id]?.level == level && editor.isMeteringAudio,
+                      "Pause keeps meters visible while the queued audio fade is still playing")
+        for _ in 0..<20 { if live.pauseComplete { break }; _ = try block() }
+        for _ in 0..<24 { _ = try block() }
+        try liveCheck(live.pauseComplete && (editor.trackMeters[track.id]?.level ?? 0) > 0 && editor.trackMeters[dry.id]?.level == 0,
+                      "Paused meters retain real FX tails and clear the dry-only bus")
+        editor.playPause()
+        for _ in 0..<8 { _ = try block() }
+        editor.updateTransportPosition()
+    }
+    let beforeStop = editor.trackMeters[track.id]?.level ?? 0, stoppedAt = live.currentTime
+    live.queue.suspend()
+    editor.stop()
+    let retained = editor.trackMeters[track.id]?.level ?? 0
+    let dryStopped = editor.trackMeters[dry.id]?.level == 0
+    let activeDuringHandoff = editor.isMeteringAudio
+    let obsolete = live.consumeEffectsPeaks()
+    live.queue.resume(); live.queue.sync {}
+    try liveCheck(beforeStop > 0 && retained == beforeStop && dryStopped && activeDuringHandoff && obsolete.isEmpty,
+                  "Stop preserves FX meters without blinking during the worker handoff, clears dry buses and rejects old timeline peaks")
     let position = graph.position, cachedFrames = graph.outputCache.frames
     var tail: Float = 0
     for index in 0..<24 { let peak = try block(); if index > 8 { tail = max(tail, peak) } }
     try liveCheck(tail > 0.001 && live.engine.isRunning && live.node.isPlaying && !live.isPlaying,
                   "Stop retains the running engine/node and audible effect tails after queued source buffers finish")
-    try liveCheck(live.currentTime == 0.25 && graph.position <= position + 480 && graph.outputCache.frames == cachedFrames,
+    try liveCheck(live.currentTime == stoppedAt && graph.position <= position + 480 && graph.outputCache.frames == cachedFrames,
                   "Effects keep processing silence without advancing the stopped timeline")
+    try liveCheck((editor.trackMeters[track.id]?.level ?? 0) > 0 && editor.trackMeters[dry.id]?.level == 0,
+                  "Idle meters show the real effect tail without reviving the dry-only track")
     live.setMuted(true, trackID: track.id)
     var muted: Float = 1
     for _ in 0..<12 { muted = try block() }
     try liveCheck(muted == 0, "Track MUTE silences live effects while stopped")
+    // The offline engine must keep advancing while the 25 Hz meter poll
+    // drains its last mixed peak window and observes the following silence.
+    for _ in 0..<32 {
+        if editor.trackMeters[track.id]?.level == 0 && editor.trackMeters[Project.masterID]?.level == 0 { break }
+        _ = try block()
+    }
+    try liveCheck(editor.trackMeters[track.id]?.level == 0 && editor.trackMeters[Project.masterID]?.level == 0,
+                  "Silent idle output clears the meters without an artificial release tail")
     // An idle graph must not decode even an unavailable source file.
     var missing = project; missing.tracks[0].clips[0].source = directory.appendingPathComponent("missing.wav").path
     let idle = try StreamingGraph(project: missing, store: store, includeAudioSources: false) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }
