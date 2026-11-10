@@ -237,6 +237,7 @@ func runAudioTests() throws {
     try runTransportPositionTests()
     try runPauseContinuityTests()
     try runLiveEffectsTests()
+    try runStopBufferTests()
     try runTempoTests()
     try runTrackSoloTests()
     try runFragmentSettingsTests()

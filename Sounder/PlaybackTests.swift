@@ -1224,6 +1224,80 @@ func runPauseContinuityTests() throws {
     }
     try check(live.isPlaying && live.engine === engine && longestSilence <= 2 && jump < 0.001,
               "Rapid Space pause/resume joins fades without a gap or obsolete pause callback (silence: \(longestSilence), jump: \(jump))")
+    try runPausedEffectsLatencyTests()
+}
+
+private func runPausedEffectsLatencyTests() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderResumeLatency-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory), url = store.freshURL()
+    let format = ProjectAudioFormat(bitDepth: 32)
+    let samples = (0..<192_000).map { Float(0.1 + Double($0) / 960_000) }
+    try store.write(AudioSignal(channels: [samples, samples.map { -$0 * 0.5 }]), to: url)
+    // Exercise an actual delayed processor, its parent's dry compensation and
+    // an independent root. Short latency also tests a fade crossing pre-roll.
+    for latency in [37, 7200] {
+        let clip = Clip(name: "Ramp", source: url.path, start: 0, duration: 4, order: 1)
+        let parent = Track(name: "Parent", clips: [clip])
+        let child = Track(name: "Delayed child", parent: parent.id, clips: [clip],
+                          effects: [PluginEffect(name: "Delay", path: "test", classID: "delay")])
+        let project = Project(tracks: [parent, child, Track(name: "Parallel", clips: [clip])], audioFormat: format)
+        var instances = 0
+        let graph = try StreamingGraph(project: project, store: store) { _ in
+            instances += 1
+            var delay = [Float](repeating: 0, count: latency * 2), offset = 0
+            return StreamingEffect(latency: latency, tail: 0) { input in
+                var output = input
+                for i in input.indices {
+                    output[i] = delay[offset]; delay[offset] = input[i]
+                    offset = (offset + 1) % delay.count
+                }
+                return output
+            }
+        }
+        let live = LivePlayback(graph: graph, format: format, start: 0.25)
+        live.continuesEffectsWhenPaused = true
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+        try live.startPlayback()
+        defer { live.stop() }
+        func block() throws -> [[Float]] {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.002)); live.queue.sync {}
+            guard try live.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render resumed FX") }
+            return (0..<2).map { Array(UnsafeBufferPointer(start: buffer.floatChannelData![$0], count: 512)) }
+        }
+        for _ in 0..<8 { _ = try block() }
+        let engine = live.engine, node = live.node
+        for target in [Double?.none, 1.5] {
+            try live.pause()
+            for _ in 0..<20 { if live.pauseComplete { break }; _ = try block() }
+            guard live.pauseComplete else { throw SounderError.message("Latency test did not pause") }
+            // Let silence fully replace both processor and compensation state.
+            for _ in 0..<24 { _ = try block() }
+            let start = target ?? live.pausePosition
+            try live.resume(to: start)
+            var sourceFrame = 1, heardSource = false, maximum = 0.0
+            for _ in 0..<24 {
+                let output = try block()
+                for i in 0..<512 {
+                    if !heardSource && abs(output[0][i]) > 1e-8 { heardSource = true }
+                    guard heardSource else { continue }
+                    let gain = Float(min(1, Double(sourceFrame) / 479))
+                    let expected = samples[Int((start * 48_000).rounded()) + sourceFrame] * 3 * gain
+                    maximum = max(maximum, abs(Double(output[0][i] - expected)), abs(Double(output[1][i] + expected * 0.5)))
+                    sourceFrame += 1
+                }
+                if live.currentTime - start >= 1024.0 / 48_000 && !heardSource {
+                    throw SounderError.message("Cursor advances through silent FX latency on resume (\(latency) frames)")
+                }
+            }
+            guard heardSource, maximum < 1e-6, instances == 1, live.engine === engine, live.node === node, live.graph === graph else {
+                throw SounderError.message("Resume loses source frames, fade or live FX state (latency \(latency), error \(maximum))")
+            }
+            print("PASS: Resume after idle FX/paused seek preserves exact stereo samples, 10 ms fade and processors with \(latency)-frame latency (error: \(maximum))")
+        }
+    }
 }
 
 func runLoopPlaybackTests() throws {

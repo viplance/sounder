@@ -1376,6 +1376,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 if CommandLine.arguments.contains("--microphone-test") {
     do { try runMicrophoneSmokeTest(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
+if CommandLine.arguments.contains("--stop-buffer-test") {
+    do { setbuf(stdout, nil); try runStopBufferTests(); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
 if let index = CommandLine.arguments.firstIndex(of: "--fx-clipboard-test"), index + 1 < CommandLine.arguments.count {
     do { setbuf(stdout, nil); try runEffectsClipboardTest(path: CommandLine.arguments[index + 1]); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }

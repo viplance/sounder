@@ -510,3 +510,70 @@ func runEffectsClipboardTest(path: String) throws {
     board.clearContents(); board.setString("Unrelated text", forType: .string)
     try liveCheck(!master.canPasteEffects && !master.pasteSelection(), "FX Paste ignores unrelated clipboard formats")
 }
+
+func runStopBufferTests() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderStopQueue-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try AudioStore(directory: root), source = store.freshURL()
+    try store.write([Float](repeating: 0.2, count: 96_000), to: source)
+    let format = ProjectAudioFormat(bitDepth: 32)
+    let dry = Track(name: "Dry", clips: [Clip(name: "Continuous tone", source: source.path, start: 0, duration: 2, order: 1)])
+    let latent = Track(name: "Silent latency bus", effects: [PluginEffect(name: "50 ms latency", path: "test", classID: "latency")])
+    let project = Project(tracks: [dry, latent], audioFormat: format)
+    for (capacity, pausing) in [1024, 4096, 32768].flatMap({ [($0, false), ($0, true)] }) {
+        let action = pausing ? "Pause" : "Stop"
+        let graph = try StreamingGraph(project: project, store: store) { _ in
+            StreamingEffect(latency: 2400, tail: 0) { [Float](repeating: 0, count: $0.count) }
+        }
+        let live = LivePlayback(graph: graph, format: format, start: 0)
+        try live.configureBufferSize(capacity)
+        live.continuesEffectsWhenPaused = pausing
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
+        try live.startPlayback()
+        defer { live.stop() }
+        func block() throws -> [Float] {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.002)); live.queue.sync {}
+            guard try live.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render Stop regression") }
+            return (0..<512).map { buffer.floatChannelData![0][$0] }
+        }
+        var level: Float = 0
+        for _ in 0..<8 { level = max(level, try block().map(abs).max() ?? 0) }
+        try liveCheck(level > 0.15, "Stop fixture plays real dry audio through 50 ms parallel-bus compensation (queue \(capacity))")
+        let engine = live.engine
+        var frozen = 0.25
+        if pausing {
+            try live.pause()
+            for _ in 0..<100 {
+                if live.pauseComplete { break }
+                _ = try block()
+            }
+            try liveCheck(live.pauseComplete, "Pause reaches its audible boundary (queue \(capacity))")
+            frozen = live.pausePosition
+        } else { live.auditionEffects(at: frozen, hosts: [], tempo: 120); live.queue.sync {} }
+        var lastDryFrame = -1
+        for index in 0..<20 {
+            for (frame, sample) in try block().enumerated() where abs(sample) > 0.001 { lastDryFrame = index * 512 + frame }
+        }
+        try liveCheck(lastDryFrame < 512,
+                      "\(action) drops queued/PDC dry audio without a delayed replay (queue \(capacity), last dry frame \(lastDryFrame))")
+        try liveCheck(live.engine === engine && live.engine.isRunning && live.node.isPlaying && live.currentTime == frozen,
+                      "\(action) retains live FX on the same engine with a frozen timeline")
+        if pausing {
+            try live.resume(to: frozen)
+            var checked = false
+            for _ in 0..<(capacity / 512 + 32) {
+                let output = try block()
+                let elapsed = live.currentTime - frozen
+                if elapsed >= 1024.0 / 48_000 && !checked {
+                    try liveCheck((output.map(abs).max() ?? 0) > 0.19,
+                                  "Resume restores compensated dry audio as soon as the cursor advances (queue \(capacity), elapsed \(elapsed))")
+                    checked = true
+                }
+            }
+            try liveCheck(checked && live.engine === engine && live.isPlaying,
+                          "Resume retains the live engine and reaches timeline output (queue \(capacity))")
+        }
+    }
+}

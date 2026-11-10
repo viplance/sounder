@@ -330,11 +330,23 @@ final class StreamingGraph {
     // Seeking is a discontinuity in source time, not in the output clock.
     // Keep live processors (including their tails), but flush routing delays.
     // Only the declared latency needs pre-roll; never replay project history.
-    func seek(to frame: Int) throws {
+    func seek(to frame: Int, fadeInFrames: Int? = nil) throws {
         position = max(0, frame)
-        roots.forEach { $0.resetDelays() }; delays.forEach { $0.reset() }
+        clearRoutingDelays()
         let target = position + latency
-        while position < target { _ = try render(frames: min(512, target - position)) }
+        while position < target {
+            let count = min(512, target - position)
+            if let fadeInFrames {
+                // Prime the returning source, including its fade, before its
+                // first audible sample. Keep transient fade PCM out of cache.
+                _ = try renderEffects(frames: count, sourceFadeLength: fadeInFrames, sourceFadeInFrame: position - frame)
+            } else { _ = try render(frames: count) }
+        }
+    }
+    // Routing queues contain timeline PCM, not plug-in state. Clear them at
+    // Stop/Pause so latency compensation cannot replay old dry audio later.
+    func clearRoutingDelays() {
+        roots.forEach { $0.resetDelays() }; delays.forEach { $0.reset() }
     }
     var hasEffects: Bool { needsHistory }
     /// Same ordered buses and latency compensation, but no timeline/cache work.
@@ -411,8 +423,6 @@ final class LivePlayback {
     private let meterBuffer = PlaybackMeterBuffer()
     private var running = false
     private var effectsOnly = false
-    private var effectsFadeRemaining = 0
-    private var effectsFadeLength = 1
     private var effectHosts: [SNPluginHost] = []
     private var auditionRequested = false
     private var auditionPosition = 0.0
@@ -425,6 +435,7 @@ final class LivePlayback {
     private var pauseFadeFrames = 0
     private var pauseFadeFrame = 0
     private var resumeFadeFrame: Int?
+    private var resumeSourcePrerollFrames = 0
     private var resumeRequested = false
     private(set) var isPaused = false
     private(set) var pauseComplete = false
@@ -628,14 +639,14 @@ final class LivePlayback {
                 transportLock.lock(); auditionRequested = false
                 transportMotions = [(lastKnownFrame, stationary)]; transportLock.unlock()
                 for host in effectHosts { host.setTransportPlaying(true, position: Int64(frame), tempo: tempo) }
-                try resumeAtQueuedBoundary(at: frame)
+                try resumeAtQueuedBoundary(at: frame, restoringTimeline: true)
             } else if pausing { try resumeAtQueuedBoundary(at: frame) }
             else { try restartPausedNode(at: frame) }
         }
     }
     private func finishPause() throws {
         if continuesEffectsWhenPaused && graph.hasEffects {
-            try configureEffects(position: pausePosition, hosts: effectHosts, tempo: tempo, fadeSource: false)
+            try configureEffects(position: pausePosition, hosts: effectHosts, tempo: tempo)
         } else { node.pause(); running = false }
         pausing = false; pauseComplete = true
         let position = pausePosition, generation = streamGeneration
@@ -644,13 +655,19 @@ final class LivePlayback {
             self.didPause?(position)
         }
     }
-    private func resumeAtQueuedBoundary(at frame: Int) throws {
+    private func resumeAtQueuedBoundary(at frame: Int, restoringTimeline: Bool = false) throws {
         // A quick second Space can arrive before the fade-out is audible.
         // Queue the fade-in immediately after it; do not wait for presentation
         // and restart the node, which would introduce a gap or lose the seek.
         bufferFill.reset()
         streamGeneration += 1; scheduled = 0; pausing = false; pauseComplete = false
-        if shuttleRenderer != nil || graph.position != frame + graph.latency { try graph.seek(to: frame) }
+        // Idle FX have consumed silence even when graph.position still matches
+        // the paused cursor. Refill plug-in and routing latency before exposing
+        // timeline motion, just as a live seek does, without resetting hosts.
+        resumeSourcePrerollFrames = restoringTimeline ? graph.latency : 0
+        if restoringTimeline {
+            try graph.seek(to: frame, fadeInFrames: Int(format.sampleRate * 0.010))
+        } else if shuttleRenderer != nil || graph.position != frame + graph.latency { try graph.seek(to: frame) }
         shuttleRenderer = nil; renderingNormal = true; nextFrame = frame
         resetLoopPosition(frame)
         seekFade = []; seekFadeFrame = 0; resumeFadeFrame = 0; meterBuffer.clear()
@@ -680,7 +697,7 @@ final class LivePlayback {
         transportLock.lock()
         firstFrame = frame; lastKnownFrame = 0; renderedOutputFrames = 0; transportMotions = []; seekRequest = nil
         transportLock.unlock()
-        seekFade = []; seekFadeFrame = 0; resumeFadeFrame = 0
+        seekFade = []; seekFadeFrame = 0; resumeFadeFrame = 0; resumeSourcePrerollFrames = 0
         meterBuffer.clear(); running = true
         let pcm = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
         for _ in 0..<bufferBlockCount { try enqueue(format: pcm) }
@@ -837,10 +854,12 @@ final class LivePlayback {
     }
     private func enqueue(format pcmFormat: AVAudioFormat, bridgeFrames: Int? = nil) throws {
         guard running else { return }
+        // Stop closes the source immediately, before this worker has finished
+        // its current DSP block. Old consumption callbacks must not refill it.
+        guard effectsOnly || !isAuditioningEffects else { return }
         if effectsOnly {
             let count = bufferBlocks[bufferBlockIndex]; bufferBlockIndex = (bufferBlockIndex + 1) % bufferBlocks.count
-            let values = try graph.renderEffects(frames: count, sourceFadeRemaining: effectsFadeRemaining, sourceFadeLength: effectsFadeLength)
-            effectsFadeRemaining = max(0, effectsFadeRemaining - count)
+            let values = try graph.renderEffects(frames: count)
             let buffer = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(count))!
             buffer.frameLength = AVAudioFrameCount(count)
             let scale: Float = format.bitDepth == 16 ? 32768 : 8388608
@@ -912,7 +931,7 @@ final class LivePlayback {
                     sourceFadeRemaining: pauseFadeFrames - pauseFadeFrame - positions.count, sourceFadeLength: pauseFadeFrames))
             } else if let first = resumeFadeFrame, continuesEffectsWhenPaused && graph.hasEffects {
                 samples.append(contentsOf: try graph.renderEffects(frames: count,
-                    sourceFadeLength: Int(format.sampleRate * 0.010), sourceFadeInFrame: first + positions.count))
+                    sourceFadeLength: Int(format.sampleRate * 0.010), sourceFadeInFrame: resumeSourcePrerollFrames + first + positions.count))
             } else { samples.append(contentsOf: try graph.render(frames: count)) }
             if let loop {
                 let fade = Double(max(1, min(Int(format.sampleRate * 0.010), loop.count / 2)))
@@ -1023,10 +1042,9 @@ final class LivePlayback {
     func setSolo(_ ids: Set<UUID>) { queue.async { self.graph.setSolo(ids) } }
     func setTrackMix(_ track: Track) { queue.async { self.graph.setTrackMix(track) } }
     func configureLiveHosts(_ hosts: [SNPluginHost]) { queue.async { [self] in effectHosts = hosts } }
-    private func configureEffects(position: Double, hosts: [SNPluginHost], tempo: Double, fadeSource: Bool) throws {
+    private func configureEffects(position: Double, hosts: [SNPluginHost], tempo: Double) throws {
         effectsOnly = true; effectHosts = hosts
-        effectsFadeLength = max(1, Int(format.sampleRate * 0.010))
-        effectsFadeRemaining = fadeSource ? effectsFadeLength : 0
+        graph.clearRoutingDelays()
         pausing = false; resumeRequested = false; metronomeEnabled = false; shuttleRenderer = nil
         running = true; streamGeneration += 1; scheduled = 0; bufferFill.reset()
         let stationary = ShuttleMotion(start: position, direction: 1, end: Double(Int.max / 4) / format.sampleRate, initialSpeed: 0, target: 0)
@@ -1038,14 +1056,24 @@ final class LivePlayback {
     }
     func auditionEffects(at position: Double, hosts: [SNPluginHost], tempo: Double) {
         transportLock.lock(); auditionRequested = true; auditionPosition = position; transportLock.unlock()
+        cancelReturn()
+        // Flush already scheduled timeline PCM now, without waiting behind a
+        // heavy plug-in block. Keep the hardware engine and processors alive.
+        node.stop()
         queue.async { [self] in
-            do { try configureEffects(position: position, hosts: hosts, tempo: tempo, fadeSource: true) }
-            catch { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(error) } }
+            do {
+                // An in-flight block may have scheduled once after the first
+                // flush. The stopped node cannot play it; discard it here too.
+                node.stop(); outputFrames = 0; meterBuffer.clear()
+                transportLock.lock(); lastKnownFrame = 0; renderedOutputFrames = 0; transportMotions = []; transportLock.unlock()
+                try configureEffects(position: position, hosts: hosts, tempo: tempo)
+                node.play()
+            } catch { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(error) } }
         }
     }
     /// Called only by the preparation worker, with private/new graph ownership.
     func startEffects(at position: Double, hosts: [SNPluginHost], tempo: Double) throws {
-        try queue.sync { try configureEffects(position: position, hosts: hosts, tempo: tempo, fadeSource: false) }
+        try queue.sync { try configureEffects(position: position, hosts: hosts, tempo: tempo) }
         engine.prepare(); try engine.start(); node.play()
     }
     func replaceEffectsGraph(_ graph: StreamingGraph, at position: Double, hosts: [SNPluginHost], tempo: Double) {
