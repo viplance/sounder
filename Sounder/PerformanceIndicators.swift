@@ -19,6 +19,21 @@ struct ProcessCPUSampler {
     }
 }
 
+/// Average the last second of UI observations, at most eight samples per second.
+struct BufferFillAverage {
+    static let sampleInterval = 1.0 / 8
+    private var samples: [(time: Double, value: Double)] = []
+    mutating func sample(_ value: Double, at time: Double) -> Double {
+        samples.removeAll { $0.time <= time - 1 || $0.time > time }
+        let value = min(100, max(0, value))
+        // Extra editor refreshes must not give one instant extra weight.
+        if let last = samples.last, time - last.time < Self.sampleInterval {
+            samples[samples.count - 1].value = value
+        } else { samples.append((time, value)) }
+        return samples.reduce(0) { $0 + $1.value } / Double(samples.count)
+    }
+}
+
 /// Disabled here means read-only transport status, not a dimmed value.
 private final class BufferValueCell: NSButtonCell {
     override func drawTitle(_ title: NSAttributedString, withFrame frame: NSRect, in controlView: NSView) -> NSRect {
@@ -33,11 +48,14 @@ final class PerformanceIndicators: NSStackView {
     let cpu = NSTextField(labelWithString: "0%")
     let buffer = PointerButton(title: "0%", target: nil, action: nil)
     var bufferValue: (() -> Double)?
+    var bufferAverageSource: (() -> AudioBufferFill?)?
     var bufferDescription: (() -> String)?
     var idleBufferText: (() -> String?)?
     var editBuffer: (() -> Void)?
     private var cpuSampleTime = -Double.infinity
     private var sampler = ProcessCPUSampler()
+    private var bufferAverage = BufferFillAverage()
+    private weak var averagedBuffer: AudioBufferFill?
     private var timer: Timer?
     init() {
         super.init(frame: .zero)
@@ -66,7 +84,7 @@ final class PerformanceIndicators: NSStackView {
         super.viewDidMoveToWindow(); timer?.invalidate(); timer = nil
         guard window != nil else { return }
         _ = sampler.sample()
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: BufferFillAverage.sampleInterval, repeats: true) { [weak self] _ in
             guard let self, let window = self.window, window.isVisible, !window.isMiniaturized, window.occlusionState.contains(.visible) else { return }
             self.refresh()
         }
@@ -79,7 +97,13 @@ final class PerformanceIndicators: NSStackView {
             if cpu.stringValue != cpuText { cpu.stringValue = cpuText }
             cpuSampleTime = now
         }
-        let value = max(0, min(100, bufferValue?() ?? 0))
+        let source = bufferAverageSource?()
+        if source !== averagedBuffer || source == nil {
+            bufferAverage = BufferFillAverage(); averagedBuffer = source
+        }
+        let value: Double
+        if let source { value = bufferAverage.sample(source.percent, at: now) }
+        else { value = max(0, min(100, bufferValue?() ?? 0)) }
         let idle = idleBufferText?()
         let bufferText = idle ?? "\(Int(value))%"
         let description = idle != nil ? "Edit playback buffer size" : (bufferDescription?() ?? "Prepared audio in the playback queue")

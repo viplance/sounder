@@ -558,6 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         toolbar.addArrangedSubview(section("VIEW", [button("Zoom out", "minus.magnifyingglass", #selector(zoomOut)), button("Zoom in", "plus.magnifyingglass", #selector(zoomIn))]))
         let spacer2 = NSView(); spacer2.setContentHuggingPriority(.defaultLow, for: .horizontal); toolbar.addArrangedSubview(spacer2)
         performanceIndicators.bufferValue = { [weak self] in self?.editor.bufferPercent ?? 0 }
+        performanceIndicators.bufferAverageSource = { [weak self] in self?.editor.player?.bufferFill ?? self?.editor.shuttle?.bufferFill }
         performanceIndicators.bufferDescription = { [weak self] in self?.editor.bufferDescription ?? "" }
         performanceIndicators.idleBufferText = { [weak self] in
             guard let self, self.editor.canEditPlaybackBuffer else { return nil }

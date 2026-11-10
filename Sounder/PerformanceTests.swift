@@ -181,6 +181,12 @@ func runPerformanceTests() throws {
                   "CPU is normalized to all \(cores) logical CPUs and stays within 0–100%")
     }
     let fill = AudioBufferFill()
+    var average = BufferFillAverage()
+    try check(average.sample(100, at: 0) == 100 && average.sample(0, at: 0.25) == 50 &&
+              average.sample(50, at: 0.5) == 50 && average.sample(50, at: 1) == 100.0 / 3,
+              "BUFFER averages observations within the last second without inventing startup samples")
+    try check(average.sample(100, at: 1.01) == 50 && average.sample(25, at: 3) == 25,
+              "Extra UI refreshes share a sample and stale observations expire after a polling gap")
     try check(fill.percent == 0, "Unprepared playback buffer reports zero")
     fill.update(filled: 2, capacity: 4); try check(fill.percent == 50, "Buffer reports actual prepared queue occupancy")
     fill.update(filled: 8, capacity: 4); try check(fill.percent == 100, "Buffer percentage is capped at full capacity")
