@@ -2,6 +2,51 @@ import AppKit
 
 extension AppDelegate {
     func verifyChoiceAlertsUI() throws {
+        // Exercise focus, plugin-driven resizing and dismissal of the shared
+        // surface in an actual AppKit window, rather than only checking flags.
+        let popup = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 180))
+        let body = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 180))
+        let field = NSTextField(string: "Editable")
+        field.frame = NSRect(x: 20, y: 20, width: 200, height: 24)
+        body.addSubview(field); popup.contentView = body; popup.installHeader()
+        defer { popup.orderOut(nil) }
+        popup.makeKeyAndOrderFront(nil)
+        guard !popup.styleMask.contains(.titled), popup.standardWindowButton(.closeButton) == nil,
+              popup.makeFirstResponder(field), field.currentEditor() != nil else {
+            throw SounderError.message("Shared popup has system chrome or cannot edit native text")
+        }
+        body.setFrameSize(NSSize(width: 480, height: 240))
+        popup.setContentSize(body.frame.size)
+        guard popup.contentView?.frame.size == NSSize(width: 480, height: 290),
+              body.frame == NSRect(x: 0, y: 0, width: 480, height: 240),
+              let close = popup.contentView?.subviews.compactMap({ $0 as? PointerButton }).first,
+              close.frame.maxX == 464, close.frame.minY > body.frame.maxY,
+              close.title.isEmpty, close.image != nil, close.imagePosition == .imageOnly,
+              let heading = popup.contentView?.subviews.compactMap({ $0 as? NSTextField }).first,
+              heading.frame.minY > body.frame.maxY, heading.frame.maxX < close.frame.minX else {
+            throw SounderError.message("Popup heading or close icon overlaps a resized native plugin editor")
+        }
+        close.performClick(nil)
+        guard !popup.isVisible else { throw SounderError.message("Shared popup Close action did not dismiss the window") }
+        print("PASS: Headerless popups retain native text focus, plugin resizing and a separate Close action")
+        if let index = CommandLine.arguments.firstIndex(of: "--popup-plugin-ui-test"), index + 1 < CommandLine.arguments.count {
+            let host = try SNPluginHost(path: CommandLine.arguments[index + 1], classID: "", state: nil)
+            for native in [true, false] {
+                let plugin = PluginEditorWindow(host: host, editor: editor, effectID: UUID())
+                plugin.show(native: native)
+                guard !plugin.window.styleMask.contains(.titled), plugin.window.level == .floating,
+                      (plugin.window as? PopupWindow)?.acceptsEditorShortcuts == true,
+                      let button = plugin.window.contentView?.subviews.compactMap({ $0 as? PointerButton }).first else {
+                    plugin.close(capture: false)
+                    throw SounderError.message("Plugin popup lost its shared surface, initial focus or floating level (native: \(native), responder: \(String(describing: plugin.window.firstResponder)))")
+                }
+                button.performClick(nil)
+                guard !plugin.window.isVisible, plugin.idle == nil, editor.pluginWindows[plugin.effectID] == nil else {
+                    throw SounderError.message("Plugin Close failed to detach its editor and stop its idle timer")
+                }
+            }
+            print("PASS: Real VST3 native and parameter popups share the surface and Close releases their editors and timers")
+        }
         let cases: [(String, [String], [(UInt16, NSEvent.ModifierFlags)], Int, Bool)] = [
             ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(125, []), (126, []), (36, [])], 0, false),
             ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(48, []), (36, [])], 1, false),
@@ -1555,5 +1600,113 @@ extension AppDelegate {
         rack.plugins.showPicker()
         try check(rack.plugins.vst3Only.state == .on && rack.plugins.matches.allSatisfy { $0.pathExtension.lowercased() == "vst3" }, "Reopening the picker retains its format filter")
         rack.plugins.popover.close()
+    }
+}
+
+
+extension AppDelegate {
+    func verifyPopupShortcutsUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+        }
+        let original = editor.project
+        let popup = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 180))
+        let body = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 180))
+        let input = NSTextField(string: "Plugin search")
+        input.frame = NSRect(x: 20, y: 20, width: 180, height: 24)
+        let dropdown = NSPopUpButton(frame: NSRect(x: 220, y: 20, width: 160, height: 26))
+        dropdown.addItems(withTitles: ["First", "Second"])
+        body.addSubview(input); body.addSubview(dropdown)
+        popup.contentView = body; popup.installHeader(); popup.makeKeyAndOrderFront(nil)
+        defer {
+            editor.stop(); popup.orderOut(nil)
+            editor.project = original; editor.selection = []; editor.dirty = false
+            window.makeKeyAndOrderFront(nil); window.makeFirstResponder(timeline); refresh()
+        }
+        func event(_ code: UInt16, flags: NSEvent.ModifierFlags = [], target: NSWindow? = nil) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags,
+                            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: (target ?? popup).windowNumber,
+                            context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+        }
+        func background() { popup.prepareKeyboardFocus(at: NSPoint(x: 400, y: 160)) }
+        try check(popup.isKeyWindow && popup.acceptsEditorShortcuts,
+                  "New popups immediately focus their background without a mouse click")
+        let nextPopup = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 140))
+        nextPopup.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 140))
+        nextPopup.installHeader(protectsHostedContent: true); nextPopup.makeKeyAndOrderFront(nil)
+        try check(nextPopup.isKeyWindow && nextPopup.acceptsEditorShortcuts &&
+                  handlePopupShortcut(event(123, flags: [.command], target: nextPopup)),
+                  "A second new plugin-style popup immediately accepts editor shortcuts")
+        nextPopup.orderOut(nil); popup.makeKeyAndOrderFront(nil)
+        let clip = original.tracks[0].clips[0]
+        editor.selection = [clip.id]; editor.cursor = clip.start + 0.5
+        try check(popup.acceptsEditorShortcuts && handlePhysicalShortcut(event(1)) &&
+                  editor.project.tracks[0].clips.count == original.tracks[0].clips.count + 1,
+                  "Popup background forwards physical Split to the editor")
+        try check(handlePhysicalShortcut(event(6, flags: [.command])) && editor.project.tracks[0].clips.count == original.tracks[0].clips.count,
+                  "Popup background forwards Undo to the project")
+        try check(handlePhysicalShortcut(event(0, flags: [.command])) && editor.selection.count == original.tracks.flatMap(\.clips).count,
+                  "Popup background forwards Select All to timeline fragments")
+        let cursor = editor.cursor
+        try check(handlePopupShortcut(event(124)) && editor.cursor > cursor, "Popup background arrows seek the timeline")
+        try check(handlePopupShortcut(event(123, flags: [.command])) && editor.cursor == 0,
+                  "Popup background Command-Left reaches timeline zero")
+        try check(handlePopupShortcut(event(49)) && editor.isPlaying, "Popup background Space starts playback")
+        try check(handlePopupShortcut(event(49)), "Popup background Space pauses playback")
+        editor.stop()
+        try check(handleShuttleShortcut(event(124, flags: [.shift])) && editor.isShuttling,
+                  "Popup background Shift-arrow starts shuttle")
+        let release = NSEvent.keyEvent(with: .keyUp, location: .zero, modifierFlags: [.shift],
+                                       timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: popup.windowNumber,
+                                       context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 124)!
+        try check(handleShuttleShortcut(release), "Popup background arrow release settles shuttle")
+        editor.stop()
+        try check(handlePopupShortcut(event(53)) && popup.isVisible,
+                  "Popup background Escape controls editor Stop without closing the popup")
+        popup.prepareKeyboardFocus(at: NSPoint(x: input.frame.midX, y: input.frame.midY))
+        popup.makeFirstResponder(input)
+        popup.makeKeyAndOrderFront(nil)
+        try check(!popup.acceptsEditorShortcuts && !handlePhysicalShortcut(event(1)) && !handlePopupShortcut(event(49)) &&
+                  !handleShuttleShortcut(event(124, flags: [.shift])), "Popup text fields retain letters, Space and Shift-arrows")
+        if let text = input.currentEditor() as? NSTextView {
+            text.insertText("s ", replacementRange: text.selectedRange())
+            try check(text.string.contains("s "), "Typing in a popup remains native text editing")
+        }
+        background()
+        popup.prepareKeyboardFocus(at: NSPoint(x: dropdown.frame.midX, y: dropdown.frame.midY))
+        try check(!popup.acceptsEditorShortcuts && !handlePopupShortcut(event(125)) && !handlePopupShortcut(event(36)),
+                  "Popup dropdown clicks relinquish editor shortcuts before native menu tracking")
+        // Native plug-in bodies are protected even when their views do not take first responder.
+        let protected = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 180))
+        protected.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 180))
+        protected.installHeader(protectsHostedContent: true)
+        defer { protected.orderOut(nil) }
+        protected.prepareKeyboardFocus(at: NSPoint(x: 20, y: 200))
+        try check(protected.acceptsEditorShortcuts, "Plugin popup heading can focus editor shortcuts")
+        protected.prepareKeyboardFocus(at: NSPoint(x: 200, y: 100))
+        try check(!protected.acceptsEditorShortcuts, "Plugin content clears forwarding even without a native first responder")
+        editor.showEffects(for: original.tracks[0].id)
+        let rack = editor.effectsWindows[original.tracks[0].id]!
+        rack.plugins.popover.close()
+        (rack.window as! PopupWindow).prepareKeyboardFocus(at: NSPoint(x: 20, y: rack.window.contentView!.bounds.maxY - 25))
+        editor.selection = [clip.id]
+        try check(handlePhysicalShortcut(event(0, flags: [.command], target: rack.window)) &&
+                  editor.selection.count == original.tracks.flatMap(\.clips).count,
+                  "FX background Command-A selects timeline fragments")
+        rack.window.makeFirstResponder(rack.table)
+        let chainSelect = event(0, flags: [.command], target: rack.window)
+        try check(!handlePhysicalShortcut(chainSelect) && rack.window.performKeyEquivalent(with: chainSelect),
+                  "Focused FX list retains its own Command-A shortcut")
+        rack.done(); popup.makeKeyAndOrderFront(nil)
+        background()
+        let modal = CompactSettingsAlert(); modal.messageText = "Modal isolation"; modal.addButton(withTitle: "Cancel")
+        var blocked = false
+        let timer = Timer(timeInterval: 0.05, repeats: false) { _ in
+            blocked = !self.handlePhysicalShortcut(event(1)) && !self.handlePopupShortcut(event(49))
+            modal.buttons[0].performClick(nil)
+        }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        _ = modal.runModal()
+        try check(blocked, "Decision dialogs retain modal keyboard isolation")
     }
 }

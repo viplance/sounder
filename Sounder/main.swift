@@ -200,9 +200,120 @@ final class ProjectNameView: NSView {
     }
 }
 
+/// Shared app-owned popup surface, matching the compact Export audio dialog.
+/// Borderless windows must explicitly accept focus for native fields and plug-in editors.
+final class PopupBackgroundView: NSView {
+    override var acceptsFirstResponder: Bool { true }
+}
+
+class PopupWindow: NSWindow {
+    private weak var heading: NSTextField?
+    private var protectsHostedContent = false
+    private var backgroundHasFocus = false
+    private var hasPresentedPopup = false
+    var acceptsEditorShortcuts: Bool {
+        backgroundHasFocus && contentView is PopupBackgroundView && firstResponder === contentView
+    }
+    override func makeKeyAndOrderFront(_ sender: Any?) {
+        let newlyPresented = !hasPresentedPopup || !isVisible
+        if newlyPresented, contentView is PopupBackgroundView { initialFirstResponder = contentView }
+        super.makeKeyAndOrderFront(sender)
+        if newlyPresented, let root = contentView as? PopupBackgroundView {
+            backgroundHasFocus = makeFirstResponder(root)
+            hasPresentedPopup = true
+        }
+    }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown { prepareKeyboardFocus(at: event.locationInWindow) }
+        if event.type == .rightMouseDown || event.type == .otherMouseDown {
+            if acceptsEditorShortcuts { makeFirstResponder(nil) }
+            backgroundHasFocus = false
+        }
+        super.sendEvent(event)
+    }
+    func prepareKeyboardFocus(at point: NSPoint) {
+        guard let root = contentView else { return }
+        let hit = root.hitTest(root.convert(point, from: nil))
+        let background = hit === root || hit === heading || (!protectsHostedContent && hit === closeButtonBody)
+        if background {
+            backgroundHasFocus = makeFirstResponder(root)
+        } else {
+            if acceptsEditorShortcuts { makeFirstResponder(nil) }
+            backgroundHasFocus = false
+        }
+    }
+    private weak var closeButtonBody: NSView?
+    init(contentRect: NSRect) {
+        super.init(contentRect: contentRect, styleMask: [.borderless], backing: .buffered, defer: false)
+        isReleasedWhenClosed = false
+        isMovableByWindowBackground = true
+        hasShadow = true
+        isOpaque = false
+        backgroundColor = .clear
+    }
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override var contentView: NSView? {
+        didSet {
+            contentView?.wantsLayer = true
+            contentView?.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            contentView?.layer?.cornerRadius = 10
+            contentView?.layer?.masksToBounds = true
+        }
+    }
+    override func performClose(_ sender: Any?) {
+        // Preserve each controller's cleanup/cancellation path without a system close button.
+        guard delegate?.windowShouldClose?(self) != false else { return }
+        close()
+    }
+    override func setContentSize(_ size: NSSize) {
+        guard let body = closeButtonBody else { super.setContentSize(size); return }
+        // Native VST editors resize their host body and then the window. Keep
+        // the header outside the dimensions requested by the plug-in.
+        super.setContentSize(NSSize(width: size.width, height: size.height + 50))
+        body.frame = NSRect(x: 0, y: 0, width: size.width, height: size.height)
+    }
+    /// App-owned heading and dismissal, outside the hosted content dimensions.
+    func installHeader(protectsHostedContent: Bool = false) {
+        self.protectsHostedContent = protectsHostedContent
+        guard let body = contentView else { return }
+        let size = body.frame.size
+        let root = PopupBackgroundView(frame: NSRect(x: 0, y: 0, width: size.width, height: size.height + 50))
+        body.removeFromSuperview()
+        body.frame = NSRect(x: 0, y: 0, width: size.width, height: size.height)
+        body.autoresizingMask = [.width, .height]
+        root.addSubview(body)
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.lineBreakMode = .byTruncatingMiddle
+        titleLabel.toolTip = title
+        titleLabel.frame = NSRect(x: 20, y: size.height + 15, width: max(0, size.width - 80), height: 24)
+        titleLabel.autoresizingMask = [.width, .minYMargin]
+        root.addSubview(titleLabel)
+        heading = titleLabel
+        let button = PointerButton(title: "", target: self, action: #selector(performClose(_:)))
+        button.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close")
+        button.imagePosition = .imageOnly
+        button.isBordered = false
+        button.contentTintColor = .secondaryLabelColor
+        button.toolTip = "Close"
+        button.setAccessibilityLabel("Close")
+        button.keyEquivalent = "\u{1b}"
+        button.frame = NSRect(x: size.width - 44, y: size.height + 11, width: 28, height: 28)
+        button.autoresizingMask = [.minXMargin, .minYMargin]
+        root.addSubview(button)
+        let popupSize = root.frame.size
+        contentView = root
+        super.setContentSize(popupSize)
+        body.frame = NSRect(x: 0, y: 0, width: size.width, height: size.height)
+        body.layer?.cornerRadius = 0
+        closeButtonBody = body
+    }
+}
+
 // Button-only confirmations support keyboard choice regardless of the macOS
 // keyboard-navigation preference. Form dialogs retain their normal field keys.
-final class ActionChoiceAlert: NSAlert {
+final class ActionChoiceAlert: CompactSettingsAlert {
     var cancellationIndex: Int?
     private(set) var selectedButtonIndex = 0
     private func selectButton(_ index: Int) {
@@ -212,6 +323,7 @@ final class ActionChoiceAlert: NSAlert {
             if i == index { button.keyEquivalent = "\r"; button.keyEquivalentModifierMask = [] }
         }
         window.defaultButtonCell = buttons[index].cell as? NSButtonCell
+        window.initialFirstResponder = buttons[index]
         window.makeFirstResponder(buttons[index])
     }
     @discardableResult func handleChoiceKey(_ event: NSEvent) -> Bool {
@@ -233,6 +345,12 @@ final class ActionChoiceAlert: NSAlert {
         default: return false
         }
     }
+    override func layout() {
+        super.layout()
+        for (index, button) in buttons.enumerated() {
+            button.keyEquivalent = index == selectedButtonIndex ? "\r" : index == cancellationIndex ? "\u{1b}" : ""
+        }
+    }
     override func runModal() -> NSApplication.ModalResponse {
         layout()
         if let first = buttons.indices.first(where: { buttons[$0].isEnabled }) { selectButton(first) }
@@ -245,7 +363,7 @@ final class ActionChoiceAlert: NSAlert {
 }
 
 // Settings use a compact form layout rather than NSAlert's reserved icon area.
-final class CompactSettingsAlert: NSAlert {
+class CompactSettingsAlert: NSAlert {
     var minimumWidth: CGFloat = 340
     var minimumButtonWidth: CGFloat = 96
     var buttonSpacing: CGFloat = 12
@@ -609,11 +727,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         buildMenu()
         shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
-            if self.handleShuttleShortcut(event) { return nil }
+            if self.handleShuttleShortcut(event) || self.handlePopupShortcut(event) { return nil }
             return self.handlePhysicalShortcut(event) ? nil : event
         }
         NotificationCenter.default.addObserver(self, selector: #selector(cancelShuttle), name: NSApplication.didResignActiveNotification, object: NSApp)
-        NotificationCenter.default.addObserver(self, selector: #selector(cancelShuttle), name: NSWindow.didResignKeyNotification, object: window)
+        NotificationCenter.default.addObserver(self, selector: #selector(cancelShuttle), name: NSWindow.didResignKeyNotification, object: nil)
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refresh()
         if let index = CommandLine.arguments.firstIndex(of: "--import-ui-test"), index + 1 < CommandLine.arguments.count { importUITest(URL(fileURLWithPath: CommandLine.arguments[index + 1])); return }
         if let index = CommandLine.arguments.firstIndex(of: "--playback-cpu-ui-test"), index + 1 < CommandLine.arguments.count {
@@ -745,6 +863,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--fragment-mute-ui-test") { try verifyFragmentMuteUI() }
             if CommandLine.arguments.contains("--normalize-ui-test") { try verifyNormalizationUI() }
             if CommandLine.arguments.contains("--stop-return-ui-test") { try verifyStopReturnUI() }
+            if CommandLine.arguments.contains("--popup-shortcuts-ui-test") { try verifyPopupShortcutsUI() }
             if CommandLine.arguments.contains("--physical-shortcuts-ui-test") { try verifyPhysicalShortcutsUI() }
             if CommandLine.arguments.contains("--tap-tempo-ui-test") { try verifyTapTempoUI() }
             if CommandLine.arguments.contains("--tempo-ui-test") { try verifyTempoUI() }
@@ -1230,8 +1349,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if event.isARepeat { return true }
             releasedShuttleKey = nil
         }
-        guard event.type == .keyDown, event.window === window, NSApp.modalWindow == nil,
-              !(window.firstResponder is NSTextView), !(window.firstResponder is TrackMixerSlider), timeline.canSelectRange,
+        guard event.type == .keyDown, isEditorShortcutEvent(event), NSApp.modalWindow == nil,
+              !(editorShortcutResponder is NSTextView), !(editorShortcutResponder is TrackMixerSlider), timeline.canSelectRange,
               event.modifierFlags.intersection([.command, .shift, .option, .control]) == [.shift] else { return false }
         if !event.isARepeat || shuttleKey != event.keyCode {
             shuttleKey = event.keyCode
@@ -1241,12 +1360,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     @discardableResult func handlePhysicalShortcut(_ event: NSEvent) -> Bool {
         guard event.type == .keyDown, NSApp.modalWindow == nil,
-              event.window === window, !(window.firstResponder is NSTextView) else { return false }
+              isEditorShortcutEvent(event), !(editorShortcutResponder is NSTextView) else { return false }
         let flags = event.modifierFlags.intersection([.command, .shift, .control, .option])
         let letters: [UInt16: String] = [0: "a", 1: "s", 3: "f", 6: "z", 8: "c", 9: "v", 12: "q", 14: "e", 15: "r", 17: "t", 31: "o", 34: "i", 38: "j", 45: "n"]
         guard let letter = letters[event.keyCode] else { return false }
+        return dispatchEditorShortcut(letter, flags: flags)
+    }
+    private func isEditorShortcutEvent(_ event: NSEvent) -> Bool {
+        event.window === window || (event.window as? PopupWindow)?.acceptsEditorShortcuts == true
+    }
+    private var editorKeyboardContext: Bool {
+        NSApp.keyWindow == nil || NSApp.keyWindow === window || (NSApp.keyWindow as? PopupWindow)?.acceptsEditorShortcuts == true
+    }
+    private var editorShortcutResponder: NSResponder? {
+        (NSApp.keyWindow as? PopupWindow)?.acceptsEditorShortcuts == true ? nil : window.firstResponder
+    }
+    @discardableResult func handlePopupShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, NSApp.modalWindow == nil,
+              (event.window as? PopupWindow)?.acceptsEditorShortcuts == true else { return false }
+        let keys: [UInt16: String] = [49: " ", 36: "\r", 76: "\r", 123: "\u{f702}", 124: "\u{f703}",
+                                      126: "\u{f700}", 125: "\u{f701}", 51: "\u{8}", 117: "\u{8}", 53: "\u{1b}"]
+        guard let key = keys[event.keyCode] else { return false }
+        return dispatchEditorShortcut(key, flags: event.modifierFlags.intersection([.command, .shift, .control, .option]))
+    }
+    private func dispatchEditorShortcut(_ key: String, flags: NSEvent.ModifierFlags) -> Bool {
         for root in NSApp.mainMenu?.items ?? [] {
-            for item in root.submenu?.items ?? [] where item.keyEquivalent.lowercased() == letter {
+            for item in root.submenu?.items ?? [] where item.keyEquivalent.lowercased() == key {
                 var modifiers = item.keyEquivalentModifierMask.intersection([.command, .shift, .control, .option])
                 if item.keyEquivalent != item.keyEquivalent.lowercased() { modifiers.insert(.shift) }
                 guard flags == modifiers, let action = item.action, validateMenuItem(item) else { continue }
@@ -1268,7 +1407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(toggleLoop) {
             menuItem.state = editor.project.loopEnabled ? .on : .off
-            return editor.canToggleLoop && NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window)
+            return editor.canToggleLoop && NSApp.modalWindow == nil && editorKeyboardContext
         }
         if [#selector(openProject), #selector(saveProject), #selector(saveAs)].contains(menuItem.action) {
             return !editor.busy && NSApp.modalWindow == nil
@@ -1280,34 +1419,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 if menuItem.action == #selector(copy(_:)) { return rack.canCopyEffects }
                 return rack.canPasteEffects
             }
-            guard NSApp.modalWindow == nil, NSApp.keyWindow == nil || NSApp.keyWindow === window else { return false }
+            guard NSApp.modalWindow == nil, editorKeyboardContext else { return false }
             if menuItem.action == #selector(selectAll(_:)) { return timeline.canSelectRange }
             if menuItem.action == #selector(copy(_:)) { return !editor.selection.isEmpty }
             return !editor.busy && NSPasteboard.general.data(forType: Editor.fragmentPasteboardType) != nil
         }
         if [#selector(split), #selector(trim), #selector(join), #selector(normalize), #selector(muteFragments), #selector(deleteClips)].contains(menuItem.action) {
             if menuItem.action == #selector(muteFragments) { menuItem.title = editor.fragmentsAreMuted(editor.selection) ? "Unmute Fragments" : "Mute Fragments" }
-            return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView) && !editor.busy
+            return NSApp.modalWindow == nil && editorKeyboardContext && !(editorShortcutResponder is NSTextView) && !editor.busy
                 && editor.project.tracks.contains { $0.clips.contains { editor.selection.contains($0.id) } }
         }
         if menuItem.action == #selector(exportAudio) { return editor.canExport }
-        if window.firstResponder is TrackMixerSlider,
+        if editorShortcutResponder is TrackMixerSlider,
            [#selector(zoomIn), #selector(zoomOut), #selector(seekBackward), #selector(seekForward), #selector(seekToStart), #selector(seekToEnd)].contains(menuItem.action) { return false }
         if [#selector(zoomIn), #selector(zoomOut)].contains(menuItem.action) {
-            return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
+            return NSApp.modalWindow == nil && editorKeyboardContext && !(editorShortcutResponder is NSTextView)
         }
         if menuItem.action == #selector(record) {
-            return editor.canRecord && NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
+            return editor.canRecord && NSApp.modalWindow == nil && editorKeyboardContext && !(editorShortcutResponder is NSTextView)
         }
         if [#selector(restartPlayback), #selector(play), #selector(seekBackward), #selector(seekForward), #selector(seekToStart), #selector(seekToEnd), #selector(stop), #selector(record), #selector(rewind)].contains(menuItem.action) {
-            return NSApp.modalWindow == nil && (NSApp.keyWindow == nil || NSApp.keyWindow === window) && !(window.firstResponder is NSTextView)
+            return NSApp.modalWindow == nil && editorKeyboardContext && !(editorShortcutResponder is NSTextView)
                 && (!editor.isRecording || menuItem.action == #selector(restartPlayback) || menuItem.action == #selector(play))
                 && !editor.requestingMic && !editor.isExporting && !editor.isImporting && !editor.isOpening
         }
         return true
     }
     private var activeEffectsRack: EffectsWindow? {
-        guard NSApp.modalWindow == nil, let key = NSApp.keyWindow else { return nil }
+        guard NSApp.modalWindow == nil, let key = NSApp.keyWindow,
+              (key as? PopupWindow)?.acceptsEditorShortcuts != true else { return nil }
         return editor.effectsWindows.values.first {
             $0.window === key || ($0.plugins.popover.isShown && $0.plugins.search.window === key)
         }
@@ -1366,8 +1506,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func nest() { editor.addTrack(nested: true) }
     @objc func removeTrack() { editor.removeTrack() }
     @objc func unparent() { if let id = editor.selectedTrack { editor.reparent(id, to: nil) } }
-    @objc func undo() { if let input = window.firstResponder as? NSTextView { input.undoManager?.undo() } else { editor.undo() } }
-    @objc func redo() { if let input = window.firstResponder as? NSTextView { input.undoManager?.redo() } else { editor.redo() } }
+    @objc func undo() { if let input = (NSApp.keyWindow ?? window)?.firstResponder as? NSTextView { input.undoManager?.undo() } else { editor.undo() } }
+    @objc func redo() { if let input = (NSApp.keyWindow ?? window)?.firstResponder as? NSTextView { input.undoManager?.redo() } else { editor.redo() } }
     @objc func zoomIn() { editor.zoom = min(500, editor.zoom * 1.4); refresh(); timeline.centerOnPlayhead() }
     @objc func zoomOut() { editor.zoom = max(timeline.minimumZoom, editor.zoom / 1.4); refresh(); timeline.centerOnPlayhead() }
     @objc func quit() { NSApp.terminate(nil) }

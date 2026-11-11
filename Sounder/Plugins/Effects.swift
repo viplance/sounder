@@ -71,7 +71,7 @@ final class PluginEditorWindow: NSObject, NSWindowDelegate {
         self.host = host; self.editor = editor; self.effectID = effectID
     }
     func show(native: Bool) {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 466), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 466))
         window.title = host.pluginName; window.delegate = self; window.isReleasedWhenClosed = false
         window.level = .floating
         window.hidesOnDeactivate = false
@@ -93,6 +93,7 @@ final class PluginEditorWindow: NSObject, NSWindowDelegate {
             if parameters.isEmpty { let label = NSTextField(labelWithString: "This plug-in exposes no editable parameters."); label.frame = NSRect(x: 18, y: 10, width: 550, height: 22); content.addSubview(label) }
             scroll.documentView = content
         }
+        (window as? PopupWindow)?.installHeader(protectsHostedContent: true)
         lastParameters = parameterValues(); lastRevision = host.editRevision; lastLatency = host.latency
         idle = Timer(timeInterval: 1 / 30, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -311,11 +312,11 @@ final class EffectRowView: NSTableCellView {
 }
 
 /// Keep rack commands in this window; text fields retain native editing keys.
-final class EffectsRackWindow: NSWindow {
+final class EffectsRackWindow: PopupWindow {
     var command: ((UInt16) -> Bool)?
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-        if modifiers == .command, !(firstResponder is NSTextView), command?(event.keyCode) == true { return true }
+        if !acceptsEditorShortcuts, modifiers == .command, !(firstResponder is NSTextView), command?(event.keyCode) == true { return true }
         return super.performKeyEquivalent(with: event)
     }
 }
@@ -351,7 +352,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         }
         snapshotMode = snapshot != nil
         editor.effectsWindows[trackID] = self
-        window = EffectsRackWindow(contentRect: NSRect(x: 0, y: 0, width: 507, height: 399), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = EffectsRackWindow(contentRect: NSRect(x: 0, y: 0, width: 507, height: 399))
         window.title = "FX · " + (trackID == Project.masterID ? "Master" : editor.project.tracks[index!].name); window.delegate = self; window.isReleasedWhenClosed = false
         let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
         window.level = .floating; window.hidesOnDeactivate = false
@@ -392,6 +393,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         table.setAccessibilityLabel("Effect processing order")
         table.frame = NSRect(origin: .zero, size: scroll.contentSize); table.autoresizingMask = [.width]
         scroll.documentView = table; root.addSubview(scroll)
+        (window as? PopupWindow)?.installHeader()
         scan(); reload(); window.center(); window.makeKeyAndOrderFront(nil)
         focusEmptyPicker()
         if let snapshot {

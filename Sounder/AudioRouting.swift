@@ -278,7 +278,7 @@ final class AudioRoutingWindow: NSObject, NSWindowDelegate {
     init(editor: Editor) {
         self.editor = editor
         let height = min(540, 168 + max(1, editor.project.tracks.count) * 44)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: height), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: height))
         super.init()
         window.title = "In | Out"; window.isReleasedWhenClosed = false; window.delegate = self
         window.level = .floating; window.hidesOnDeactivate = false
@@ -296,6 +296,7 @@ final class AudioRoutingWindow: NSObject, NSWindowDelegate {
         tracksView.frame = NSRect(x: 0, y: 0, width: 604, height: 44); scroll.documentView = tracksView; root.addSubview(scroll)
         input.onChange = { [weak editor] route in editor?.setAudioInput(route ?? AudioEndpoint()) }
         output.onChange = { [weak editor] route in editor?.setAudioOutput(route ?? AudioEndpoint()) }
+        (window as? PopupWindow)?.installHeader()
         reloadDevices()
         monitor = AudioDeviceMonitor { [weak self] in self?.reloadDevices() }
     }

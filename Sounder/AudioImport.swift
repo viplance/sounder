@@ -122,9 +122,9 @@ final class AudioImportController: NSObject, NSWindowDelegate {
         isRunning = true
         let visibleHeight = CGFloat(min(6, urls.count)) * 74
         let height = visibleHeight + 70
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: height), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: height))
         window.title = "Import audio"; window.delegate = self; window.isReleasedWhenClosed = false
-        let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
+        let root = PopupBackgroundView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
         let scroll = NSScrollView(frame: NSRect(x: 22, y: 54, width: 516, height: visibleHeight))
         scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 508, height: CGFloat(urls.count) * 74))
@@ -264,9 +264,9 @@ final class ProjectOpenController: NSObject, NSWindowDelegate {
     func start() {
         guard !isRunning, window == nil else { return }
         isRunning = true
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 144), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 144))
         window.title = "Open project"; window.delegate = self; window.isReleasedWhenClosed = false
-        let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
+        let root = PopupBackgroundView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
         row.frame.origin = NSPoint(x: 22, y: 54); root.addSubview(row)
         row.update(fraction: 0, phase: "Reading project")
         button.title = "Cancel"; button.bezelStyle = .rounded; button.target = self; button.action = #selector(pressButton)

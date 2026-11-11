@@ -366,9 +366,9 @@ final class AudioExportController: NSObject, NSWindowDelegate {
     func start() {
         guard !isRunning, window == nil else { return }
         isRunning = true
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 144), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 144))
         window.title = "Export audio"; window.delegate = self; window.isReleasedWhenClosed = false
-        let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
+        let root = PopupBackgroundView(); root.wantsLayer = true; root.layer?.backgroundColor = panelColor.cgColor; window.contentView = root
         row.frame.origin = NSPoint(x: 22, y: 54); root.addSubview(row)
         row.update(fraction: 0, phase: "Preparing export")
         button.title = "Cancel"; button.bezelStyle = .rounded; button.target = self; button.action = #selector(pressButton)
