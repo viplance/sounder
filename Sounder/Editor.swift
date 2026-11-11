@@ -1673,7 +1673,9 @@ final class Editor: NSObject {
     func open() {
         guard !busy, confirmDiscard() else { return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.canChooseFiles = true; panel.treatsFilePackagesAsDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        panel.allowedContentTypes = [UTType(filenameExtension: "sounder")!]
+        panel.allowsOtherFileTypes = false
+        guard panel.runModal() == .OK, let url = panel.url, url.pathExtension.lowercased() == "sounder" else { return }
         do { try startProjectOpen(from: url) }
         catch { self.error(error) }
     }
