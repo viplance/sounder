@@ -233,6 +233,8 @@ func runAudioTests() throws {
     try runAudioRoutingTests()
     try runTrackMeterTests()
     try runStreamingGraphTests()
+    try runPlaybackCoreTests()
+    try runPlaybackTransitionTests()
     try runShuttleAudioTests()
     try runTransportPositionTests()
     try runPauseContinuityTests()
@@ -272,7 +274,13 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
     print("Loaded \(host.pluginName) [\(host.classID)]")
     let parameters = host.parameters()
     guard !parameters.isEmpty else { throw SounderError.message("No plug-in parameters") }
-    let parameter = parameters.first { ($0["name"] as? String ?? "").lowercased().contains("output") } ?? parameters[0]
+    // This fixture measures a steady sine's level. Attack controls pitch
+    // transitions in Canary and need not change that signal at all; prefer a
+    // gain/filter control when the plug-in has no output level parameter.
+    let parameter = parameters.first { ($0["name"] as? String ?? "").lowercased().contains("output") }
+        ?? parameters.first { ($0["name"] as? String ?? "").lowercased().contains("gain") }
+        ?? parameters.first { ($0["name"] as? String ?? "").lowercased() == "high pass" }
+        ?? parameters[0]
     let id = (parameter["index"] as! NSNumber).intValue
     host.setParameter(id, value: 0.37)
     let state = try host.saveState()
@@ -325,7 +333,10 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
     let raceDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderFXPreparation-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: raceDirectory) }
     let raceStore = try AudioStore(directory: raceDirectory), raceSource = raceStore.freshURL()
-    try raceStore.write((0..<192_000).map { Float(sin(Double($0) * 2 * .pi * 440 / sampleRate) * 0.05) }, to: raceSource)
+    // Canary's high-pass range is 0...160 Hz; use a signal in that band so
+    // this is an output assertion, not an assumption about a parameter name.
+    let raceFrequency = (parameter["name"] as? String ?? "").lowercased() == "high pass" ? 80.0 : 440.0
+    try raceStore.write((0..<192_000).map { Float(sin(Double($0) * 2 * .pi * raceFrequency / sampleRate) * 0.05) }, to: raceSource)
     let entered = DispatchSemaphore(value: 0), gate = DispatchSemaphore(value: 0)
     var firstPreparation = true
     let raceEditor = Editor(store: raceStore, makePlayback: { graph, format, start in
@@ -351,12 +362,12 @@ func runPluginTest(path: String, editorTest: Bool = false) throws {
     }
     func livePeak(_ value: Double) -> Float {
         editorHost.setParameter(id, value: value)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        RunLoop.current.run(until: Date().addingTimeInterval(max(0.25, Double(editorHost.latency) / sampleRate + 0.1)))
         guard let playback = raceEditor.player else { return 0 }
         return playback.queue.sync { playback.graph.trackPeaks[raceEditor.project.tracks[0].id]?.left ?? 0 }
     }
     let quietPeak = livePeak(0.15), loudPeak = livePeak(0.85)
-    guard abs(quietPeak - loudPeak) > 0.001 else { throw SounderError.message("Editor parameter changes do not reach the background-prepared track FX") }
+    guard abs(quietPeak - loudPeak) > 0.001 else { throw SounderError.message("Editor parameter changes do not reach the background-prepared track FX (\(parameter["name"] ?? ""), peaks \(quietPeak), \(loudPeak))") }
     print("PASS: Opening track FX during background preparation retains the editor processor and changes the actual live output")
     raceEditor.preparesPlaybackInBackground = false; raceEditor.stop()
     if editorTest {
@@ -763,6 +774,8 @@ func runProjectStorageTests() throws {
     editor.project = Project(tracks: [Track(name: "Media", clips: [a, b, split])])
     editor.range = 1.125...3.875
     editor.cursor = 7.123456789
+    editor.zoom = 137.5
+    editor.captureTimelineView = { TimelineViewState(zoom: 137.5, x: 456.25, y: 123.5) }
     let originalAudio = try store.renderAudio(editor.project)
     editor.checkpoint(); editor.project.tracks[0].clips[0].name = "Renamed"
     let url = root.appendingPathComponent("Session/Project.sounder"), media = url.deletingLastPathComponent().appendingPathComponent("media")
@@ -774,11 +787,14 @@ func runProjectStorageTests() throws {
     let reopened = Editor(store: try AudioStore(directory: root.appendingPathComponent("reopened")))
     try reopened.open(from: url)
     try check(reopened.range == editor.range, "Open restores the selected timeline period")
+    try check(saved.timelineView == TimelineViewState(zoom: 137.5, x: 456.25, y: 123.5) && reopened.zoom == 137.5,
+              "Save/Open preserves timeline zoom and both viewport coordinates")
     try check(saved.timelineCursor == editor.cursor && reopened.cursor == editor.cursor && reopened.lastPlaybackStart == nil, "Save/Open preserves the exact playhead beyond audio bounds without setting the last-start marker")
     let cursorCopy = root.appendingPathComponent("CursorCopy/Project.sounder")
     try reopened.save(to: cursorCopy)
     try reopened.open(from: cursorCopy)
     try check(reopened.cursor == editor.cursor, "Save As preserves the main timeline cursor")
+    try check(reopened.project.timelineView == saved.timelineView, "Save As preserves viewport even without an attached timeline")
     editor.cursor = 0
     editor.range = nil; try editor.save(to: url)
     try reopened.open(from: url)
@@ -786,6 +802,12 @@ func runProjectStorageTests() throws {
     try check(reopened.cursor == 0, "Saving cursor zero replaces a previously saved position")
     var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
     legacy.removeValue(forKey: "timelineCursor")
+    legacy.removeValue(forKey: "timelineView")
+    try check(try JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: legacy)).timelineView == nil,
+              "Older projects have no saved viewport and remain readable")
+    var invalidView = legacy; invalidView["timelineView"] = ["zoom": 0, "x": 0, "y": 0]
+    try check((try? JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: invalidView))) == nil,
+              "Invalid saved timeline scale is rejected")
     try check(try JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: legacy)).timelineCursor == 0, "Legacy projects without a saved playhead default to zero")
     var invalidCursor = legacy; invalidCursor["timelineCursor"] = -1
     try check((try? JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: invalidCursor))) == nil, "Invalid negative saved cursor is rejected")

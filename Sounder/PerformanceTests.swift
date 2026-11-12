@@ -332,6 +332,7 @@ func runPerformanceTests() throws {
     guard let ready = ahead.standbyPlayer else { throw SounderError.message("Idle prebuffer is missing") }
     let retained = ready.graph.outputCache
     try check(!ahead.isPlaying && !ahead.busy && ahead.canRecord && ahead.bufferPercent == 100, "Stopped project prebuffers silently without disabling editing or Record")
+    ahead.project.timelineView = TimelineViewState(zoom: 200, x: 400, y: 100) // View metadata must preserve this prepared engine.
     let click = ProcessInfo.processInfo.systemUptime
     ahead.playPause()
     try check(ahead.player === ready && ahead.isPlaying && !ahead.isPreparingPlayback && ProcessInfo.processInfo.systemUptime - click < 0.1, "Play consumes the already prepared engine and buffers without rebuilding DSP")

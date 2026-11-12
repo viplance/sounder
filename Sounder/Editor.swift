@@ -352,6 +352,8 @@ final class Editor: NSObject {
     private(set) var playbackScrollRequest: UInt64 = 0
     var range: ClosedRange<Double>? { didSet { updateLoop() } }
     var zoom = 70.0
+    var captureTimelineView: (() -> TimelineViewState?)?
+    private(set) var timelineViewRestoreID: UInt64 = 0
     var changed: (() -> Void)?
     var transportChanged: (() -> Void)?
     let notifications: ToastCenter
@@ -384,7 +386,7 @@ final class Editor: NSObject {
     }
     private func mixCacheKey() throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
-        var renderProject = project; renderProject.timelineRange = nil; renderProject.timelineCursor = 0
+        var renderProject = project; renderProject.timelineRange = nil; renderProject.timelineCursor = 0; renderProject.timelineView = nil
         return try encoder.encode(renderProject)
     }
     var isShuttling: Bool { shuttleGesture != nil }
@@ -1636,6 +1638,8 @@ final class Editor: NSObject {
         flushPluginEdits()
         try capturePluginStates()
         var snapshot = project; snapshot.name = projectName; snapshot.timelineRange = range; snapshot.timelineCursor = cursor
+        snapshot.timelineView = captureTimelineView?() ?? TimelineViewState(zoom: zoom, x: project.timelineView?.x ?? 0, y: project.timelineView?.y ?? 0)
+        try snapshot.timelineView?.validate()
         let saved = try ProjectStorage.save(snapshot, to: url, additionalSources: pendingRecordedSources)
         func remapped(_ original: Project) -> Project {
             var result = original
@@ -1645,7 +1649,7 @@ final class Editor: NSObject {
             return result
         }
         for (source, target) in saved.sources { if let data = audio.cache[source] { audio.cache[target] = data } }
-        project = remapped(project); project.name = saved.project.name; project.timelineRange = snapshot.timelineRange; project.timelineCursor = snapshot.timelineCursor
+        project = remapped(project); project.name = saved.project.name; project.timelineRange = snapshot.timelineRange; project.timelineCursor = snapshot.timelineCursor; project.timelineView = snapshot.timelineView
         undoStack = undoStack.map(remapped); redoStack = redoStack.map(remapped)
         let pasteboard = NSPasteboard.general
         if let bytes = pasteboard.data(forType: Self.fragmentPasteboardType),
@@ -1705,6 +1709,8 @@ final class Editor: NSObject {
         project = prepared.project; projectURL = url
         audio.configure(project.audioFormat); audio.cache = prepared.sources
         undoStack = []; redoStack = []; selection = []; cursor = project.timelineCursor
+        zoom = project.timelineView?.zoom ?? 70
+        timelineViewRestoreID &+= 1
         lastPlaybackStart = nil; range = project.timelineRange; dirty = false
         reconcile(); update()
     }

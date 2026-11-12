@@ -180,10 +180,7 @@ final class RecordingWriter {
     private var publishedFailure: Error?
 
     private var alignment: (clock: RecordingHostClock, latency: Double)?
-    private var nextPacketFrame: Int?
-    // Position in the input sample rate, before conversion or loop replacement.
-    // Hardware timestamps place every packet; callback delivery is not a clock.
-    private var nextInputFrame = 0
+    private var packetTimeline = RecordingPacketTimeline()
     func configureSynchronization(clock: RecordingHostClock, inputLatency: Double) {
         queue.sync { alignment = (clock, inputLatency) }
     }
@@ -261,17 +258,13 @@ final class RecordingWriter {
                     // Without a hardware timestamp, only the first packet may
                     // use the arrival-time fallback. Later callbacks can jitter.
                     let offset: Int
-                    if hostTime != nil || nextPacketFrame == nil {
+                    if hostTime != nil || packetTimeline.nextPacketFrame == nil {
                         guard let frame = alignment.clock.inputFrameOffset(hostTime: stamp, latency: alignment.latency, sampleRate: sourceFormat.sampleRate) else { return }
                         offset = frame
-                    } else { offset = nextPacketFrame! }
-                    // Keep the physical packet end even when pre-roll is
-                    // discarded. A following untimestamped packet continues
-                    // that input interval, rather than jumping to take zero.
-                    nextPacketFrame = offset + Int(copy.frameLength)
-                    if offset > nextInputFrame { try padInput(frames: offset - nextInputFrame); nextInputFrame = offset }
-                    let skip = min(max(0, nextInputFrame - offset), Int(copy.frameLength))
-                    let remaining = Int(copy.frameLength) - skip
+                    } else { offset = packetTimeline.nextPacketFrame! }
+                    let placement = packetTimeline.place(offset: offset, frames: Int(copy.frameLength))
+                    if placement.padding > 0 { try padInput(frames: placement.padding) }
+                    let skip = placement.skip, remaining = placement.remaining
                     guard remaining > 0 else { return }
                     if skip > 0 {
                         for channel in 0..<Int(copy.format.channelCount) {
@@ -279,7 +272,6 @@ final class RecordingWriter {
                         }
                         copy.frameLength = AVAudioFrameCount(remaining)
                     }
-                    nextInputFrame += remaining
                 }
                 try convert(copy, ending: false)
             }

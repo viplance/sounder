@@ -146,14 +146,20 @@ func runMulticorePluginTest(path: String, classID: String, state: Data) throws {
             return result.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
         }
     }
+    // Measure audible output after declared lookahead. Canary's 19632-frame
+    // latency exceeds the entire 32-block observation window; measuring from
+    // cold DSP falsely reports a concurrency failure because energy is zero.
+    try graph.seek(to: 0)
     var energy = 0.0
     for _ in 0..<32 {
         let output = try graph.render(frames: 512)
         guard output.allSatisfy(\.isFinite) else { throw SounderError.message("Parallel VST produced invalid audio") }
         energy += output.reduce(0) { $0 + Double($1 * $1) }
     }
-    guard energy > 0.001, retained.count == 4,
-          ProcessInfo.processInfo.activeProcessorCount == 1 || (probe.maximum > 1 && probe.threadCount > 1) else {
+    guard energy > 0.001, retained.count == 4 else {
+        throw SounderError.message("Native VST produced no compensated audio (energy: \(energy), instances: \(retained.count), latency: \(graph.latency))")
+    }
+    guard ProcessInfo.processInfo.activeProcessorCount == 1 || (probe.maximum > 1 && probe.threadCount > 1) else {
         throw SounderError.message("Independent native VST processors did not run concurrently")
     }
     let serial = try store.renderAudio(project, parallel: false), parallel = try store.renderAudio(project)

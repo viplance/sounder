@@ -1710,3 +1710,51 @@ extension AppDelegate {
         try check(blocked, "Decision dialogs retain modal keyboard isolation")
     }
 }
+
+
+extension AppDelegate {
+    func verifyProjectViewUI() throws {
+        func check(_ value: Bool, _ message: String) throws {
+            guard value else { throw SounderError.message(message) }
+            print("PASS: \(message)")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderView-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = Editor(store: try AudioStore(directory: root))
+        model.preparesPlaybackInBackground = false
+        model.project = Project(tracks: (0..<12).map { Track(name: "Track \($0)") })
+        model.zoom = 140; model.cursor = 13.375
+        let canvas = Timeline(model), scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 900, height: 500))
+        scroll.hasHorizontalScroller = true; scroll.hasVerticalScroller = true
+        scroll.documentView = canvas
+        let testWindow = NSWindow(contentRect: scroll.frame, styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        testWindow.isReleasedWhenClosed = false; testWindow.contentView = scroll
+        defer { model.captureTimelineView = nil; model.changed = nil; testWindow.close() }
+        testWindow.orderFront(nil); testWindow.contentView?.layoutSubtreeIfNeeded()
+        model.changed = { canvas.refresh() }
+        canvas.refresh()
+        scroll.contentView.scroll(to: NSPoint(x: 1100, y: 180)); scroll.reflectScrolledClipView(scroll.contentView)
+        let expected = canvas.viewportRect.origin
+        let file = root.appendingPathComponent("View.sounder")
+        try model.save(to: file)
+        model.zoom = 70; model.cursor = 0; canvas.refresh()
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        try model.open(from: file)
+        try check(model.zoom == 140 && model.cursor == 13.375 && canvas.viewportRect.origin == expected,
+                  "Project Open restores zoom, horizontal/vertical viewport and cursor after AppKit layout")
+        scroll.contentView.scroll(to: NSPoint(x: 800, y: 90)); scroll.reflectScrolledClipView(scroll.contentView)
+        canvas.refresh()
+        try check(canvas.viewportRect.origin == NSPoint(x: 800, y: 90), "Later refresh does not reapply the saved viewport")
+        let copy = root.appendingPathComponent("Copy.sounder")
+        try model.save(to: copy)
+        try model.open(from: copy)
+        try check(canvas.viewportRect.origin == NSPoint(x: 800, y: 90), "Save As stores the latest displayed viewport")
+        var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+        legacy.removeValue(forKey: "timelineView")
+        try JSONSerialization.data(withJSONObject: legacy).write(to: file)
+        try model.open(from: file)
+        let cursorX = canvas.header + model.cursor * model.zoom
+        try check(cursorX >= canvas.visibleFragmentRect.minX && cursorX <= canvas.visibleFragmentRect.maxX,
+                  "Legacy project opens with its saved cursor visible instead of showing timeline zero")
+    }
+}

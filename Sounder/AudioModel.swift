@@ -313,6 +313,17 @@ enum PlaybackBufferSize {
         }
     }
 }
+/// View metadata only; never participates in audio preparation or Undo.
+struct TimelineViewState: Codable, Equatable {
+    var zoom: Double
+    var x: Double
+    var y: Double
+    func validate() throws {
+        guard zoom.isFinite, zoom > 0, x.isFinite, y.isFinite, x >= 0, y >= 0 else {
+            throw SounderError.message("Invalid timeline view")
+        }
+    }
+}
 struct Project: Codable {
     static let masterID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     var tracks: [Track] = [Track(name: "Audio 01")]
@@ -345,6 +356,7 @@ struct Project: Codable {
     var loopEnabled = false
     var timelineRange: ClosedRange<Double>? = nil
     var timelineCursor = 0.0
+    var timelineView: TimelineViewState?
     var defaultInput = AudioEndpoint()
     var defaultOutput = AudioEndpoint()
     var normalizationLevel = -1.0
@@ -354,7 +366,7 @@ struct Project: Codable {
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, masterEffectsBypassed, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, timelineRange, timelineCursor, normalizationLevel, defaultInput, defaultOutput }
+    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, masterEffectsBypassed, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, timelineRange, timelineCursor, timelineView, normalizationLevel, defaultInput, defaultOutput }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
@@ -378,6 +390,8 @@ extension Project {
         tempoMode = try values.decodeIfPresent(Bool.self, forKey: .tempoMode) ?? false
         metronomeEnabled = try values.decodeIfPresent(Bool.self, forKey: .metronomeEnabled) ?? false
         loopEnabled = try values.decodeIfPresent(Bool.self, forKey: .loopEnabled) ?? false
+        timelineView = try values.decodeIfPresent(TimelineViewState.self, forKey: .timelineView)
+        try timelineView?.validate()
         timelineCursor = try values.decodeIfPresent(Double.self, forKey: .timelineCursor) ?? 0
         guard timelineCursor.isFinite, timelineCursor >= 0 else { throw SounderError.message("Invalid timeline cursor") }
         timelineRange = try values.decodeIfPresent(ClosedRange<Double>.self, forKey: .timelineRange)

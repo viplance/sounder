@@ -831,6 +831,11 @@ final class Timeline: NSView {
     override var acceptsFirstResponder: Bool { true }
     init(_ editor: Editor) {
         self.editor = editor; super.init(frame: .zero)
+        editor.captureTimelineView = { [weak self] in
+            guard let self, self.enclosingScrollView != nil else { return nil }
+            // Layer scrolling may be ahead of AppKit's native clip bounds.
+            return TimelineViewState(zoom: self.editor.zoom, x: max(0, self.viewportRect.minX), y: max(0, self.viewportRect.minY))
+        }
         registerForDraggedTypes(AudioFileDrop.types)
         controlsOverlay.addSubview(scrollSurface)
         controlsOverlay.addSubview(sidebarSurface); controlsOverlay.addSubview(rulerSurface)
@@ -882,6 +887,7 @@ final class Timeline: NSView {
     }
     override var isOpaque: Bool { true }
     /// Displayed document coordinates; native visibleRect catches up on input.
+    private var restoredViewID: UInt64 = 0
     var viewportRect: NSRect { NSRect(origin: presentationOrigin ?? super.visibleRect.origin, size: super.visibleRect.size) }
     var isPresentingScroll: Bool { presentationOrigin != nil }
     /// Convert a document point even while only the presentation layers scroll.
@@ -1116,6 +1122,18 @@ final class Timeline: NSView {
         editor.zoom = max(minimumZoom, editor.zoom)
         let width = editor.zoom <= minimumZoom ? visible.width : max(visible.width, header + timelineDuration * editor.zoom)
         frame.size = NSSize(width: width, height: max(visible.height, ruler + CGFloat(rows.count) * rowHeight + 110))
+        if restoredViewID != editor.timelineViewRestoreID, let scroll = enclosingScrollView,
+           scroll.contentSize.width > 0, scroll.contentSize.height > 0 {
+            // Restore once, after the document's new size is known. A layout
+            // or waveform refresh must not undo subsequent user scrolling.
+            restoredViewID = editor.timelineViewRestoreID
+            playbackScroll = nil; pausedScrollCursor = nil; followedPlayback = false
+            let saved = editor.project.timelineView
+            let origin = NSPoint(x: min(max(0, frame.width - scroll.contentSize.width), saved?.x ?? centeredPlayheadOrigin),
+                                 y: min(max(0, frame.height - scroll.contentSize.height), saved?.y ?? 0))
+            scroll.contentView.scroll(to: origin)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
         positionPinnedSurfaces()
         positionHeaderControls()
         sidebarSurface.needsDisplay = true; rulerSurface.needsDisplay = true

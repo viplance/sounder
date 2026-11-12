@@ -873,6 +873,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if CommandLine.arguments.contains("--restart-ui-test") { try verifyRestartUI() }
             if CommandLine.arguments.contains("--mute-ui-test") { try verifyMuteUI() }
             if CommandLine.arguments.contains("--zoom-ui-test") { try verifyZoomUI() }
+            if CommandLine.arguments.contains("--project-view-ui-test") { try verifyProjectViewUI() }
             if CommandLine.arguments.contains("--range-ui-test") { try verifyRangeUI() }
             if CommandLine.arguments.contains("--shuttle-ui-test") { try verifyShuttleUI() }
             if CommandLine.arguments.contains("--boundary-seek-ui-test") { try verifyBoundarySeekUI() }
@@ -1522,6 +1523,8 @@ if CommandLine.arguments.contains("--buffer-regression-test") {
     do {
         setbuf(stdout, nil)
         try runRecordingPacketTimelineTests()
+        try runPlaybackCoreTests()
+        try runPlaybackTransitionTests()
         try runAtomicStopPositionTests()
         try runRecordingOutputAnchorTests()
         try runRecordedTrackAlignmentTests()
