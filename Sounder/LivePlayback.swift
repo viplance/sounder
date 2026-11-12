@@ -198,7 +198,7 @@ final class StreamingGraph {
             children.forEach { $0.resetDelays() }
         }
         var output: [Float] = []
-        func render(position: Int, frames: Int, includeDry: Bool = true, sourceFadeRemaining: Int = 0, sourceFadeLength: Int = 1, sourceFadeInFrame: Int? = nil) throws -> [Float] {
+        func render(position: Int, frames: Int, includeDry: Bool = true, sourceFadeRemaining: Int = 0, sourceFadeLength: Int = 1, sourceFadeInFrame: Int? = nil, compensateLatency: Bool = true) throws -> [Float] {
             var input = [Float](repeating: 0, count: frames * channels)
             let first = position * channels
             if includeDry && soloDry && first < dry.count {
@@ -217,9 +217,9 @@ final class StreamingGraph {
                     for channel in 0..<channels { input[frame * channels + channel] *= gain }
                 }
             }
-            input = dryDelay.apply(input)
+            if compensateLatency { input = dryDelay.apply(input) }
             for (index, child) in children.enumerated() {
-                let signal = childDelays[index].apply(child.output)
+                let signal = compensateLatency ? childDelays[index].apply(child.output) : child.output
                 for i in input.indices { input[i] += signal[i] }
             }
             for effect in effects { input = try effect.process(input) }
@@ -231,7 +231,7 @@ final class StreamingGraph {
                 if rampRemaining > 0 { rampRemaining -= 1 }
             }
             let output = muted || !soloBus ? [Float](repeating: 0, count: input.count) : input
-            let metered = meterDelay?.apply(output) ?? output
+            let metered = compensateLatency ? (meterDelay?.apply(output) ?? output) : output
             peak = StereoLevels()
             for frame in 0..<frames {
                 let l = metered[frame * channels], r = metered[frame * channels + (channels > 1 ? 1 : 0)]
@@ -349,17 +349,38 @@ final class StreamingGraph {
         roots.forEach { $0.resetDelays() }; delays.forEach { $0.reset() }
     }
     var hasEffects: Bool { needsHistory }
+    /// Discard timeline samples retained inside processors as well as host PDC.
+    /// Preserve processor instances/voices; silence never enters the mix cache.
+    func drainTimelineLatency() throws {
+        clearRoutingDelays()
+        // Drain each processor independently. Rendering the entire graph here
+        // would feed discarded lookahead into downstream reverbs and advance
+        // unrelated tails by the slowest branch's latency.
+        for bus in orderedBuses {
+            for effect in bus.effects {
+                var remaining = effect.latency
+                while remaining > 0 {
+                    let count = min(512, remaining)
+                    _ = try effect.process([Float](repeating: 0, count: count * channels))
+                    remaining -= count
+                }
+            }
+        }
+    }
     /// Same ordered buses and latency compensation, but no timeline/cache work.
     func renderEffects(frames: Int, sourceFadeRemaining: Int = 0, sourceFadeLength: Int = 1, sourceFadeInFrame: Int? = nil) throws -> [Float] {
         precondition(frames > 0 && frames <= 512)
+        // Idle voices/tails have no source timeline to align. Reintroducing
+        // PDC here delays a fresh tail behind silence after Stop.
+        let compensateLatency = sourceFadeRemaining > 0 || sourceFadeInFrame != nil
         var mix = [Float](repeating: 0, count: frames * channels)
         try renderPlan.perform { index in
             let bus = orderedBuses[index]
             bus.output = try bus.render(position: position, frames: frames, includeDry: sourceFadeRemaining > 0 || sourceFadeInFrame != nil,
-                                        sourceFadeRemaining: sourceFadeRemaining, sourceFadeLength: sourceFadeLength, sourceFadeInFrame: sourceFadeInFrame)
+                                        sourceFadeRemaining: sourceFadeRemaining, sourceFadeLength: sourceFadeLength, sourceFadeInFrame: sourceFadeInFrame, compensateLatency: compensateLatency)
         }
         for (index, root) in roots.enumerated() {
-            let output = delays[index].apply(root.output)
+            let output = compensateLatency ? delays[index].apply(root.output) : root.output
             for i in mix.indices { mix[i] += output[i] }
         }
         for (id, bus) in buses {
@@ -398,6 +419,12 @@ final class StreamingGraph {
         try outputCache.write(output, at: first)
         return output
     }
+}
+
+/// A source position and its DAC instant from the same render timestamp.
+struct RecordingPlaybackAnchor {
+    let sourceTime: Double
+    let hostTime: UInt64
 }
 
 /// Keep a short render-ahead queue, replenished when buffers are consumed.
@@ -464,6 +491,8 @@ final class LivePlayback {
     private func isCurrentReturn(_ token: UUID) -> Bool { returnLock.lock(); defer { returnLock.unlock() }; return returnToken == token }
     func completeReturn() { isShuttling = false; returnReady = false; cancelReturn() }
     private let transportLock = NSLock()
+    private var stopping = false
+    private var isStopping: Bool { transportLock.lock(); defer { transportLock.unlock() }; return stopping }
     private var renderedOutputFrames = 0
     private var transportMotions: [(frame: Int, motion: ShuttleMotion)] = []
     private(set) var isShuttling = false
@@ -481,7 +510,7 @@ final class LivePlayback {
     var finished: ((Error?) -> Void)?
     private var firstFrame: Int
     private var lastKnownFrame = 0
-    var isPlaying: Bool { !isAuditioningEffects && !isPaused && engine.isRunning && (node.isPlaying || resumeRequested) }
+    var isPlaying: Bool { !isStopping && !isAuditioningEffects && !isPaused && engine.isRunning && (node.isPlaying || resumeRequested) }
     var renderedFrames: Int { queue.sync { graph.position } }
     var currentTime: Double {
         transportLock.lock(); let frozen = auditionRequested ? auditionPosition : nil; transportLock.unlock()
@@ -498,12 +527,22 @@ final class LivePlayback {
         // Player time continues through silence while the final presentation
         // callback is pending. Never display a position beyond scheduled PCM.
         if let renderedClock { lastKnownFrame = max(lastKnownFrame, min(renderedOutputFrames, renderedClock)) }
-        if let index = transportMotions.lastIndex(where: { $0.frame <= lastKnownFrame }) {
-            let segment = transportMotions[index]
-            if index > 0 { transportMotions.removeFirst(index) }
-            return segment.motion.position(at: Double(lastKnownFrame - segment.frame) / format.sampleRate)
+        let position = sourceTimeLocked(at: lastKnownFrame)
+        // Retain the queued window's history too: a recording snapshot can
+        // straddle a very short loop wrap relative to the UI's last clock read.
+        if let index = transportMotions.lastIndex(where: { $0.frame <= lastKnownFrame - max(bufferFrameCount, 512) }), index > 0 {
+            transportMotions.removeFirst(index)
         }
-        return Double(recordingPlayback ? firstFrame + lastKnownFrame : min(graph.totalFrames, firstFrame + lastKnownFrame)) / format.sampleRate
+        return position
+    }
+    /// Caller holds transportLock. Rendered PCM, cursor and recording all use
+    /// this mapping from monotonic output frames to the source timeline.
+    private func sourceTimeLocked(at frame: Int) -> Double {
+        if let index = transportMotions.lastIndex(where: { $0.frame <= frame }) {
+            let segment = transportMotions[index]
+            return segment.motion.position(at: Double(frame - segment.frame) / format.sampleRate)
+        }
+        return Double(recordingPlayback ? firstFrame + frame : min(graph.totalFrames, firstFrame + frame)) / format.sampleRate
     }
     var currentSpeed: Double {
         _ = currentTime
@@ -585,24 +624,33 @@ final class LivePlayback {
     /// transport clock. Render-ahead PCM and declared FX latency are already
     /// accounted for by the player timeline and must not be subtracted again.
     func recordingPresentationHostTime(at sourceTime: Double) -> UInt64? {
+        recordingAnchor(at: sourceTime)?.hostTime
+    }
+    func recordingAnchor(at sourceTime: Double? = nil) -> RecordingPlaybackAnchor? {
         guard !engine.isInManualRenderingMode, let stamp = node.lastRenderTime, stamp.isHostTimeValid,
               let played = node.playerTime(forNodeTime: stamp), played.isSampleTimeValid, played.sampleRate > 0 else { return nil }
+        return recordingAnchor(at: sourceTime, renderTime: stamp, playerTime: played, outputLatency: recordingOutputLatency)
+    }
+    // Explicit clock pair also allows deterministic DAC/ADC synchronization
+    // tests without substituting callback wall time or requiring a microphone.
+    func recordingAnchor(at sourceTime: Double? = nil, renderTime stamp: AVAudioTime, playerTime played: AVAudioTime, outputLatency: Double) -> RecordingPlaybackAnchor? {
+        guard stamp.isHostTimeValid, played.isSampleTimeValid, played.sampleRate > 0 else { return nil }
         let frame = Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded())
         transportLock.lock()
-        let delta: Double
-        if let seekRequest, abs(seekRequest.time - sourceTime) < 0.5 / format.sampleRate,
-           let targetFrame = seekRequest.outputFrame {
+        let boundedFrame = max(0, min(renderedOutputFrames, frame))
+        let origin = sourceTime ?? sourceTimeLocked(at: boundedFrame)
+        let targetFrame: Double
+        if let seekRequest, abs(seekRequest.time - origin) < 0.5 / format.sampleRate, sourceTime != nil {
             // Enter can restart a take while its seek is still queued for output.
-            delta = Double(targetFrame - frame) / format.sampleRate
-        } else if let segment = transportMotions.last(where: { $0.frame <= frame }) {
-            delta = sourceTime - segment.motion.position(at: Double(frame - segment.frame) / format.sampleRate)
+            guard let boundary = seekRequest.outputFrame else { transportLock.unlock(); return nil }
+            targetFrame = Double(boundary)
         } else {
-            delta = sourceTime - Double(firstFrame + frame) / format.sampleRate
+            targetFrame = Double(boundedFrame) + (origin - sourceTimeLocked(at: boundedFrame)) * format.sampleRate
         }
         transportLock.unlock()
-        let seconds = AVAudioTime.seconds(forHostTime: stamp.hostTime) + delta + recordingOutputLatency
+        let seconds = AVAudioTime.seconds(forHostTime: stamp.hostTime) + (targetFrame - Double(frame)) / format.sampleRate + max(0, outputLatency)
         guard seconds.isFinite, seconds >= 0 else { return nil }
-        return AVAudioTime.hostTime(forSeconds: seconds)
+        return RecordingPlaybackAnchor(sourceTime: origin, hostTime: AVAudioTime.hostTime(forSeconds: seconds))
     }
     // Only the player pauses. Keep the engine, decoded PCM and live processors
     // ready, and finish the short fade at its audible completion, not consumption.
@@ -647,7 +695,7 @@ final class LivePlayback {
     }
     private func finishPause() throws {
         if continuesEffectsWhenPaused && graph.hasEffects {
-            try configureEffects(position: pausePosition, hosts: effectHosts, tempo: tempo)
+            try configureEffects(position: pausePosition, hosts: effectHosts, tempo: tempo, drainTimeline: true)
         } else { node.pause(); running = false }
         pausing = false; pauseComplete = true
         let position = pausePosition, generation = streamGeneration
@@ -854,7 +902,7 @@ final class LivePlayback {
         }
     }
     private func enqueue(format pcmFormat: AVAudioFormat, bridgeFrames: Int? = nil) throws {
-        guard running else { return }
+        guard running, !isStopping else { return }
         // Stop closes the source immediately, before this worker has finished
         // its current DSP block. Old consumption callbacks must not refill it.
         guard effectsOnly || !isAuditioningEffects else { return }
@@ -976,6 +1024,9 @@ final class LivePlayback {
         schedule(buffer, last: !recordingPlayback && loop == nil && nextFrame == graph.totalFrames, format: pcmFormat, pauseFinal: pauseFinal, replenishes: bridgeFrames == nil)
     }
     private func schedule(_ buffer: AVAudioPCMBuffer, last: Bool, format pcmFormat: AVAudioFormat, pauseFinal: Bool = false, replenishes: Bool = true) {
+        // Stop may arrive while this buffer's DSP is blocked. Do not publish
+        // that obsolete PCM or give its callback ownership of the new queue.
+        guard !isStopping, effectsOnly || !isAuditioningEffects else { return }
         transportLock.lock(); renderedOutputFrames = outputFrames; transportLock.unlock()
         let bufferFrames = Int(buffer.frameLength)
         let bufferGeneration = bufferFill.enqueue(frames: bufferFrames, capacity: bufferFrameCount)
@@ -1043,16 +1094,19 @@ final class LivePlayback {
     func setSolo(_ ids: Set<UUID>) { queue.async { self.graph.setSolo(ids) } }
     func setTrackMix(_ track: Track) { queue.async { self.graph.setTrackMix(track) } }
     func configureLiveHosts(_ hosts: [SNPluginHost]) { queue.async { [self] in effectHosts = hosts } }
-    private func configureEffects(position: Double, hosts: [SNPluginHost], tempo: Double) throws {
+    private func configureEffects(position: Double, hosts: [SNPluginHost], tempo: Double, drainTimeline: Bool = false) throws {
         meterBuffer.clear()
         effectsOnly = true; effectHosts = hosts
+        // Stateful processors can flush/fade their lookahead on the playing
+        // edge. Publish that edge before consuming their buffered timeline.
+        for host in hosts { host.setTransportPlaying(false, position: Int64((position * format.sampleRate).rounded()), tempo: tempo) }
         graph.clearRoutingDelays()
+        if drainTimeline { try graph.drainTimelineLatency() }
         pausing = false; resumeRequested = false; metronomeEnabled = false; shuttleRenderer = nil
         running = true; streamGeneration += 1; scheduled = 0; bufferFill.reset()
         let stationary = ShuttleMotion(start: position, direction: 1, end: Double(Int.max / 4) / format.sampleRate, initialSpeed: 0, target: 0)
         transportLock.lock(); auditionRequested = true; auditionPosition = position; seekRequest = nil
         transportMotions.append((outputFrames, stationary)); transportLock.unlock()
-        for host in hosts { host.setTransportPlaying(false, position: Int64((position * format.sampleRate).rounded()), tempo: tempo) }
         let pcm = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: AVAudioChannelCount(format.channels))!
         for _ in 0..<bufferBlockCount { try enqueue(format: pcm) }
         transportLock.lock(); effectsMetersReady = true; transportLock.unlock()
@@ -1069,7 +1123,7 @@ final class LivePlayback {
                 // flush. The stopped node cannot play it; discard it here too.
                 node.stop(); outputFrames = 0; meterBuffer.clear()
                 transportLock.lock(); lastKnownFrame = 0; renderedOutputFrames = 0; transportMotions = []; transportLock.unlock()
-                try configureEffects(position: position, hosts: hosts, tempo: tempo)
+                try configureEffects(position: position, hosts: hosts, tempo: tempo, drainTimeline: true)
                 node.play()
             } catch { running = false; DispatchQueue.main.async { [weak self] in self?.finished?(error) } }
         }
@@ -1100,9 +1154,13 @@ final class LivePlayback {
         return meterBuffer.consume(through: Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded()))
     }
     func stop() {
-        bufferFill.reset()
-        cancelReturn(); queue.sync { running = false; streamGeneration += 1; pausing = false }
+        transportLock.lock(); stopping = true; transportLock.unlock()
+        // Silence the node before waiting for a slow DSP block. Drain the
+        // worker before the final flush/reset, so it cannot refill after Stop.
+        cancelReturn(); node.stop()
+        queue.sync { running = false; streamGeneration += 1; pausing = false; scheduled = 0 }
         node.stop(); engine.stop()
+        bufferFill.reset()
         // Releasing hands processors to this worker. Drain a cancelled block
         // before another Play can begin using those same plug-in instances.
         returnQueue.sync {}

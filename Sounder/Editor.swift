@@ -384,7 +384,7 @@ final class Editor: NSObject {
     }
     private func mixCacheKey() throws -> Data {
         let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
-        var renderProject = project; renderProject.timelineRange = nil
+        var renderProject = project; renderProject.timelineRange = nil; renderProject.timelineCursor = 0
         return try encoder.encode(renderProject)
     }
     var isShuttling: Bool { shuttleGesture != nil }
@@ -829,10 +829,13 @@ final class Editor: NSObject {
             if let player { try player.prepareForRecording() }
             else { startPlayback(forRecording: true) }
             guard let player else { throw SounderError.message("Cannot start recording playback") }
-            let origin = position ?? (wasPlaying ? player.currentTime : player.start)
+            // Read source position and DAC time from one output timestamp. Two
+            // reads can fall on opposite sides of a loop/queued seek boundary.
+            let liveAnchor = wasPlaying ? player.recordingAnchor(at: position) : nil
+            let origin = position ?? liveAnchor?.sourceTime ?? (wasPlaying ? player.currentTime : player.start)
             let captureClock = RecordingHostClock()
             // Freeze the output cycle before input setup can cross a loop wrap.
-            let liveHost = wasPlaying ? player.recordingPresentationHostTime(at: origin) : nil
+            let liveHost = liveAnchor?.hostTime
             if let liveHost { captureClock.set(hostTime: liveHost) }
             for id in targets {
                 guard let track = project.tracks.first(where: { $0.id == id }) else { continue }
@@ -1177,8 +1180,7 @@ final class Editor: NSObject {
         if isPreparingPlayback { cancelPlaybackPreparation(); update(); return }
         if isShuttling { endShuttle(resume: false); return }
         if isRecording {
-            let start = recordingOrigin
-            stop(); cursor = start; update(); return
+            stop(returningTo: recordingOrigin); return
         }
         guard !requestingMic, !isExporting, !isImporting && !isOpening else { return }
         if let playback = player {
@@ -1526,12 +1528,13 @@ final class Editor: NSObject {
     }
     func stopAndReturnToStart() {
         let start = isRecording ? recordingOrigin : (lastPlaybackStart ?? 0)
-        stop(); cursor = start; update()
+        stop(returningTo: start)
     }
-    func stop() {
+    func stop() { stop(returningTo: nil) }
+    private func stop(returningTo position: Double?) {
         cancelPlaybackPreparation()
         endShuttle(resume: false)
-        stopPlayback(preserveEffects: true)
+        stopPlayback(at: position, preserveEffects: true)
         if !recordings.isEmpty {
             let takes = recordings
             let failures = takes.map { $0.recorder.stop() }
@@ -1563,9 +1566,14 @@ final class Editor: NSObject {
                 cursor = saved.map { $0.1.end }.max() ?? cursor
                 if errors.isEmpty { notifications.show("Recording saved", style: .success) }
             }
+            if let position { cursor = position }
             for error in errors { self.error(error) }
         }
         clearRecordingState()
+        // Commit the cursor together with the take. Publishing the recording
+        // end and then the return point makes the viewport jump twice and can
+        // launch speculative preparation for the intermediate position.
+        if let position { cursor = position }
         stopTrackMeters(preserving: liveEffectsPlayer != nil ? effectMeterTracks : [])
         update()
     }
@@ -1627,7 +1635,7 @@ final class Editor: NSObject {
         guard !busy else { throw SounderError.message("Wait for the current operation before saving") }
         flushPluginEdits()
         try capturePluginStates()
-        var snapshot = project; snapshot.name = projectName; snapshot.timelineRange = range
+        var snapshot = project; snapshot.name = projectName; snapshot.timelineRange = range; snapshot.timelineCursor = cursor
         let saved = try ProjectStorage.save(snapshot, to: url, additionalSources: pendingRecordedSources)
         func remapped(_ original: Project) -> Project {
             var result = original
@@ -1637,7 +1645,7 @@ final class Editor: NSObject {
             return result
         }
         for (source, target) in saved.sources { if let data = audio.cache[source] { audio.cache[target] = data } }
-        project = remapped(project); project.name = saved.project.name; project.timelineRange = snapshot.timelineRange
+        project = remapped(project); project.name = saved.project.name; project.timelineRange = snapshot.timelineRange; project.timelineCursor = snapshot.timelineCursor
         undoStack = undoStack.map(remapped); redoStack = redoStack.map(remapped)
         let pasteboard = NSPasteboard.general
         if let bytes = pasteboard.data(forType: Self.fragmentPasteboardType),
@@ -1696,7 +1704,7 @@ final class Editor: NSObject {
         pendingRecordedSources = []; recordedSourceCleanup = [:]
         project = prepared.project; projectURL = url
         audio.configure(project.audioFormat); audio.cache = prepared.sources
-        undoStack = []; redoStack = []; selection = []; cursor = 0
+        undoStack = []; redoStack = []; selection = []; cursor = project.timelineCursor
         lastPlaybackStart = nil; range = project.timelineRange; dirty = false
         reconcile(); update()
     }

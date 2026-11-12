@@ -10,6 +10,7 @@
     "build:icons": "node ./scripts/build-icons.mjs",
     "build:app": "node ./scripts/build.mjs",
     "test": "node ./scripts/test.mjs",
+    "test:buffers": "node ./scripts/test.mjs --buffers",
     "release": "node ./scripts/build-release.mjs",
     "release:local": "node ./scripts/build-release.mjs --skip-notarize",
     "clean": "rm -rf build .build",

@@ -29,3 +29,6 @@ Each entry records a stable ID, display information, producer homepage, direct H
 When updating an entry, download the producer's macOS archive, inspect the actual VST3/arm64 bundle, verify its signature, and update the version, size and SHA-256 together. Mutable producer download URLs intentionally fail verification when their contents change until the local catalog is updated. Do not substitute third-party mirrors or remove checksum verification.
 
 Run `Sounder --plugin-install-test` for picker/cancellation/corrupt-download checks. To exercise actual archives without touching the user's VST3 directory, put verified downloads in a temporary directory as `<id>.zip` / `<id>.pkg` and run `Sounder --plugin-install-test --plugin-archives /path/to/archives`. That optional check installs into a disposable directory and loads every bundle in the real VST3 host.
+
+
+CanaryVoiceTune is downloaded from the developer HTTPS URL in PluginCatalog.json. No VST3 binaries or installation archives are shipped inside Sounder.app. Updates to the developer archive require a matching catalog checksum and byte count.

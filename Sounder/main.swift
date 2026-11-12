@@ -1514,6 +1514,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func about() { NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "Sounder", .applicationVersion: "1.1.0", .credits: NSAttributedString(string: "Audio recorder & editor\nDzmitry Sharko")]) }
 }
 
+if let index = CommandLine.arguments.firstIndex(of: "--plugin-buffer-test"), index + 1 < CommandLine.arguments.count {
+    do { setbuf(stdout, nil); try runPluginBufferBoundaryTests(path: CommandLine.arguments[index + 1]); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if CommandLine.arguments.contains("--buffer-regression-test") {
+    do {
+        setbuf(stdout, nil)
+        try runRecordingPacketTimelineTests()
+        try runAtomicStopPositionTests()
+        try runRecordingOutputAnchorTests()
+        try runRecordedTrackAlignmentTests()
+        try runBlockedBufferStopTests()
+        try runPerformanceTests()
+        try runRecordingSynchronizationTests()
+        try runStopBufferTests()
+        try runLiveEffectsTests()
+        try runShuttleAudioTests()
+        try runTransportPositionTests()
+        try runPauseContinuityTests()
+        try runLoopPlaybackTests()
+        try runLoopRecordingTests()
+        try runLiveRecordingTests()
+        try runMultitrackRecordingTests()
+        try runOverdubTests()
+        print("All buffer regression tests passed")
+        exit(0)
+    } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
 if CommandLine.arguments.contains("--microphone-test") {
     do { try runMicrophoneSmokeTest(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }

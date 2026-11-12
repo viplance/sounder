@@ -180,8 +180,10 @@ final class RecordingWriter {
     private var publishedFailure: Error?
 
     private var alignment: (clock: RecordingHostClock, latency: Double)?
-    private var aligned = false
-    private var trimInputFrames = 0
+    private var nextPacketFrame: Int?
+    // Position in the input sample rate, before conversion or loop replacement.
+    // Hardware timestamps place every packet; callback delivery is not a clock.
+    private var nextInputFrame = 0
     func configureSynchronization(clock: RecordingHostClock, inputLatency: Double) {
         queue.sync { alignment = (clock, inputLatency) }
     }
@@ -255,21 +257,29 @@ final class RecordingWriter {
         queue.async { [self] in
             guard failure == nil else { return }
             do {
-                if let alignment, !aligned {
-                    guard let offset = alignment.clock.inputFrameOffset(hostTime: stamp, latency: alignment.latency, sampleRate: sourceFormat.sampleRate) else { return }
-                    aligned = true
-                    if offset < 0 { trimInputFrames = -offset }
-                    else if offset > 0 { try padInput(frames: offset) }
-                }
-                if trimInputFrames > 0 {
-                    let skip = min(trimInputFrames, Int(copy.frameLength))
-                    trimInputFrames -= skip
+                if let alignment {
+                    // Without a hardware timestamp, only the first packet may
+                    // use the arrival-time fallback. Later callbacks can jitter.
+                    let offset: Int
+                    if hostTime != nil || nextPacketFrame == nil {
+                        guard let frame = alignment.clock.inputFrameOffset(hostTime: stamp, latency: alignment.latency, sampleRate: sourceFormat.sampleRate) else { return }
+                        offset = frame
+                    } else { offset = nextPacketFrame! }
+                    // Keep the physical packet end even when pre-roll is
+                    // discarded. A following untimestamped packet continues
+                    // that input interval, rather than jumping to take zero.
+                    nextPacketFrame = offset + Int(copy.frameLength)
+                    if offset > nextInputFrame { try padInput(frames: offset - nextInputFrame); nextInputFrame = offset }
+                    let skip = min(max(0, nextInputFrame - offset), Int(copy.frameLength))
                     let remaining = Int(copy.frameLength) - skip
                     guard remaining > 0 else { return }
-                    for channel in 0..<Int(copy.format.channelCount) {
-                        memmove(copy.floatChannelData![channel], copy.floatChannelData![channel].advanced(by: skip), remaining * MemoryLayout<Float>.size)
+                    if skip > 0 {
+                        for channel in 0..<Int(copy.format.channelCount) {
+                            memmove(copy.floatChannelData![channel], copy.floatChannelData![channel].advanced(by: skip), remaining * MemoryLayout<Float>.size)
+                        }
+                        copy.frameLength = AVAudioFrameCount(remaining)
                     }
-                    copy.frameLength = AVAudioFrameCount(remaining)
+                    nextInputFrame += remaining
                 }
                 try convert(copy, ending: false)
             }

@@ -252,6 +252,11 @@ func runAudioTests() throws {
     try runLiveRecordingTests()
     try runMultitrackRecordingTests()
     try runRecordingSynchronizationTests()
+    try runRecordingPacketTimelineTests()
+    try runAtomicStopPositionTests()
+    try runRecordingOutputAnchorTests()
+    try runRecordedTrackAlignmentTests()
+    try runBlockedBufferStopTests()
     try runOverdubTests()
     try runResamplingTests()
     try runNotificationTests()
@@ -757,6 +762,7 @@ func runProjectStorageTests() throws {
     let b = Clip(name: "Imported", source: inputs[1].path, start: 0, duration: 0.05, order: 2)
     editor.project = Project(tracks: [Track(name: "Media", clips: [a, b, split])])
     editor.range = 1.125...3.875
+    editor.cursor = 7.123456789
     let originalAudio = try store.renderAudio(editor.project)
     editor.checkpoint(); editor.project.tracks[0].clips[0].name = "Renamed"
     let url = root.appendingPathComponent("Session/Project.sounder"), media = url.deletingLastPathComponent().appendingPathComponent("media")
@@ -768,10 +774,21 @@ func runProjectStorageTests() throws {
     let reopened = Editor(store: try AudioStore(directory: root.appendingPathComponent("reopened")))
     try reopened.open(from: url)
     try check(reopened.range == editor.range, "Open restores the selected timeline period")
+    try check(saved.timelineCursor == editor.cursor && reopened.cursor == editor.cursor && reopened.lastPlaybackStart == nil, "Save/Open preserves the exact playhead beyond audio bounds without setting the last-start marker")
+    let cursorCopy = root.appendingPathComponent("CursorCopy/Project.sounder")
+    try reopened.save(to: cursorCopy)
+    try reopened.open(from: cursorCopy)
+    try check(reopened.cursor == editor.cursor, "Save As preserves the main timeline cursor")
+    editor.cursor = 0
     editor.range = nil; try editor.save(to: url)
     try reopened.open(from: url)
     try check(reopened.range == nil, "Saving a cleared timeline period removes the previous selection")
+    try check(reopened.cursor == 0, "Saving cursor zero replaces a previously saved position")
     var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+    legacy.removeValue(forKey: "timelineCursor")
+    try check(try JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: legacy)).timelineCursor == 0, "Legacy projects without a saved playhead default to zero")
+    var invalidCursor = legacy; invalidCursor["timelineCursor"] = -1
+    try check((try? JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: invalidCursor))) == nil, "Invalid negative saved cursor is rejected")
     legacy.removeValue(forKey: "timelineRange")
     try check(try JSONDecoder().decode(Project.self, from: JSONSerialization.data(withJSONObject: legacy)).timelineRange == nil,
               "Projects without a saved timeline period open with no selection")

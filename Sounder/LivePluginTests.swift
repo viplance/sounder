@@ -7,7 +7,89 @@ private func liveCheck(_ condition: Bool, _ message: String) throws {
     print("PASS: \(message)")
 }
 
+func runPluginBufferBoundaryTests(path: String) throws {
+    _ = NSApplication.shared
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderPluginBoundary-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try AudioStore(directory: root), source = store.freshURL()
+    let phase = 2.0 * Double.pi * 220.0 / 48_000.0
+    let samples: [Float] = (0..<144_000).map { Float(sin(Double($0) * phase) * 0.2) }
+    try store.write(samples, to: source)
+    let host = try SNPluginHost(path: path, classID: "", state: nil)
+    let track = Track(name: "Buffered plugin", clips: [Clip(name: "Signal", source: source.path, start: 0, duration: 3, order: 1)],
+                      effects: [PluginEffect(name: host.pluginName, path: path, classID: host.classID)])
+    try host.beginStreaming(2)
+    let declared = host.latency
+    let graph = try StreamingGraph(project: Project(tracks: [track]), store: store) { _ in
+        StreamingEffect(latency: declared, tail: host.tail) { input in
+            let data = try host.processBlock(input.withUnsafeBytes { Data($0) }, channels: 2)
+            return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        }
+    }
+    try graph.seek(to: 24_000)
+    let first = try graph.render(frames: 512).map(abs).max() ?? 0
+    var onset = first > 0.001 ? 0 : -1
+    for block in 1..<100 {
+        let values = try graph.render(frames: 512)
+        if onset < 0, let i = values.firstIndex(where: { abs($0) > 0.001 }) { onset = block * 512 + i / 2 }
+    }
+    print("START \(host.pluginName): declared=\(declared), initialPeak=\(first), extra onset=\(onset)")
+    try liveCheck(onset >= 0 && onset < 512, "Real plugin starts at the compensated boundary without an extra silent interval")
+    let position = graph.position, cached = graph.outputCache.frames
+    host.setTransportPlaying(false, position: Int64(position - declared), tempo: 120)
+    try graph.drainTimelineLatency()
+    var residual: Float = 0
+    for _ in 0..<8 { residual = max(residual, try graph.renderEffects(frames: 512).map(abs).max() ?? 0) }
+    print("BOUNDARY \(host.pluginName): latency=\(declared), stopped residual=\(residual), tail=\(host.tail)")
+    if host.tail == 0 { try liveCheck(residual < 0.005, "Stop removes real plugin timeline lookahead without a delayed replay") }
+    try liveCheck(graph.position == position && graph.outputCache.frames == cached, "Plugin drain freezes source time and leaves timeline cache unchanged")
+    if host.pluginName.localizedCaseInsensitiveContains("TONE3000") { try runToneStopMeterTest(path: path) }
+}
+
+/// Two real TONE3000 instances receive identical PCM and Stop. A slow parallel
+/// branch must not shift either the first instance's tail or its meter.
+private func runToneStopMeterTest(path: String) throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderToneStop-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try AudioStore(directory: root), source = store.freshURL()
+    let phase = 2.0 * Double.pi * 220.0 / 48000.0
+    let signal: [Float] = (0..<96000).map { Float(sin(Double($0) * phase) * 0.2) }
+    try store.write(signal, to: source)
+    let a = try SNPluginHost(path: path, classID: "", state: nil)
+    let b = try SNPluginHost(path: path, classID: a.classID, state: try a.saveState())
+    let tone = Track(name: "Real TONE3000", clips: [Clip(name: "Signal", source: source.path, start: 0, duration: 2, order: 1)], effects: [PluginEffect(name: a.pluginName, path: path, classID: "tone")])
+    let slow = Track(name: "Parallel 500 ms", effects: [PluginEffect(name: "Latency", path: "test", classID: "slow")])
+    func make(_ host: SNPluginHost, parallel: Bool) throws -> StreamingGraph {
+        try host.beginStreaming(2)
+        return try StreamingGraph(project: Project(tracks: parallel ? [tone, slow] : [tone]), store: store) { effect in
+            if effect.classID == "slow" { return StreamingEffect(latency: 24000, tail: 0) { [Float](repeating: 0, count: $0.count) } }
+            return StreamingEffect(latency: host.latency, tail: host.tail) { input in
+                let data = try host.processBlock(input.withUnsafeBytes { Data($0) }, channels: 2)
+                return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            }
+        }
+    }
+    let delayed = try make(a, parallel: true), reference = try make(b, parallel: false)
+    for _ in 0..<64 { _ = try delayed.render(frames: 512); _ = try reference.render(frames: 512) }
+    a.setTransportPlaying(false, position: 32768, tempo: 120)
+    b.setTransportPlaying(false, position: 32768, tempo: 120)
+    try delayed.drainTimelineLatency(); try reference.drainTimelineLatency()
+    let cached = delayed.outputCache.frames
+    var maximumError: Float = 0, meterError: Float = 0
+    for _ in 0..<96 {
+        let actual = try delayed.renderEffects(frames: 512), expected = try reference.renderEffects(frames: 512)
+        for (x, y) in zip(actual, expected) { maximumError = max(maximumError, abs(x - y)) }
+        let peak = expected.map(abs).max() ?? 0
+        meterError = max(meterError, abs((delayed.trackPeaks[tone.id]?.left ?? 0) - peak))
+    }
+    try liveCheck(maximumError < 1e-6 && meterError < 1e-6,
+                  "Real TONE3000 Stop: 500 ms parallel latency adds no delayed audio/meter burst over 1.024 s (PCM error \(maximumError), meter error \(meterError))")
+    try liveCheck(delayed.position == 32768 && delayed.outputCache.frames == cached,
+                  "Real TONE3000 idle tail leaves the stopped timeline and cache fixed")
+}
+
 func runLiveEffectsTests() throws {
+    try runPluginDrainIsolationTests()
     let words: [UInt32] = [0x20903C64, 0x10F80000, 0x30FFFFFF, 0x2090447F, 0x20B0407F, 0x20803C00, 0x40000000]
     let messages = words.withUnsafeBufferPointer { LiveMIDIDecoder.decode($0, source: 7) }
     try liveCheck(messages == [LiveMIDIMessage(source: 7, status: 0x90, data1: 60, data2: 100),
@@ -99,6 +181,52 @@ func runLiveEffectsTests() throws {
     var missing = project; missing.tracks[0].clips[0].source = directory.appendingPathComponent("missing.wav").path
     let idle = try StreamingGraph(project: missing, store: store, includeAudioSources: false) { _ in StreamingEffect(latency: 0, tail: 0) { $0 } }
     try liveCheck(try idle.renderEffects(frames: 512).allSatisfy { $0 == 0 }, "Stopped FX preparation does not decode timeline sources")
+}
+
+private func runPluginDrainIsolationTests() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderDrainIsolation-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try AudioStore(directory: root)
+    let tail = PluginEffect(name: "Tail", path: "test", classID: "tail")
+    let parent = Track(name: "Parent reverb", effects: [tail])
+    let child = Track(name: "Lookahead", parent: parent.id, effects: [PluginEffect(name: "Delay", path: "test", classID: "delay")])
+    let parallel = Track(name: "Independent reverb", effects: [tail])
+    var tailCalls = 0, delayCalls = 0
+    var retained = [Float](repeating: 0.2, count: 16000), offset = 0
+    let graph = try StreamingGraph(project: Project(tracks: [parent, child, parallel]), store: store) { effect in
+        if effect.classID == "tail" {
+            return StreamingEffect(latency: 0, tail: 48000) { samples in tailCalls += 1; return samples }
+        }
+        return StreamingEffect(latency: 8000, tail: 0) { input in
+            delayCalls += 1
+            var result = input
+            for i in input.indices { result[i] = retained[offset]; retained[offset] = input[i]; offset = (offset + 1) % retained.count }
+            return result
+        }
+    }
+    try graph.drainTimelineLatency()
+    try liveCheck(tailCalls == 0 && delayCalls > 0 && retained.allSatisfy { $0 == 0 } && graph.position == 0 && graph.outputCache.frames == 0,
+                  "Draining lookahead removes retained PCM without advancing downstream/parallel reverb tails, source time or cache")
+    let ringing = Track(name: "IR tail", effects: [tail])
+    let latent = Track(name: "Slow parallel FX", effects: [PluginEffect(name: "500 ms", path: "test", classID: "latency")])
+    var firstTail = true
+    let idle = try StreamingGraph(project: Project(tracks: [ringing, latent]), store: store) { effect in
+        if effect.classID == "latency" { return StreamingEffect(latency: 24000, tail: 0) { [Float](repeating: 0, count: $0.count) } }
+        return StreamingEffect(latency: 0, tail: 96000) { input in
+            defer { firstTail = false }
+            return [Float](repeating: firstTail ? 0.2 : 0, count: input.count)
+        }
+    }
+    idle.clearRoutingDelays()
+    let immediate = try idle.renderEffects(frames: 512)
+    try liveCheck(immediate.max() == 0.2 && idle.trackPeaks[ringing.id]?.left == 0.2,
+                  "Stopped FX tail and meters are immediate despite 500 ms latency on another branch")
+    for _ in 0..<60 {
+        let output = try idle.renderEffects(frames: 512)
+        try liveCheck(output.allSatisfy { $0 == 0 } && idle.trackPeaks[ringing.id] == StereoLevels(),
+                      "Idle PDC cannot replay a tail or meter burst after silence")
+    }
+
 }
 
 /// Real instrument test, optionally repeated with a legacy VST bundle.
@@ -556,12 +684,17 @@ func runStopBufferTests() throws {
     try store.write([Float](repeating: 0.2, count: 96_000), to: source)
     let format = ProjectAudioFormat(bitDepth: 32)
     let dry = Track(name: "Dry", clips: [Clip(name: "Continuous tone", source: source.path, start: 0, duration: 2, order: 1)])
-    let latent = Track(name: "Silent latency bus", effects: [PluginEffect(name: "50 ms latency", path: "test", classID: "latency")])
+    let latent = Track(name: "Buffered source bus", clips: dry.clips, effects: [PluginEffect(name: "50 ms latency", path: "test", classID: "latency")])
     let project = Project(tracks: [dry, latent], audioFormat: format)
     for (capacity, pausing) in [1024, 4096, 32768].flatMap({ [($0, false), ($0, true)] }) {
         let action = pausing ? "Pause" : "Stop"
         let graph = try StreamingGraph(project: project, store: store) { _ in
-            StreamingEffect(latency: 2400, tail: 0) { [Float](repeating: 0, count: $0.count) }
+            var delay = [Float](repeating: 0, count: 4800), offset = 0
+            return StreamingEffect(latency: 2400, tail: 0) { input in
+                var result = input
+                for i in input.indices { result[i] = delay[offset]; delay[offset] = input[i]; offset = (offset + 1) % delay.count }
+                return result
+            }
         }
         let live = LivePlayback(graph: graph, format: format, start: 0)
         try live.configureBufferSize(capacity)
@@ -613,5 +746,50 @@ func runStopBufferTests() throws {
             try liveCheck(checked && live.engine === engine && live.isPlaying,
                           "Resume retains the live engine and reaches timeline output (queue \(capacity))")
         }
+    }
+}
+
+/// Freeze a real render block, then stop from another thread. This makes late
+/// callbacks deterministic instead of relying on a heavy plug-in being slow.
+func runBlockedBufferStopTests() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderBlockedStop-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try AudioStore(directory: root), source = store.freshURL()
+    try store.write([Float](repeating: 0.2, count: 48_000), to: source)
+    for capacity in [96, 1024, 32768] {
+        let track = Track(name: "Blocked FX", clips: [Clip(name: "Dry", source: source.path, start: 0, duration: 1, order: 1)],
+                          effects: [PluginEffect(name: "Gate", path: "test", classID: "gate")])
+        let project = Project(tracks: [track], audioFormat: ProjectAudioFormat(bitDepth: 32))
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
+        let arm = NSLock()
+        var blocking = false
+        let graph = try StreamingGraph(project: project, store: store) { _ in
+            StreamingEffect(latency: 0, tail: 0) { samples in
+                arm.lock(); let wait = blocking; blocking = false; arm.unlock()
+                if wait { entered.signal(); release.wait() }
+                return samples
+            }
+        }
+        let live = LivePlayback(graph: graph, format: project.audioFormat, start: 0)
+        try live.configureBufferSize(capacity)
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        try live.startPlayback()
+        defer { live.stop() }
+        arm.lock(); blocking = true; arm.unlock()
+        // A worker render models the in-flight refill, without waiting for a
+        // hardware callback or assuming any particular AVAudioEngine quantum.
+        live.queue.async { _ = try? graph.render(frames: 32) }
+        guard entered.wait(timeout: .now() + 2) == .success else { throw SounderError.message("Render did not reach test gate") }
+        DispatchQueue.global(qos: .userInitiated).async { live.stop(); stopped.signal() }
+        let deadline = Date().addingTimeInterval(0.2)
+        while live.node.isPlaying && Date() < deadline { Thread.sleep(forTimeInterval: 0.001) }
+        let immediate = !live.node.isPlaying
+        release.signal()
+        guard stopped.wait(timeout: .now() + 2) == .success else { throw SounderError.message("Stop did not drain blocked DSP") }
+        guard immediate, !live.engine.isRunning, live.bufferFill.percent == 0 else {
+            throw SounderError.message("Stop waits for blocked DSP before silencing or leaves stale buffer readiness (queue \(capacity))")
+        }
+        print("PASS: Stop silences before blocked DSP completes and leaves no stale queue (\(capacity) samples)")
     }
 }

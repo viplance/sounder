@@ -1,6 +1,210 @@
 import AppKit
 import AVFoundation
 
+/// Compare saved PCM against an independently assembled physical input timeline.
+/// Gaps, duplicate deliveries and pre-roll must not shift later input samples.
+func runRecordingPacketTimelineTests() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderPacketClock-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    for rate in [44_100.0, 48_000, 96_000] {
+        for channels in [1, 2] {
+            for looping in [false, true] {
+                let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: AVAudioChannelCount(channels))!
+                let format = ProjectAudioFormat(sampleRate: rate, bitDepth: 32)
+                let actualURL = store.freshURL(), expectedURL = store.freshURL()
+                let actual = try RecordingWriter(url: actualURL, format: format, inputFormat: input)
+                let expected = try RecordingWriter(url: expectedURL, format: format, inputFormat: input)
+                if looping {
+                    try actual.configureLoop(0.02..<0.08, start: 0)
+                    try expected.configureLoop(0.02..<0.08, start: 0)
+                }
+                let clock = RecordingHostClock(), reference = 100.0, latency = 0.023
+                clock.set(hostTime: AVAudioTime.hostTime(forSeconds: reference))
+                actual.configureSynchronization(clock: clock, inputLatency: latency)
+                // A gap during pre-roll, an overlap, a missing input packet,
+                // a repeated packet and a pulse after all these transitions.
+                let packets = [(-600, 200), (-400, 200), (-200, 457), (200, 312), (512, 512),
+                               (1536, 512), (1536, 512), (2048, 4096)]
+                let total = 6144
+                var referencePCM = [[Float]](repeating: Array(repeating: 0, count: total), count: channels)
+                var written = 0
+                for (first, count) in packets {
+                    let buffer = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(count))!
+                    buffer.frameLength = AVAudioFrameCount(count)
+                    for channel in 0..<channels { for i in 0..<count {
+                        let frame = first + i
+                        let sample: Float = frame == 4000 ? 0.8 : Float(sin(Double(frame) * 0.017) * 0.2)
+                        let value = channel == 0 ? sample : -sample * 0.3
+                        buffer.floatChannelData![channel][i] = value
+                        if frame >= written && frame >= 0 { referencePCM[channel][frame] = value }
+                    } }
+                    written = max(written, first + count)
+                    let stamp = AVAudioTime.hostTime(forSeconds: reference + latency + Double(first) / 48_000)
+                    actual.append(buffer, hostTime: [-400, 512, 2048].contains(first) ? nil : stamp)
+                }
+                // The reference writer sees one continuous, already aligned stream.
+                let buffer = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(total))!
+                buffer.frameLength = AVAudioFrameCount(total)
+                for channel in 0..<channels { referencePCM[channel].withUnsafeBufferPointer { buffer.floatChannelData![channel].update(from: $0.baseAddress!, count: total) } }
+                expected.append(buffer)
+                if let failure = actual.finish() { throw failure }
+                if let failure = expected.finish() { throw failure }
+                let result = try AudioStore.decode(actualURL, sampleRate: rate)
+                let target = try AudioStore.decode(expectedURL, sampleRate: rate)
+                guard result.frameCount == target.frameCount, zip(result.channels, target.channels).allSatisfy({ a, b in
+                    zip(a, b).allSatisfy { abs($0 - $1) < 1e-6 }
+                }) else {
+                    throw SounderError.message("Input packet loss/overlap shifts recorded PCM (\(Int(rate)) Hz, \(channels) channels, Loop \(looping), frames \(result.frameCount)/\(target.frameCount))")
+                }
+                print("PASS: Timestamped gaps/overlaps preserve saved PCM and loop seams at \(Int(rate)) Hz, \(channels) channel(s), Loop \(looping)")
+            }
+        }
+    }
+}
+
+func runAtomicStopPositionTests() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderAtomicStop-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+    for space in [false, true] {
+        let editor = Editor(store: store)
+        editor.cursor = 1.25
+        let recorder = try LiveRecorder(url: store.freshURL(), format: ProjectAudioFormat(), inputFormat: input)
+        try recorder.start(); editor.activateRecording(recorder)
+        recorder.writer.append(captureTestBuffer(format: input, start: 0, frames: 24_000))
+        recorder.writer.waitForPendingWrites(); editor.updateRecordingWaveform()
+        var presented: [Double] = []
+        editor.changed = { presented.append(editor.cursor) }
+        if space { editor.playPause() } else { editor.stopAndReturnToStart() }
+        guard !presented.isEmpty, presented.allSatisfy({ $0 == 1.25 }), editor.cursor == 1.25 else {
+            throw SounderError.message("\(space ? "Space" : "Stop") publishes intermediate recording-end cursor positions: \(presented)")
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        guard editor.cursor == 1.25, editor.project.tracks[0].clips.count == 1 else {
+            throw SounderError.message("Late capture completion moves the stopped cursor or loses the take")
+        }
+        print("PASS: \(space ? "Space" : "Stop") commits recording and presents only the final return position")
+    }
+}
+
+func runRecordingOutputAnchorTests() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderOutputAnchor-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    for capacity in [96, 1000, 1024, 4096, 32768] {
+        let format = ProjectAudioFormat(bitDepth: 32)
+        let project = Project(tracks: [Track(name: "Selected empty loop")], audioFormat: format)
+        let live = LivePlayback(graph: try StreamingGraph(project: project, store: store) { _ in fatalError() }, format: format, start: 100.0 / 48_000)
+        try live.configureBufferSize(capacity)
+        live.setLoop((100.0 / 48_000)..<(137.0 / 48_000))
+        try live.prepareForRecording()
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
+        try live.startPlayback(playImmediately: false)
+        defer { live.stop() }
+        for frame in [0, 36, 37, 38, capacity - 1] {
+            let renderSeconds = 100 + Double(frame) / 48_000
+            let renderTime = AVAudioTime(hostTime: AVAudioTime.hostTime(forSeconds: renderSeconds))
+            let playerTime = AVAudioTime(sampleTime: AVAudioFramePosition(frame), atRate: 48_000)
+            let latency = 0.037
+            guard let anchor = live.recordingAnchor(renderTime: renderTime, playerTime: playerTime, outputLatency: latency) else {
+                throw SounderError.message("Missing recording DAC snapshot")
+            }
+            let expectedFrame = 100 + frame % 37
+            let error = abs(AVAudioTime.seconds(forHostTime: anchor.hostTime) - renderSeconds - latency)
+            guard abs(anchor.sourceTime * 48_000 - Double(expectedFrame)) < 1e-6, error < 1e-7 else {
+                throw SounderError.message("Recording anchor crosses a loop cycle or adds render-ahead latency (capacity \(capacity), frame \(frame))")
+            }
+            // A physical pulse 50 ms after the DAC anchor must be placed at
+            // 50 ms in the new take, independently of ready-queue capacity.
+            let clock = RecordingHostClock(); clock.set(hostTime: anchor.hostTime)
+            let inputStamp = AVAudioTime.hostTime(forSeconds: AVAudioTime.seconds(forHostTime: anchor.hostTime) + 0.023 + 0.05)
+            guard clock.inputFrameOffset(hostTime: inputStamp, latency: 0.023, sampleRate: 48_000) == 2400 else {
+                throw SounderError.message("Recording adds queue capacity or device latency twice")
+            }
+        }
+        // Enter's replacement take starts when the queued seek reaches output,
+        // even when the old source has the same time on a different loop pass.
+        live.seek(to: 0.5); live.queue.sync {}
+        let stamp = AVAudioTime(hostTime: AVAudioTime.hostTime(forSeconds: 100))
+        let played = AVAudioTime(sampleTime: 0, atRate: 48_000)
+        guard let anchor = live.recordingAnchor(at: 0.5, renderTime: stamp, playerTime: played, outputLatency: 0.037),
+              abs(AVAudioTime.seconds(forHostTime: anchor.hostTime) - 100 - 0.037 - Double(capacity) / 48_000) < 1e-7 else {
+            throw SounderError.message("Enter anchors the replacement recording before its seek is audible")
+        }
+        print("PASS: One DAC snapshot aligns punch-in, short Loop and queued Enter with a \(capacity)-sample queue")
+    }
+}
+
+/// Record a timestamped pulse, finalize its WAV, then play it with the backing
+/// pulse through AVAudioEngine. A correct preview alone cannot pass this test.
+func runRecordedTrackAlignmentTests() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderRecordedAlignment-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    for rate in [44_100.0, 48_000, 96_000] {
+        for capacity in [96, 1000, 32768] {
+            let format = ProjectAudioFormat(sampleRate: rate, bitDepth: 32)
+            let input = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+            let reference = 100.037, inputLatency = 0.023
+            let editor = Editor(store: store, makeRecorder: { url, format in
+                let capture = try LiveRecorder(url: url, format: format, inputFormat: input)
+                let clock = RecordingHostClock(); clock.set(hostTime: AVAudioTime.hostTime(forSeconds: reference))
+                capture.writer.configureSynchronization(clock: clock, inputLatency: inputLatency)
+                return capture
+            }, makePlayback: { graph, format, start in
+                let live = LivePlayback(graph: graph, format: format, start: start)
+                try live.engine.enableManualRenderingMode(.offline, format: AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 2)!, maximumFrameCount: 512)
+                return live
+            })
+            store.configure(format)
+            var bedPCM = [Float](repeating: 0, count: Int(rate))
+            let pulseFrame = Int((0.35 * rate).rounded())
+            bedPCM[pulseFrame] = 0.4
+            let bedURL = store.freshURL(); try store.write(AudioSignal(channels: [bedPCM]), to: bedURL, bitDepth: 32)
+            let bed = Track(name: "Backing pulse", clips: [Clip(name: "Reference", source: bedURL.path, start: 0, duration: 1, order: 1)])
+            let mic = Track(name: "Recorded pulse")
+            editor.project = Project(tracks: [bed, mic], audioFormat: format)
+            editor.project.playbackBufferFrames = capacity
+            editor.selectedTrack = mic.id; editor.cursor = 0.25
+            defer { editor.stop() }
+            try editor.startRecording()
+            let writer = editor.recorder!.writer
+            let pre = 1776
+            for first in stride(from: -pre, to: 19_200, by: 257) {
+                let count = min(257, 19_200 - first)
+                let buffer = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: AVAudioFrameCount(count))!
+                buffer.frameLength = AVAudioFrameCount(count)
+                buffer.floatChannelData![0].initialize(repeating: 0, count: count)
+                if first <= 4800 && first + count > 4800 { buffer.floatChannelData![0][4800 - first] = 0.4 }
+                writer.append(buffer, hostTime: AVAudioTime.hostTime(forSeconds: reference + inputLatency + Double(first) / 48_000))
+            }
+            writer.waitForPendingWrites(); editor.stopAndReturnToStart()
+            guard let take = editor.project.tracks[1].clips.first, take.start == 0.25 else { throw SounderError.message("Recorded take lost its trigger position") }
+            let recorded = try store.renderAudio(editor.project, onlyTrack: mic.id)
+            let peak = recorded.channels[0].indices.max { abs(recorded.channels[0][$0]) < abs(recorded.channels[0][$1]) }!
+            guard abs(peak - pulseFrame) <= 3 else { throw SounderError.message("Saved take lags backing pulse at \(Int(rate)) Hz, buffer \(capacity): \(peak - pulseFrame) frames") }
+            editor.seek(to: 0); editor.playPause()
+            guard let live = editor.player else { throw SounderError.message("Cannot replay recorded take") }
+            let quantum = min(512, capacity / 3)
+            let output = AVAudioPCMBuffer(pcmFormat: live.engine.manualRenderingFormat, frameCapacity: 512)!
+            var audible: [Float] = []
+            while audible.count < pulseFrame + 1024 {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.001)); live.queue.sync {}
+                guard try live.engine.renderOffline(AVAudioFrameCount(quantum), to: output) == .success else { throw SounderError.message("Cannot render recorded take replay") }
+                audible.append(contentsOf: UnsafeBufferPointer(start: output.floatChannelData![0], count: quantum))
+            }
+            let maximum = audible.indices.max { abs(audible[$0]) < abs(audible[$1]) }!
+            guard abs(maximum - pulseFrame) <= 3, abs(audible[maximum]) > 0.6 else {
+                throw SounderError.message("Replayed take does not coincide with backing audio at \(Int(rate)) Hz, buffer \(capacity)")
+            }
+            print("PASS: Recorded WAV and actual replay align with the backing pulse at \(Int(rate)) Hz, buffer \(capacity)")
+        }
+    }
+}
+
 func captureTestBuffer(format: AVAudioFormat, start: Int, frames: Int) -> AVAudioPCMBuffer {
     let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))!
     buffer.frameLength = AVAudioFrameCount(frames)

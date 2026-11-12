@@ -5,13 +5,22 @@ extension AppDelegate {
     func verifyCanvasCompositionUI() throws {
         let content = window.contentView!
         content.layoutSubtreeIfNeeded(); timeline.refresh(); content.displayIfNeeded()
+        // A preceding transport/scroll test may leave the first fixture clip
+        // outside the viewport. Sample a known visible canvas, then restore it.
+        timeline.synchronizeScrollPresentation()
+        let clipView = timeline.enclosingScrollView!.contentView
+        let previousOrigin = clipView.bounds.origin
+        clipView.scroll(to: .zero)
+        defer { clipView.scroll(to: previousOrigin) }
         let clip = timeline.clipRect(editor.project.tracks[0].clips[0], row: 0, layer: 0)
         let point = timeline.convertDocumentPoint(NSPoint(x: clip.minX + 18, y: clip.midY + 5), to: content)
         guard let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { throw SounderError.message("Cannot capture canvas composition") }
         content.cacheDisplay(in: content.bounds, to: bitmap)
         let scale = CGFloat(bitmap.pixelsWide) / content.bounds.width
         let y = content.isFlipped ? point.y : content.bounds.maxY - point.y
-        let color = bitmap.colorAt(x: Int(point.x * scale), y: Int(y * scale))!.usingColorSpace(.deviceRGB)!
+        guard let color = bitmap.colorAt(x: Int(point.x * scale), y: Int(y * scale))?.usingColorSpace(.deviceRGB) else {
+            throw SounderError.message("Canvas composition sample is outside the captured viewport: \(point)")
+        }
         guard color.greenComponent - color.redComponent > 0.04 else { throw SounderError.message("Pinned overlay covers the stopped fragment canvas: \(color)") }
         print("PASS: The stopped window composites fragment pixels through the pinned overlay")
     }

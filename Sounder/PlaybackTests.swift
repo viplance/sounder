@@ -1236,7 +1236,7 @@ private func runPausedEffectsLatencyTests() throws {
     try store.write(AudioSignal(channels: [samples, samples.map { -$0 * 0.5 }]), to: url)
     // Exercise an actual delayed processor, its parent's dry compensation and
     // an independent root. Short latency also tests a fade crossing pre-roll.
-    for latency in [37, 7200] {
+    for (latency, capacity) in [37, 7200].flatMap({ latency in [96, 1000, 1024, 4096, 32768].map { (latency, $0) } }) {
         let clip = Clip(name: "Ramp", source: url.path, start: 0, duration: 4, order: 1)
         let parent = Track(name: "Parent", clips: [clip])
         let child = Track(name: "Delayed child", parent: parent.id, clips: [clip],
@@ -1256,7 +1256,10 @@ private func runPausedEffectsLatencyTests() throws {
             }
         }
         let live = LivePlayback(graph: graph, format: format, start: 0.25)
+        try live.configureBufferSize(capacity)
         live.continuesEffectsWhenPaused = true
+        let quantum = min(512, capacity / 3)
+        let drainBlocks = (capacity + latency + quantum - 1) / quantum + 32
         let pcm = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
         try live.engine.enableManualRenderingMode(.offline, format: pcm, maximumFrameCount: 512)
         let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 512)!
@@ -1264,23 +1267,23 @@ private func runPausedEffectsLatencyTests() throws {
         defer { live.stop() }
         func block() throws -> [[Float]] {
             RunLoop.current.run(until: Date().addingTimeInterval(0.002)); live.queue.sync {}
-            guard try live.engine.renderOffline(512, to: buffer) == .success else { throw SounderError.message("Cannot render resumed FX") }
-            return (0..<2).map { Array(UnsafeBufferPointer(start: buffer.floatChannelData![$0], count: 512)) }
+            guard try live.engine.renderOffline(AVAudioFrameCount(quantum), to: buffer) == .success else { throw SounderError.message("Cannot render resumed FX") }
+            return (0..<2).map { Array(UnsafeBufferPointer(start: buffer.floatChannelData![$0], count: quantum)) }
         }
         for _ in 0..<8 { _ = try block() }
         let engine = live.engine, node = live.node
         for target in [Double?.none, 1.5] {
             try live.pause()
-            for _ in 0..<20 { if live.pauseComplete { break }; _ = try block() }
+            for _ in 0..<(capacity / quantum + 32) { if live.pauseComplete { break }; _ = try block() }
             guard live.pauseComplete else { throw SounderError.message("Latency test did not pause") }
             // Let silence fully replace both processor and compensation state.
-            for _ in 0..<24 { _ = try block() }
+            for _ in 0..<drainBlocks { _ = try block() }
             let start = target ?? live.pausePosition
             try live.resume(to: start)
             var sourceFrame = 1, heardSource = false, maximum = 0.0
-            for _ in 0..<24 {
+            for _ in 0..<drainBlocks {
                 let output = try block()
-                for i in 0..<512 {
+                for i in 0..<quantum {
                     if !heardSource && abs(output[0][i]) > 1e-8 { heardSource = true }
                     guard heardSource else { continue }
                     let gain = Float(min(1, Double(sourceFrame) / 479))
@@ -1289,13 +1292,13 @@ private func runPausedEffectsLatencyTests() throws {
                     sourceFrame += 1
                 }
                 if live.currentTime - start >= 1024.0 / 48_000 && !heardSource {
-                    throw SounderError.message("Cursor advances through silent FX latency on resume (\(latency) frames)")
+                    throw SounderError.message("Cursor advances through silent FX latency on resume (\(latency) frames, queue \(capacity))")
                 }
             }
             guard heardSource, maximum < 1e-6, instances == 1, live.engine === engine, live.node === node, live.graph === graph else {
-                throw SounderError.message("Resume loses source frames, fade or live FX state (latency \(latency), error \(maximum))")
+                throw SounderError.message("Resume loses source frames, fade or live FX state (latency \(latency), queue \(capacity), error \(maximum))")
             }
-            print("PASS: Resume after idle FX/paused seek preserves exact stereo samples, 10 ms fade and processors with \(latency)-frame latency (error: \(maximum))")
+            print("PASS: Resume after idle FX/paused seek preserves exact stereo samples, 10 ms fade and processors with \(latency)-frame latency, queue \(capacity) (error: \(maximum))")
         }
     }
 }
