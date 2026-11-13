@@ -105,6 +105,7 @@ final class PluginEditorWindow: NSObject, NSWindowDelegate {
     }
     func parameterValues() -> [Double] { host.parameters().map { ($0["value"] as? NSNumber)?.doubleValue ?? 0 } }
     func captureChanges() {
+        guard editor.pluginHosts[effectID] === host, editor.pluginWindows[effectID] === self else { return }
         guard let snapshot = host.editorSnapshot(revision: lastRevision, values: lastParameters.map { NSNumber(value: $0) }) else { return }
         if let message = snapshot["error"] as? String { editor.error(SounderError.message(message)); return }
         let parameters = (snapshot["values"] as? [NSNumber] ?? []).map(\.doubleValue)
@@ -115,13 +116,16 @@ final class PluginEditorWindow: NSObject, NSWindowDelegate {
         guard let state = snapshot["state"] as? Data,
               let effect = editor.project.allEffects.first(where: { $0.id == effectID }), state != effect.state else { return }
         editor.invalidateMixCache()
-        if !editor.dirty || Date().timeIntervalSince(lastChange) > 0.5 { editor.checkpoint() }
+        if !editor.dirty || Date().timeIntervalSince(lastChange) > 0.5 { guard editor.checkpoint(capturingPlugins: false) else { return } }
         editor.setEffectState(state, effectID: effectID)
         lastChange = Date(); editor.update()
     }
     @objc func changeParameter(_ sender: NSSlider) { host.setParameter(sender.tag, value: sender.doubleValue); captureChanges() }
     func close(capture: Bool = true) {
-        if capture { captureChanges() }
+        if capture {
+            captureChanges()
+            do { try editor.capturePluginStates(recordUndo: true) } catch { editor.error(error); return }
+        }
         idle?.invalidate(); idle = nil; host.detachEditor(); window?.orderOut(nil)
         editor.pluginWindows.removeValue(forKey: effectID)
     }
@@ -503,7 +507,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
             }
             let first = effects.count
             try editor.capturePluginStates()
-            editor.checkpoint()
+            guard editor.checkpoint() else { return false }
             editor.pluginHosts.merge(hosts) { current, _ in current }
             effects.append(contentsOf: additions)
             editor.effectsChanged(); reload()
@@ -534,7 +538,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         guard exists, (0...effects.count).contains(insertion), let row = effects.firstIndex(where: { $0.id == id }) else { return false }
         let destination = insertion > row ? insertion - 1 : insertion
         guard destination != row else { return false }
-        editor.checkpoint()
+        guard editor.checkpoint() else { return false }
         var chain = effects; let effect = chain.remove(at: row); chain.insert(effect, at: destination); effects = chain
         editor.effectsChanged(); reload(); table.selectRowIndexes(IndexSet(integer: destination), byExtendingSelection: false)
         return true
@@ -545,7 +549,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
         do {
             let host = try SNPluginHost(path: url.path, classID: "", state: nil, sampleRate: editor.project.audioFormat.sampleRate)
             let effect = PluginEffect(name: host.pluginName, path: url.path, classID: host.classID, state: try host.saveState())
-            editor.checkpoint()
+            guard editor.checkpoint() else { return }
             // Register before effectsChanged can start background preparation.
             // The native editor and the audio graph must share this processor.
             editor.pluginHosts[effect.id] = host
@@ -581,13 +585,13 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     @objc func bypass() { if effects.indices.contains(table.selectedRow) { bypass(id: effects[table.selectedRow].id) } }
     func bypass(id: UUID) {
         guard exists, let row = effects.firstIndex(where: { $0.id == id }) else { return }
-        editor.checkpoint(); effects[row].bypassed.toggle(); editor.effectsChanged(); reload()
+        guard editor.checkpoint() else { return }; effects[row].bypassed.toggle(); editor.effectsChanged(); reload()
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
     }
     @objc func remove() { if effects.indices.contains(table.selectedRow) { remove(id: effects[table.selectedRow].id) } }
     func remove(id: UUID) {
         guard exists, let row = effects.firstIndex(where: { $0.id == id }) else { return }
-        editor.pluginWindows[id]?.close(); editor.checkpoint(); effects.remove(at: row); editor.effectsChanged(); reload()
+        editor.pluginWindows[id]?.close(); guard editor.checkpoint() else { return }; effects.remove(at: row); editor.effectsChanged(); reload()
         editor.notifications.show("Effect removed", style: .error)
     }
     func move(id: UUID, by delta: Int) {

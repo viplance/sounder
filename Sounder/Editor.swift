@@ -316,7 +316,7 @@ final class Editor: NSObject {
     func setPlaybackBufferSize(_ frames: Int) throws {
         try PlaybackBufferSize.validate(frames)
         guard canEditPlaybackBuffer, frames != project.playbackBufferSize else { return }
-        checkpoint(); project.playbackBufferFrames = frames; update()
+        guard checkpoint() else { return }; project.playbackBufferFrames = frames; update()
     }
     func editPlaybackBuffer(using edit: (Int) -> Int?) throws {
         guard canEditPlaybackBuffer else { return }
@@ -457,7 +457,7 @@ final class Editor: NSObject {
     var canArmTracks: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     func toggleRecordArm(_ id: UUID) {
         guard canArmTracks, let index = project.tracks.firstIndex(where: { $0.id == id }) else { return }
-        checkpoint(); project.tracks[index].recordArmed.toggle(); update()
+        guard checkpoint() else { return }; project.tracks[index].recordArmed.toggle(); update()
     }
     private var recordingOrigin = 0.0
     private var pendingRecordedSources = Set<String>()
@@ -539,28 +539,51 @@ final class Editor: NSObject {
             try input?.validate()
             if let trackID {
                 guard let index = project.tracks.firstIndex(where: { $0.id == trackID }), project.tracks[index].input != input else { return }
-                checkpoint(); project.tracks[index].input = input
+                guard checkpoint() else { return }; project.tracks[index].input = input
             } else {
                 let route = input ?? AudioEndpoint()
                 guard project.defaultInput != route else { return }
-                checkpoint(); project.defaultInput = route
+                guard checkpoint() else { return }; project.defaultInput = route
             }
             update()
         } catch { self.error(error) }
     }
     func setAudioOutput(_ output: AudioEndpoint) {
         guard !busy, project.defaultOutput != output else { return }
-        do { try output.validate(); checkpoint(); project.defaultOutput = output; update() }
+        do { try output.validate(); guard checkpoint() else { return }; project.defaultOutput = output; update() }
         catch { self.error(error) }
     }
-    func checkpoint() { invalidateMixCache(); undoStack.append(project); if undoStack.count > 50 { undoStack.removeFirst() }; redoStack = []; dirty = true }
-    func undo() { guard !busy else { return }; flushPluginEdits(); guard let previous = undoStack.popLast() else { return }; redoStack.append(project); project = previous; dirty = true; reconcile(); update("Undo") }
-    func redo() { guard !busy else { return }; flushPluginEdits(); guard let next = redoStack.popLast() else { return }; undoStack.append(project); project = next; dirty = true; reconcile(); update("Redo") }
+    /// Capture before mutation. A failed snapshot aborts the edit rather than
+    /// putting an incomplete plugin state into history.
+    @discardableResult func checkpoint(capturingPlugins: Bool = true) -> Bool {
+        do { if capturingPlugins { try capturePluginStates() } }
+        catch { self.error(error); return false }
+        invalidateMixCache(); undoStack.append(project)
+        if undoStack.count > 50 { undoStack.removeFirst() }
+        redoStack = []; dirty = true; return true
+    }
+    func undo() { restoreHistory(undo: true) }
+    func redo() { restoreHistory(undo: false) }
+    private func restoreHistory(undo: Bool) {
+        guard !busy else { return }
+        flushPluginEdits()
+        guard let replacement = undo ? undoStack.last : redoStack.last else { return }
+        do { try capturePluginStates() } catch { self.error(error); return }
+        let current = project
+        // Retire every producer/window before exposing the replacement project.
+        retirePluginSession()
+        if undo { undoStack.removeLast(); redoStack.append(current) }
+        else { redoStack.removeLast(); undoStack.append(current) }
+        project = replacement; dirty = true; reconcile(); update(undo ? "Undo" : "Redo")
+    }
+    private func retirePluginSession() {
+        cancelPlaybackPreparation(); preparationRequest = nil
+        discardLiveEffects(); discardStandbyPlayback(); discardPausedPlayback(); releaseMIDI()
+        closePluginWindows(capture: false); pluginHosts = [:]
+    }
     func reconcile() {
-        discardLiveEffects(); releaseMIDI()
+        retirePluginSession()
         invalidateMixCache()
-        closePluginWindows(capture: false)
-        pluginHosts = [:]
         for window in Array(effectsWindows.values) {
             if window.exists { window.reload(notifyEditor: false) } else { window.done() }
         }
@@ -571,13 +594,13 @@ final class Editor: NSObject {
     func renameProject(_ name: String) {
         let trimmed = NameRules.normalized(name)
         guard !trimmed.isEmpty, trimmed != projectName else { return }
-        checkpoint(); project.name = trimmed; update("Project renamed")
+        guard checkpoint() else { return }; project.name = trimmed; update("Project renamed")
     }
     func setAudioFormat(_ format: ProjectAudioFormat) throws {
         guard !busy, format != project.audioFormat else { return }
         try format.validate()
         discardLiveEffects(); releaseMIDI()
-        flushPluginEdits(); checkpoint(); closePluginWindows(capture: false); pluginHosts = [:]
+        flushPluginEdits(); guard checkpoint() else { return }; closePluginWindows(capture: false); pluginHosts = [:]
         project.audioFormat = format; audio.configure(format)
         update("Audio format: " + format.label)
     }
@@ -601,7 +624,7 @@ final class Editor: NSObject {
                 }
             }
         }
-        checkpoint()
+        guard checkpoint() else { return }
         project.tracks.insert(track, at: insertion); selectedTrack = track.id; selection = []; update(nested ? "Nested track added" : "Track added")
     }
     func descendants(of id: UUID) -> Set<UUID> {
@@ -616,7 +639,7 @@ final class Editor: NSObject {
         do { try TrackHierarchy.validate(tracks) }
         catch { notifications.show(TrackHierarchy.limitMessage, style: .hint); return }
         guard project.tracks[index].parent != parent else { return }
-        checkpoint(); project.tracks = tracks; update("Track hierarchy updated")
+        guard checkpoint() else { return }; project.tracks[index].parent = parent; update("Track hierarchy updated")
     }
     func removeTrack() {
         guard !busy else { return }
@@ -624,12 +647,12 @@ final class Editor: NSObject {
         let id = project.tracks[index].id
         let alert = ActionChoiceAlert(); alert.cancellationIndex = 1; alert.messageText = "Delete track?"; alert.informativeText = "This removes the track, its fragments and nested tracks. You can undo this action."; alert.addButton(withTitle: "Delete"); alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        checkpoint(); let ids = descendants(of: id); project.tracks.removeAll { ids.contains($0.id) }; reconcile(); notifications.show("Track deleted", style: .error); update()
+        guard checkpoint() else { return }; let ids = descendants(of: id); project.tracks.removeAll { ids.contains($0.id) }; reconcile(); notifications.show("Track deleted", style: .error); update()
     }
     func deleteClips() {
         guard !busy else { return }
         guard !selection.isEmpty else { notifications.show("Select fragments to delete", style: .hint); return }
-        checkpoint()
+        guard checkpoint() else { return }
         for i in project.tracks.indices { project.tracks[i].clips.removeAll { selection.contains($0.id) } }; selection = []; notifications.show("Fragments deleted", style: .error); update()
     }
     static let fragmentPasteboardType = NSPasteboard.PasteboardType("enotix.Sounder.fragments")
@@ -663,7 +686,7 @@ final class Editor: NSObject {
             var targets = TrackHierarchy.orderedRows(project.tracks).map { $0.0.id }
             let base = targets.firstIndex(where: { $0 == selectedTrack }) ?? 0
             let required = base + payload.items.map(\.row).max()! + 1
-            checkpoint()
+            guard checkpoint() else { return }
             while targets.count < required {
                 let row = targets.count - base
                 let name = NameRules.normalized(payload.items.first(where: { $0.row == row })?.trackName ?? "Audio " + String(format: "%02d", targets.count + 1))
@@ -698,7 +721,7 @@ final class Editor: NSObject {
                 }
                 let results = gains, cache = prepared
                 DispatchQueue.main.async { [self] in
-                    checkpoint()
+                    guard checkpoint() else { return }
                     for i in project.tracks.indices {
                         for j in project.tracks[i].clips.indices {
                             if let gain = results[project.tracks[i].clips[j].id] { project.tracks[i].clips[j].gain = gain }
@@ -718,14 +741,14 @@ final class Editor: NSObject {
         let original = project.tracks[i].clips[j]
         let edited = try settings.applying(to: original, peak: peak)
         guard FragmentSettings(edited) != FragmentSettings(original) else { return }
-        checkpoint(); project.tracks[i].clips[j] = edited; update("Fragment updated")
+        guard checkpoint() else { return }; project.tracks[i].clips[j] = edited; update("Fragment updated")
     }
     func setFragmentFade(_ id: UUID, left: Bool, durationMS: Double? = nil, curve: FadeCurve? = nil) {
         guard !busy, let i = project.tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == id }) }),
               let j = project.tracks[i].clips.firstIndex(where: { $0.id == id }) else { return }
         let original = project.tracks[i].clips[j], edited = original.changingFade(left: left, durationMS: durationMS, curve: curve)
         guard FragmentSettings(original) != FragmentSettings(edited) else { return }
-        checkpoint(); project.tracks[i].clips[j] = edited; update()
+        guard checkpoint() else { return }; project.tracks[i].clips[j] = edited; update()
     }
     func fragmentsAreMuted(_ ids: Set<UUID>) -> Bool {
         let clips = project.tracks.flatMap(\.clips).filter { ids.contains($0.id) }
@@ -738,7 +761,7 @@ final class Editor: NSObject {
             notifications.show("Select fragments to mute or unmute", style: .hint); return
         }
         let muted = !fragmentsAreMuted(targets)
-        checkpoint()
+        guard checkpoint() else { return }
         for i in project.tracks.indices {
             for j in project.tracks[i].clips.indices where targets.contains(project.tracks[i].clips[j].id) { project.tracks[i].clips[j].muted = muted }
         }
@@ -776,7 +799,7 @@ final class Editor: NSObject {
         guard !busy else { return }
         let changes = fragmentLayerChanges(ids, up: up)
         guard !changes.isEmpty else { return }
-        checkpoint()
+        guard checkpoint() else { return }
         for change in changes {
             var clips = change.clips
             for i in clips.indices { clips[i].order = project.nextOrder; project.nextOrder += 1 }
@@ -804,7 +827,7 @@ final class Editor: NSObject {
     }
     func finishAudioImport(_ imported: [ImportedAudio], track: UUID?, start: Double, placement: AudioImportPlacement = .singleTrack) {
         guard !imported.isEmpty else { update(); return }
-        checkpoint()
+        guard checkpoint() else { return }
         var targets: [UUID]
         switch placement {
         case .singleTrack:
@@ -845,7 +868,7 @@ final class Editor: NSObject {
                 guard granted else { self.error(SounderError.message("Allow Sounder to use the microphone in System Settings → Privacy & Security → Microphone.")); return }
                 do {
                     if self.recordingTargets.isEmpty {
-                        self.checkpoint()
+                        guard self.checkpoint() else { return }
                         let track = Track(name: "Audio " + String(format: "%02d", self.project.tracks.count + 1))
                         self.project.tracks.append(track); self.selectedTrack = track.id
                     }
@@ -1062,7 +1085,7 @@ final class Editor: NSObject {
     }
     func toggleAllEffects(for trackID: UUID) {
         guard canToggleEffects, let chain = effectChain(for: trackID), !chain.isEmpty else { return }
-        checkpoint()
+        guard checkpoint() else { return }
         if trackID == Project.masterID { project.masterEffectsBypassed.toggle() }
         else if let index = project.tracks.firstIndex(where: { $0.id == trackID }) { project.tracks[index].effectsBypassed.toggle() }
         effectsChanged()
@@ -1082,18 +1105,24 @@ final class Editor: NSObject {
     // Files/presets/impulse responses can change without any normalized
     // parameter or edit notification. Save the complete authoritative hosts,
     // including processors whose editors have already been closed.
-    func capturePluginStates() throws {
+    func capturePluginStates(recordUndo: Bool = false) throws {
         var states: [(UUID, Data)] = []
         for effect in project.allEffects {
             if let host = pluginHosts[effect.id] { states.append((effect.id, try host.saveState())) }
         }
-        for (id, state) in states { setEffectState(state, effectID: id) }
+        let previous = Dictionary(uniqueKeysWithValues: project.allEffects.map { ($0.id, $0.state) })
+        let changed = states.contains { (previous[$0.0] ?? nil) != $0.1 }
+        if changed, recordUndo { _ = checkpoint(capturingPlugins: false) }
+        for (id, state) in states {
+            if (previous[id] ?? nil) != state { dirty = true }
+            setEffectState(state, effectID: id)
+        }
     }
     func closePluginWindows(capture: Bool = true) { for window in Array(pluginWindows.values) { window.close(capture: capture) } }
-    func toggleTempoMode() { checkpoint(); project.tempoMode.toggle(); updateMetronome(); update() }
+    func toggleTempoMode() { guard checkpoint() else { return }; project.tempoMode.toggle(); updateMetronome(); update() }
     func setTempo(_ bpm: Double) {
         guard bpm.isFinite, (20...300).contains(bpm), bpm != project.tempo else { return }
-        checkpoint(); project.tempo = bpm; updateMetronome(); update("Tempo updated")
+        guard checkpoint() else { return }; project.tempo = bpm; updateMetronome(); update("Tempo updated")
     }
     var loopRange: Range<Double>? {
         guard project.loopEnabled else { return nil }
@@ -1106,11 +1135,11 @@ final class Editor: NSObject {
     var canToggleLoop: Bool { !isRecording && !isShuttling && !requestingMic && !isExporting && !isImporting && !isOpening && !isNormalizing }
     func toggleLoop() {
         guard canToggleLoop else { return }
-        checkpoint(); project.loopEnabled.toggle(); updateLoop(); update()
+        guard checkpoint() else { return }; project.loopEnabled.toggle(); updateLoop(); update()
     }
     private func updateLoop() { player?.setLoop(loopRange) }
     func toggleMetronome() {
-        checkpoint(); project.metronomeEnabled.toggle(); updateMetronome(); update()
+        guard checkpoint() else { return }; project.metronomeEnabled.toggle(); updateMetronome(); update()
     }
     private func updateMetronome() {
         player?.setMetronome(tempo: project.tempo, enabled: project.metronomeIsAudible)
@@ -1124,7 +1153,7 @@ final class Editor: NSObject {
             guard canAdjustTrackMix, let volumeDB, volumeDB.isFinite else { return false }
             let volume = max(-60, min(12, volumeDB))
             guard volume != project.masterVolumeDB else { return false }
-            if shouldCheckpoint { checkpoint() } else { invalidateMixCache(); dirty = true }
+            if shouldCheckpoint { guard checkpoint() else { return false } } else { invalidateMixCache(); dirty = true }
             project.masterVolumeDB = volume; player?.setTrackMix(project.masterTrack)
             liveEffectsPlayer?.setTrackMix(project.masterTrack)
             update(); return true
@@ -1134,16 +1163,16 @@ final class Editor: NSObject {
         if let volumeDB, volumeDB.isFinite { track.volumeDB = max(-60, min(12, volumeDB)) }
         if let pan, pan.isFinite { track.pan = max(-90, min(90, pan)) }
         guard track.volumeDB != project.tracks[i].volumeDB || track.pan != project.tracks[i].pan else { return false }
-        if shouldCheckpoint { checkpoint() }
+        if shouldCheckpoint { guard checkpoint() else { return false } }
         else { invalidateMixCache(); dirty = true }
-        project.tracks[i] = track; player?.setTrackMix(track)
+        project.tracks[i].volumeDB = track.volumeDB; project.tracks[i].pan = track.pan; player?.setTrackMix(project.tracks[i])
         liveEffectsPlayer?.setTrackMix(track)
         update(); return true
     }
     func toggleMute(_ trackID: UUID) {
         guard !isRecording, !isShuttling, !requestingMic, !isExporting, !isImporting, !isOpening,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
-        checkpoint()
+        guard checkpoint() else { return }
         project.tracks[index].muted.toggle()
         player?.setMuted(project.tracks[index].muted, trackID: trackID)
         liveEffectsPlayer?.setMuted(project.tracks[index].muted, trackID: trackID)
@@ -1153,7 +1182,7 @@ final class Editor: NSObject {
     func toggleSolo(_ trackID: UUID) {
         guard !isRecording, !isShuttling, !requestingMic, !isExporting, !isImporting, !isOpening,
               let index = project.tracks.firstIndex(where: { $0.id == trackID }) else { return }
-        checkpoint()
+        guard checkpoint() else { return }
         project.tracks[index].solo.toggle()
         player?.setSolo(Set(project.tracks.filter(\.solo).map(\.id)))
         liveEffectsPlayer?.setSolo(Set(project.tracks.filter(\.solo).map(\.id)))
@@ -1604,7 +1633,7 @@ final class Editor: NSObject {
                 } catch { errors.append(error) }
             }
             if !saved.isEmpty {
-                checkpoint()
+                guard checkpoint() else { return }
                 for (index, clip) in saved {
                     project.tracks[index].nextTakeNumber += 1; project.tracks[index].clips.append(clip)
                 }
@@ -1627,7 +1656,7 @@ final class Editor: NSObject {
         guard !busy else { return }
         let targets = project.tracks.flatMap(\.clips).filter { selection.contains($0.id) && cursor > $0.start && cursor < $0.end }
         guard !targets.isEmpty else { notifications.show("Select a fragment and place the playhead inside it to split", style: .hint); return }
-        checkpoint()
+        guard checkpoint() else { return }
         for i in project.tracks.indices {
             var next: [Clip] = []
             for clip in project.tracks[i].clips {
@@ -1642,7 +1671,7 @@ final class Editor: NSObject {
     func trim() {
         guard !busy else { return }
         guard let range, !selection.isEmpty else { notifications.show("Drag over the ruler to select a range, then trim selected fragments", style: .hint); return }
-        checkpoint()
+        guard checkpoint() else { return }
         for i in project.tracks.indices {
             project.tracks[i].clips = project.tracks[i].clips.compactMap { original in
                 guard selection.contains(original.id) else { return original }
@@ -1662,7 +1691,7 @@ final class Editor: NSObject {
         do {
             var subset = project; subset.tracks[index].clips = clips
             let samples = try audio.renderAudio(subset, range: start..<end, onlyTrack: project.tracks[index].id)
-            let url = audio.freshURL(); try audio.write(samples, to: url); checkpoint()
+            let url = audio.freshURL(); try audio.write(samples, to: url); guard checkpoint() else { try? FileManager.default.removeItem(at: url); return }
             let clip = Clip(name: "Joined \(clips.count) fragments", source: url.path, start: start, duration: end - start, order: project.nextOrder, fadeInBaked: true, fadeOutBaked: true)
             project.nextOrder += 1; project.tracks[index].clips.removeAll { selection.contains($0.id) }; project.tracks[index].clips.append(clip); selection = [clip.id]; update("Fragments joined")
         } catch { self.error(error) }
@@ -1679,8 +1708,7 @@ final class Editor: NSObject {
     }
     func save(to url: URL) throws {
         guard !busy else { throw SounderError.message("Wait for the current operation before saving") }
-        flushPluginEdits()
-        try capturePluginStates()
+        try capturePluginStates(recordUndo: true)
         var snapshot = project; snapshot.name = projectName; snapshot.timelineRange = range; snapshot.timelineCursor = cursor
         snapshot.timelineView = captureTimelineView?() ?? TimelineViewState(zoom: zoom, x: project.timelineView?.x ?? 0, y: project.timelineView?.y ?? 0)
         try snapshot.timelineView?.validate()
@@ -1722,6 +1750,7 @@ final class Editor: NSObject {
     }
     func confirmDiscard() -> Bool {
         flushPluginEdits()
+        do { try capturePluginStates(recordUndo: true) } catch { self.error(error); return false }
         guard dirty else { return true }
         let alert = ActionChoiceAlert(); alert.icon = NSApp.applicationIconImage
         alert.cancellationIndex = 2; alert.messageText = "Save changes to this project?"; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Discard"); alert.addButton(withTitle: "Cancel")
@@ -1752,7 +1781,7 @@ final class Editor: NSObject {
         projectOpener = job; job.start()
     }
     func finishProjectOpen(_ prepared: PreparedProject, from url: URL) {
-        discardPausedPlayback()
+        retirePluginSession()
         pendingRecordedSources = []; recordedSourceCleanup = [:]
         project = prepared.project; projectURL = url
         audio.configure(project.audioFormat); audio.cache = prepared.sources
@@ -1778,16 +1807,14 @@ final class Editor: NSObject {
         guard canExport else { return }
         try settings.validate()
         try (metadata ?? project.metadata).validate()
-        flushPluginEdits()
-        try capturePluginStates()
+        try capturePluginStates(recordUndo: true)
         cancelPlaybackPreparation(); discardStandbyPlayback()
         exporter?.close()
         let job = AudioExportController(editor: self, destination: url, settings: settings, range: range, metadata: metadata ?? project.metadata)
         exporter = job; job.start()
     }
     func export(to url: URL, settings: ExportSettings, range: Range<Double>? = nil, metadata: AudioMetadata? = nil) throws {
-        flushPluginEdits()
-        try capturePluginStates()
+        try capturePluginStates(recordUndo: true)
         var exportedProject = project
         if let metadata { exportedProject.metadata = metadata }
         try AudioExporter.write(project: exportedProject, store: audio, settings: settings, to: url, range: range)
@@ -1795,7 +1822,7 @@ final class Editor: NSObject {
     }
     func finishAudioExport(to url: URL, settings: ExportSettings, metadata: AudioMetadata) {
         if settings != project.exportSettings || !project.exportSettingsConfirmed || metadata != project.metadata {
-            checkpoint(); project.exportSettings = settings; project.exportSettingsConfirmed = true
+            guard checkpoint() else { return }; project.exportSettings = settings; project.exportSettingsConfirmed = true
             project.metadata = metadata
         }
         update("Exported \(url.lastPathComponent)")

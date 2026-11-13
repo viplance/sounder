@@ -1932,6 +1932,10 @@ if let index = CommandLine.arguments.firstIndex(of: "--fx-clipboard-test"), inde
     do { setbuf(stdout, nil); try runEffectsClipboardTest(path: CommandLine.arguments[index + 1]); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
+if let index = CommandLine.arguments.firstIndex(of: "--plugin-state-history-test"), index + 1 < CommandLine.arguments.count {
+    do { setbuf(stdout, nil); try runPluginStateHistoryTest(path: CommandLine.arguments[index + 1]); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
 if let index = CommandLine.arguments.firstIndex(of: "--plugin-persistence-test"), index + 1 < CommandLine.arguments.count {
     do { setbuf(stdout, nil); try runPluginPersistenceTest(path: CommandLine.arguments[index + 1]); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }

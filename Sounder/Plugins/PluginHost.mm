@@ -37,6 +37,7 @@ public:
     std::mutex mutex;
     std::atomic<uint64_t> revision {0};
     void enqueue(ParamID id, ParamValue value) { std::lock_guard<std::mutex> lock(mutex); pending[id] = value; }
+    std::map<ParamID, ParamValue> snapshot() { std::lock_guard<std::mutex> lock(mutex); return pending; }
     std::map<ParamID, ParamValue> drain() { std::lock_guard<std::mutex> lock(mutex); auto result = std::move(pending); pending.clear(); return result; }
     tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
     tresult PLUGIN_API performEdit(ParamID id, ParamValue value) override { enqueue(id, value); ++revision; return kResultOk; }
@@ -227,7 +228,7 @@ struct Engine {
             NSData *chunk = saved[@"chunk"];
             if (chunk.length && (legacy->flags & (1 << 5))) legacy->dispatch(legacy, 24, 1, chunk.length, (void *)chunk.bytes, 0);
             NSArray *params = saved[@"parameters"];
-            for (NSInteger i = 0; i < MIN(params.count, legacy->numParams); ++i) legacy->setParameter(legacy, (int32_t)i, [params[i] floatValue]);
+            if (!chunk.length) for (NSInteger i = 0; i < MIN(params.count, legacy->numParams); ++i) legacy->setParameter(legacy, (int32_t)i, [params[i] floatValue]);
         } else {
             NSData *state = saved[@"component"];
             if (state.length) {
@@ -237,7 +238,9 @@ struct Engine {
             }
             NSData *ctrl = saved[@"controller"];
             if (ctrl.length && controller) { MemoryStream stream((void *)ctrl.bytes, ctrl.length); controller->setState(&stream); }
-            NSDictionary *params = saved[@"parameters"];
+            // Complete component state is authoritative. Only edits still queued
+            // for DSP at capture time may override it in the current format.
+            NSDictionary *params = [saved[@"version"] integerValue] >= 2 && state.length ? saved[@"pendingParameters"] : saved[@"parameters"];
             for (NSString *key in params) { auto id = (ParamID)key.longLongValue; double value = [params[key] doubleValue]; if (controller) controller->setParamNormalized(id, value); handler->enqueue(id, value); }
         }
         return true;
@@ -514,14 +517,19 @@ struct Engine {
 - (double)parameterValue:(NSInteger)index { return _engine->legacy ? _engine->legacy->getParameter(_engine->legacy, (int)index) : _engine->controller ? _engine->controller->getParamNormalized((ParamID)index) : 0; }
 - (NSData *)saveState:(NSError **)error {
     std::lock_guard<std::recursive_mutex> lock(_engine->mutex);
-    NSMutableDictionary *saved = [NSMutableDictionary dictionary];
+    NSMutableDictionary *saved = [NSMutableDictionary dictionaryWithObject:@2 forKey:@"version"];
     if (_engine->legacy) {
         void *chunk = nullptr; auto *effect = _engine->legacy;
-        if (effect->flags & (1 << 5)) { auto size = effect->dispatch(effect, 23, 1, 0, &chunk, 0); if (size > 0 && chunk) saved[@"chunk"] = [NSData dataWithBytes:chunk length:size]; }
+        if (effect->flags & (1 << 5)) { auto size = effect->dispatch(effect, 23, 1, 0, &chunk, 0); if (size > 0 && chunk) saved[@"chunk"] = [NSData dataWithBytes:chunk length:size]; else { fail(error, @"VST could not save its complete state."); return nil; } }
         NSMutableArray *params = [NSMutableArray array]; for (int i = 0; i < effect->numParams; ++i) [params addObject:@(effect->getParameter(effect, i))]; saved[@"parameters"] = params;
     } else {
         MemoryStream comp, ctrl;
-        if (_engine->component->getState(&comp) == kResultOk) saved[@"component"] = streamData(comp);
+        auto result = _engine->component->getState(&comp);
+        if (result == kResultOk) saved[@"component"] = streamData(comp);
+        else if (result != kNotImplemented) { fail(error, @"VST3 could not save its complete state."); return nil; }
+        NSMutableDictionary *pending = [NSMutableDictionary dictionary];
+        for (const auto& pair : _engine->handler->snapshot()) pending[[@(pair.first) stringValue]] = @(pair.second);
+        saved[@"pendingParameters"] = pending;
         if (_engine->controller && _engine->controller->getState(&ctrl) == kResultOk) saved[@"controller"] = streamData(ctrl);
         NSMutableDictionary *params = [NSMutableDictionary dictionary];
         for (NSDictionary *p in self.parameters) { NSNumber *index = p[@"index"]; params[index.stringValue] = @([self parameterValue:index.integerValue]); }

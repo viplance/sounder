@@ -793,3 +793,41 @@ func runBlockedBufferStopTests() throws {
         print("PASS: Stop silences before blocked DSP completes and leaves no stale queue (\(capacity) samples)")
     }
 }
+
+/// Exercise complete snapshots on the same effect IDs across file versions and
+/// history transitions, including edits that have not reached a DSP block yet.
+func runPluginStateHistoryTest(path: String) throws {
+    _ = NSApplication.shared
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("SounderStateHistory-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let editor = Editor(store: try AudioStore(directory: root))
+    let host = try SNPluginHost(path: path, classID: "", state: nil)
+    guard let parameter = host.parameters().first(where: { ($0["name"] as? String ?? "").lowercased().contains("output") }) ?? host.parameters().first,
+          let number = parameter["index"] as? NSNumber else { return }
+    let id = number.intValue
+    let effect = PluginEffect(name: host.pluginName, path: path, classID: host.classID, state: try host.saveState())
+    editor.project = Project(tracks: [Track(name: "History", effects: [effect])])
+    editor.pluginHosts[effect.id] = host
+    let first = root.appendingPathComponent("First.sounder"), second = root.appendingPathComponent("Second.sounder")
+    func value() throws -> Double { try editor.pluginHost(editor.project.allEffects[0]).parameterValue(id) }
+    func check(_ expected: Double, _ message: String) throws {
+        try liveCheck(abs(try value() - expected) < 1e-5, message)
+    }
+    host.setParameter(id, value: 0.25); let a = host.parameterValue(id)
+    try editor.save(to: first)
+    host.setParameter(id, value: 0.75); let b = host.parameterValue(id)
+    try editor.save(to: second)
+    try check(b, "Save preserves the authoritative processor's current parameter")
+    editor.renameProject("Changed")
+    editor.undo(); try check(b, "Undo of an unrelated edit preserves the complete current plugin state")
+    editor.redo(); try check(b, "Redo retains the current plugin state")
+    guard editor.checkpoint() else { throw SounderError.message("Plugin checkpoint failed") }
+    try editor.pluginHost(editor.project.allEffects[0]).setParameter(id, value: a)
+    editor.undo(); try check(b, "Undo captures unpolled live edits for Redo before replacing hosts")
+    editor.redo(); try check(a, "Redo restores the unpolled edit from its complete snapshot")
+    for _ in 0..<3 {
+        try editor.open(from: first); try check(a, "Open restores the first saved version with reused effect IDs")
+        try editor.open(from: second); try check(b, "Open replaces old hosts with the second saved version")
+        try editor.save(to: second)
+    }
+}

@@ -1517,7 +1517,7 @@ final class Timeline: NSView {
         guard renamingTrack != nil else { return }
         nameField.begin(editor.project.tracks[index].name, commit: { [weak self] name in
             guard let self, let index = self.editor.project.tracks.firstIndex(where: { $0.id == id }), self.editor.project.tracks[index].name != name else { return }
-            self.editor.checkpoint(); self.editor.project.tracks[index].name = name; self.editor.update("Track renamed")
+            guard self.editor.checkpoint() else { return }; self.editor.project.tracks[index].name = name; self.editor.update("Track renamed")
         }, end: { [weak self] in self?.renamingTrack = nil; self?.sidebarSurface.needsDisplay = true })
     }
     private func layoutNameField() {
@@ -2006,7 +2006,7 @@ final class Timeline: NSView {
         if dragClip != nil, hypot(p.x - dragStart.x, p.y - dragStart.y) > 2 || didCheckpoint {
             if !didCheckpoint {
                 copyingFragments = event.modifierFlags.contains(.command)
-                editor.checkpoint(); didCheckpoint = true
+                guard editor.checkpoint() else { return }; didCheckpoint = true
             }
             if copyingFragments { NSCursor.dragCopy.set() }
             updateFragmentMove(at: p, flags: event.modifierFlags)
@@ -2033,7 +2033,7 @@ final class Timeline: NSView {
                    clip.start != resize.original.start || clip.duration != resize.original.duration,
                    let i = editor.project.tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == clip.id }) }),
                    let j = editor.project.tracks[i].clips.firstIndex(where: { $0.id == clip.id }) {
-                    editor.checkpoint(); editor.project.tracks[i].clips[j] = clip
+                    guard editor.checkpoint() else { return }; editor.project.tracks[i].clips[j] = clip
                 }
             }
             if let clip = resizedFragment, clip.start == resize.original.start, clip.duration == resize.original.duration,
@@ -2073,7 +2073,10 @@ final class Timeline: NSView {
             trackPreview = nil; trackDragRows = nil
             if let preview, !editor.busy, (try? TrackHierarchy.validate(preview)) != nil,
                preview.map({ $0.id }) != editor.project.tracks.map({ $0.id }) || preview.map({ $0.parent }) != editor.project.tracks.map({ $0.parent }) {
-                editor.checkpoint(); editor.project.tracks = preview; editor.update("Track hierarchy updated")
+                guard editor.checkpoint() else { return }; editor.project.tracks = preview.map { moved in
+                    var track = editor.project.tracks.first { $0.id == moved.id } ?? moved
+                    track.parent = moved.parent; return track
+                }; editor.update("Track hierarchy updated")
             }
             refresh()
         }
