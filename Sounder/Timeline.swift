@@ -2178,21 +2178,11 @@ final class Timeline: NSView {
         centerOnPlayhead()
     }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 1 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { editor.split() }
-        else if event.keyCode == 45 && event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty { NSApp.sendAction(#selector(AppDelegate.normalize), to: NSApp.delegate, from: self) }
-        else if event.keyCode == 123 || event.keyCode == 124 {
-            let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
-            if flags.contains(.command) { seekBoundary(end: event.keyCode == 124) }
-            else if flags.isEmpty { movePlayhead(direction: event.keyCode == 123 ? -1 : 1) }
-            else if (NSApp.delegate as? AppDelegate)?.handleShuttleShortcut(event) != true { super.keyDown(with: event) }
-        }
-        else if event.keyCode == 126 { NSApp.sendAction(#selector(AppDelegate.zoomIn), to: NSApp.delegate, from: self) }
-        else if event.keyCode == 125 { NSApp.sendAction(#selector(AppDelegate.zoomOut), to: NSApp.delegate, from: self) }
-        else if event.keyCode == 36 || event.keyCode == 76 { editor.restartFromLastStart() }
-        else if event.keyCode == 49 { editor.playPause() }
-        else if event.keyCode == 51 || event.keyCode == 117 { editor.deleteClips() }
-        else { super.keyDown(with: event) }
+        if (NSApp.delegate as? AppDelegate)?.handlePhysicalShortcut(event) == true { return }
+        if (NSApp.delegate as? AppDelegate)?.handleShuttleShortcut(event) == true { return }
+        super.keyDown(with: event)
     }
+
     override func keyUp(with event: NSEvent) {
         if (NSApp.delegate as? AppDelegate)?.handleShuttleShortcut(event) != true { super.keyUp(with: event) }
     }

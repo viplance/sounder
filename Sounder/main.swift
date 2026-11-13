@@ -747,6 +747,40 @@ final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
     }
 }
 
+final class ShortcutRecorder: PointerButton {
+    var key = ""
+    var flags: NSEvent.ModifierFlags = []
+    private var monitor: Any?
+    private static weak var active: ShortcutRecorder?
+    static func letter(for code: UInt16) -> String? {
+        [0: "a", 1: "s", 2: "d", 3: "f", 4: "h", 5: "g", 6: "z", 7: "x", 8: "c", 9: "v", 11: "b", 12: "q", 13: "w", 14: "e", 15: "r", 16: "y", 17: "t", 31: "o", 32: "u", 34: "i", 35: "p", 37: "l", 38: "j", 40: "k", 45: "n", 46: "m"][code]
+    }
+    func stopRecording() {
+        if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }; refreshTitle()
+    }
+    override init(frame: NSRect) { super.init(frame: frame); target = self; action = #selector(recordShortcut); bezelStyle = .rounded }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    func refreshTitle() {
+        let names = [" ": "Space", "\r": "Return", "\u{8}": "Backspace", "\u{1b}": "Escape", "\u{f702}": "←", "\u{f703}": "→", "\u{f700}": "↑", "\u{f701}": "↓"]
+        title = key.isEmpty ? "None" : (flags.contains(.control) ? "⌃" : "") + (flags.contains(.option) ? "⌥" : "") + (flags.contains(.shift) ? "⇧" : "") + (flags.contains(.command) ? "⌘" : "") + (names[key] ?? key.uppercased())
+    }
+    @objc private func recordShortcut() {
+        Self.active?.stopRecording(); Self.active = self
+        title = "Press keys…"
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            self.flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            let special: [UInt16: String] = [51: "\u{8}", 117: "\u{8}", 36: "\r", 76: "\r"]
+            self.key = special[event.keyCode] ?? Self.letter(for: event.keyCode) ?? event.charactersIgnoringModifiers?.lowercased() ?? ""
+            // Escape clears a binding; Escape itself can be restored with Restore Defaults.
+            if event.keyCode == 53 { self.key = ""; self.flags = [] }
+            if let monitor = self.monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+            self.refreshTitle(); return nil
+        }
+    }
+    deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate, NSMenuDelegate {
     var window: NSWindow!
     var editor: Editor!
@@ -1547,8 +1581,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let root = NSMenuItem(); root.title = title; let submenu = NSMenu(title: title); root.submenu = submenu; main.addItem(root)
             for (title, action, key) in items { let item = NSMenuItem(title: title, action: action, keyEquivalent: key); item.target = self; submenu.addItem(item) }
         }
-        menu("Sounder", [("About Sounder", #selector(about), ""), ("Quit Sounder", #selector(quit), "q")])
-        menu("File", [("Rename Project…", #selector(renameProject), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Import Audio…", #selector(importAudio), "i"), ("Export…", #selector(exportAudio), "e")])
+        menu("Sounder", [("About Sounder", #selector(about), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Keyboard Shortcuts…", #selector(keyboardShortcuts), ""), ("Quit Sounder", #selector(quit), "q")])
+        menu("File", [("Rename Project…", #selector(renameProject), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Export…", #selector(exportAudio), "e")])
         if let file = main.items.last?.submenu,
            let openIndex = file.items.firstIndex(where: { $0.action == #selector(openProject) }) {
             let recent = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
@@ -1557,13 +1591,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             file.insertItem(recent, at: openIndex + 1)
         }
         menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v")])
-        menu("Fragments", [("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Mute Fragments", #selector(muteFragments), ""), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
-        if let fragments = main.items.last?.submenu { fragments.items.filter { [#selector(split), #selector(normalize)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
+        menu("Fragments", [("Import Audio…", #selector(importAudio), "i"), ("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Mute Fragments", #selector(muteFragments), "m"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
+        if let fragments = main.items.last?.submenu { fragments.items.filter { [#selector(split), #selector(normalize), #selector(muteFragments), #selector(deleteClips)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
         menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
-        menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Loop", #selector(toggleLoop), ""), ("Stop", #selector(stop), "\u{1b}"), ("Return to Start", #selector(rewind), "")])
-        if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
+        menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Loop", #selector(toggleLoop), "l"), ("Stop", #selector(stop), "\u{1b}")])
+        if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd), #selector(toggleLoop)].contains($0.action) ? [.command] : [] } }
         menu("View", [("Zoom In", #selector(zoomIn), "\u{f700}"), ("Zoom Out", #selector(zoomOut), "\u{f701}")])
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
+        for item in shortcutMenuItems {
+            guard let action = item.action else { continue }
+            let id = NSStringFromSelector(action)
+            if shortcutDefaults[id] == nil { shortcutDefaults[id] = (item.keyEquivalent, item.keyEquivalentModifierMask.rawValue) }
+            if let saved = UserDefaults.standard.dictionary(forKey: "keyboardShortcuts")?[id] as? [String: Any],
+               let key = saved["key"] as? String, let flags = saved["flags"] as? UInt {
+                item.keyEquivalent = key; item.keyEquivalentModifierMask = NSEvent.ModifierFlags(rawValue: flags)
+            }
+        }
+    }
+    private lazy var shuttleShortcutMenu: NSMenu = {
+        let menu = NSMenu(title: "Transport")
+        for (title, action, key) in [("Shuttle Backward", #selector(shuttleBackwardShortcut), "\u{f702}"), ("Shuttle Forward", #selector(shuttleForwardShortcut), "\u{f703}")] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = [.shift]; menu.addItem(item)
+        }
+        return menu
+    }()
+    @objc private func shuttleBackwardShortcut() {}
+    @objc private func shuttleForwardShortcut() {}
+    private var shortcutDefaults: [String: (String, UInt)] = [:]
+    private var shortcutMenuItems: [NSMenuItem] {
+        (NSApp.mainMenu?.items ?? []).flatMap { $0.submenu?.items ?? [] }.filter { $0.action != nil && $0.action != #selector(about) } + shuttleShortcutMenu.items
+    }
+    @objc func keyboardShortcuts() {
+        let alert = NSAlert()
+        alert.messageText = "Keyboard Shortcuts"
+        alert.informativeText = "Click a shortcut and press new keys. Escape clears it."
+        alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Restore Defaults")
+        let items = shortcutMenuItems
+        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 6
+        var controls: [ShortcutRecorder] = []
+        for item in items {
+            let label = NSTextField(labelWithString: item.menu!.title + " · " + item.title)
+            label.frame.size.width = 300
+            let control = ShortcutRecorder(frame: .zero)
+            control.key = item.keyEquivalent.lowercased(); control.flags = item.keyEquivalentModifierMask
+            if item.keyEquivalent != item.keyEquivalent.lowercased() { control.flags.insert(.shift) }
+            control.refreshTitle(); control.widthAnchor.constraint(equalToConstant: 150).isActive = true
+            let row = NSStackView(views: [label, control]); row.spacing = 12
+            label.widthAnchor.constraint(equalToConstant: 300).isActive = true
+            stack.addArrangedSubview(row); controls.append(control)
+        }
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 490, height: 440))
+        scroll.hasVerticalScroller = true
+        stack.frame = NSRect(x: 0, y: 0, width: 470, height: stack.fittingSize.height)
+        scroll.documentView = stack; alert.accessoryView = scroll
+        while true {
+            let result = alert.runModal()
+            controls.forEach { $0.stopRecording() }
+            if result == .alertSecondButtonReturn { return }
+            if result == .alertThirdButtonReturn {
+                for (item, control) in zip(items, controls) {
+                    let value = shortcutDefaults[NSStringFromSelector(item.action!)]!
+                    control.key = value.0.lowercased(); control.flags = NSEvent.ModifierFlags(rawValue: value.1)
+                    if value.0 != value.0.lowercased() { control.flags.insert(.shift) }
+                    control.refreshTitle()
+                }
+                continue
+            }
+            var seen = Set<String>(); var duplicate = false
+            for control in controls where !control.key.isEmpty {
+                if !seen.insert("\(control.flags.rawValue):\(control.key)").inserted { duplicate = true }
+            }
+            if duplicate { alert.informativeText = "Each shortcut must be unique. Change or clear duplicate shortcuts."; continue }
+            var saved: [String: [String: Any]] = [:]
+            for (item, control) in zip(items, controls) {
+                item.keyEquivalent = control.key; item.keyEquivalentModifierMask = control.flags
+                saved[NSStringFromSelector(item.action!)] = ["key": control.key, "flags": control.flags.rawValue]
+            }
+            UserDefaults.standard.set(saved, forKey: "keyboardShortcuts"); return
+        }
     }
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === recentProjectsMenu else { return }
@@ -1585,18 +1691,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         do { try editor.startProjectOpen(from: url) }
         catch { editor.error(error) }
     }
+    private var activeShuttleModifiers: NSEvent.ModifierFlags = []
     private var shuttleKey: UInt16?
     private var releasedShuttleKey: UInt16?
     @objc private func cancelShuttle() { shuttleKey = nil; releasedShuttleKey = nil; editor.endShuttle(resume: false) }
     @discardableResult func handleShuttleShortcut(_ event: NSEvent) -> Bool {
         if event.type == .flagsChanged {
-            if let key = shuttleKey, !event.modifierFlags.contains(.shift) {
+            if let key = shuttleKey, !event.modifierFlags.intersection([.command, .shift, .option, .control]).isSuperset(of: activeShuttleModifiers) {
                 releasedShuttleKey = key; shuttleKey = nil
                 editor.releaseShuttle(); timeline.centerOnPlayhead()
             }
             return false
         }
-        guard event.keyCode == 123 || event.keyCode == 124 else { return false }
+        let key = ShortcutRecorder.letter(for: event.keyCode) ?? event.charactersIgnoringModifiers?.lowercased() ?? ""
+        let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        let binding = shuttleShortcutMenu.items.first { !$0.keyEquivalent.isEmpty && $0.keyEquivalent == key && $0.keyEquivalentModifierMask == flags }
+        guard binding != nil || shuttleKey == event.keyCode || releasedShuttleKey == event.keyCode else { return false }
         if event.type == .keyUp {
             if releasedShuttleKey == event.keyCode { releasedShuttleKey = nil; return true }
             guard shuttleKey == event.keyCode else { return false }
@@ -1608,10 +1718,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         guard event.type == .keyDown, isEditorShortcutEvent(event), NSApp.modalWindow == nil,
               !(editorShortcutResponder is NSTextView), !(editorShortcutResponder is TrackMixerSlider), timeline.canSelectRange,
-              event.modifierFlags.intersection([.command, .shift, .option, .control]) == [.shift] else { return false }
+              binding != nil else { return false }
         if !event.isARepeat || shuttleKey != event.keyCode {
-            shuttleKey = event.keyCode
-            timeline.beginShuttle(direction: event.keyCode == 123 ? -1 : 1)
+            shuttleKey = event.keyCode; activeShuttleModifiers = flags
+            timeline.beginShuttle(direction: binding?.action == #selector(shuttleBackwardShortcut) ? -1 : 1)
         }
         return true
     }
@@ -1619,8 +1729,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard event.type == .keyDown, NSApp.modalWindow == nil,
               isEditorShortcutEvent(event), !(editorShortcutResponder is NSTextView) else { return false }
         let flags = event.modifierFlags.intersection([.command, .shift, .control, .option])
-        let letters: [UInt16: String] = [0: "a", 1: "s", 3: "f", 6: "z", 8: "c", 9: "v", 12: "q", 14: "e", 15: "r", 17: "t", 31: "o", 34: "i", 38: "j", 45: "n"]
-        guard let letter = letters[event.keyCode] else { return false }
+
+        let special: [UInt16: String] = [49: " ", 36: "\r", 76: "\r", 123: "\u{f702}", 124: "\u{f703}", 126: "\u{f700}", 125: "\u{f701}", 51: "\u{8}", 117: "\u{8}", 53: "\u{1b}"]
+        guard let letter = ShortcutRecorder.letter(for: event.keyCode) ?? special[event.keyCode] ?? event.charactersIgnoringModifiers?.lowercased() else { return false }
         return dispatchEditorShortcut(letter, flags: flags)
     }
     private func isEditorShortcutEvent(_ event: NSEvent) -> Bool {

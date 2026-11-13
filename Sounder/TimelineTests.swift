@@ -933,22 +933,31 @@ extension AppDelegate {
         guard let index = roots.firstIndex(where: { $0.title == "Edit" }), index + 1 < roots.count,
               roots[index + 1].title == "Fragments", let fragments = roots[index + 1].submenu else { throw SounderError.message("Fragments menu must immediately follow Edit") }
         let actions = [#selector(split), #selector(trim), #selector(join), #selector(normalize), #selector(muteFragments), #selector(deleteClips)]
-        try check(fragments.items.compactMap(\.action) == actions && roots[index].submenu!.items.allSatisfy { !actions.contains($0.action!) }, "Fragment actions live exclusively in the system Fragments menu immediately after Edit")
+        try check(fragments.items.compactMap(\.action) == [#selector(importAudio)] + actions && roots[index].submenu!.items.allSatisfy { !actions.contains($0.action!) }, "Fragment actions live exclusively in the system Fragments menu immediately after Edit")
         editor.selection = []; fragments.update()
-        try check(fragments.items.allSatisfy { !$0.isEnabled }, "All system fragment actions disable when no fragment is selected")
+        try check(fragments.items.filter { actions.contains($0.action!) }.allSatisfy { !$0.isEnabled }, "All system fragment actions disable when no fragment is selected")
         editor.selection = [UUID()]; fragments.update()
-        try check(fragments.items.allSatisfy { !$0.isEnabled }, "Stale selection IDs cannot enable fragment actions")
+        try check(fragments.items.filter { actions.contains($0.action!) }.allSatisfy { !$0.isEnabled }, "Stale selection IDs cannot enable fragment actions")
         editor.selection = [editor.project.tracks[0].clips[0].id]; fragments.update()
-        try check(fragments.items.allSatisfy(\.isEnabled), "Selecting a real fragment enables the Fragments menu actions")
+        try check(fragments.items.filter { actions.contains($0.action!) }.allSatisfy(\.isEnabled), "Selecting a real fragment enables the Fragments menu actions")
         editor.requestingMic = true; fragments.update()
-        try check(fragments.items.allSatisfy { !$0.isEnabled }, "Busy transport keeps every fragment action disabled")
+        try check(fragments.items.filter { actions.contains($0.action!) }.allSatisfy { !$0.isEnabled }, "Busy transport keeps every fragment action disabled")
         editor.requestingMic = false
         timeline.renameTrack(editor.project.tracks[0].id); fragments.update()
-        try check(fragments.items.allSatisfy { !$0.isEnabled }, "Editing a name disables fragment actions and preserves text shortcuts")
+        try check(fragments.items.filter { actions.contains($0.action!) }.allSatisfy { !$0.isEnabled }, "Editing a name disables fragment actions and preserves text shortcuts")
         timeline.nameField.finish(commit: false); window.makeFirstResponder(timeline)
         let split = fragments.items.first { $0.action == #selector(split) }!, normalize = fragments.items.first { $0.action == #selector(normalize) }!
         try check(split.keyEquivalent == "s" && split.keyEquivalentModifierMask.isEmpty && normalize.keyEquivalent == "n" && normalize.keyEquivalentModifierMask.isEmpty, "Split and Normalize retain their physical unmodified shortcuts in Fragments")
+        let appMenu = roots.first!.submenu!
+        try check(appMenu.items.contains { $0.action == #selector(audioSettings) } && appMenu.items.contains { $0.action == #selector(keyboardShortcuts) }, "Sounder contains Audio Settings and Keyboard Shortcuts")
+        let mute = fragments.items.first { $0.action == #selector(muteFragments) }!
+        let delete = fragments.items.first { $0.action == #selector(deleteClips) }!
+        let transport = roots.first { $0.title == "Transport" }!.submenu!
+        let loop = transport.items.first { $0.action == #selector(toggleLoop) }!
+        try check(mute.keyEquivalent == "m" && mute.keyEquivalentModifierMask.isEmpty && delete.keyEquivalent == "\u{8}" && delete.keyEquivalentModifierMask.isEmpty, "Mute uses M and Delete displays unmodified Backspace")
+        try check(loop.keyEquivalent == "l" && loop.keyEquivalentModifierMask == [.command] && !transport.items.contains { $0.action == #selector(rewind) }, "Loop uses Command-L and the duplicate Return to Start is removed")
     }
+
 }
 
 extension AppDelegate {
