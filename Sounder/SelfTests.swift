@@ -697,14 +697,24 @@ func runTrackSoloTests() throws {
     var soloParent = parent; soloParent.solo = true; child.solo = false; sibling.solo = false
     try check(abs(try level([soloParent, child, sibling]) - 0.2) < 1e-6, "Parent Solo includes its subtree while excluding other roots")
     var muted = soloParent; muted.muted = true
-    try check(try level([muted, child, sibling]) == 0, "Mute overrides Solo and silences the muted parent subtree")
+    try check(abs(try level([muted, child, sibling]) - 0.2) < 1e-6, "Solo overrides parent Mute and retains its subtree")
+    child.solo = true; child.muted = true; muted.solo = false
+    try check(abs(try level([muted, child, sibling]) - 0.1) < 1e-6, "Child Solo overrides its own Mute and ancestor Mute")
+    child.solo = false; child.muted = false
     let graph = try StreamingGraph(project: Project(tracks: [parent, child, sibling]), store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0.map { $0 * 0.5 } } }
     _ = try graph.render(frames: 512)
     graph.setSolo([child.id])
     try check(abs(try graph.render(frames: 128)[0] - 0.1) < 1e-6, "Live Solo switches the next block without rebuilding playback or resetting effects")
     graph.setSolo([child.id, sibling.id])
     try check(abs(try graph.render(frames: 128)[0] - 0.3) < 1e-6, "Live multiple Solo preserves both selected tracks")
+    graph.setMuted(true, trackID: parent.id)
+    graph.setMuted(true, trackID: child.id)
+    graph.setSolo([child.id])
+    try check(abs(try graph.render(frames: 128)[0] - 0.1) < 1e-6, "Live Solo overrides own and ancestor Mute")
     graph.setSolo([])
+    try check(abs(try graph.render(frames: 128)[0] - 0.2) < 1e-6, "Clearing Solo restores retained Mute flags")
+    graph.setMuted(false, trackID: parent.id)
+    graph.setMuted(false, trackID: child.id)
     try check(abs(try graph.render(frames: 128)[0] - 0.4) < 1e-6, "Clearing the last Solo restores all unmuted tracks")
     let initial = try StreamingGraph(project: Project(tracks: [soloParent, child, sibling]), store: store) { _ in StreamingEffect(latency: 0, tail: 0) { $0.map { $0 * 0.5 } } }
     try check(abs(try initial.render(frames: 512)[1000] - 0.2) < 1e-6, "Solo saved before Play is active in the initial streaming graph")

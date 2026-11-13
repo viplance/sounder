@@ -744,7 +744,7 @@ final class Editor: NSObject {
     func importAudio() {
         guard !busy else { return }
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.audio]; panel.allowsMultipleSelection = true
-        guard panel.runModal() == .OK else { return }
+        guard EditorModalBackdrop.run({ panel.runModal() }) == .OK else { return }
         var placement = AudioImportPlacement.singleTrack
         if panel.urls.count > 1 {
             guard let chosen = ImportPlacementDialog().runModal() else { return }
@@ -1114,6 +1114,7 @@ final class Editor: NSObject {
         project.tracks[index].solo.toggle()
         player?.setSolo(Set(project.tracks.filter(\.solo).map(\.id)))
         liveEffectsPlayer?.setSolo(Set(project.tracks.filter(\.solo).map(\.id)))
+        if pausedPlayer?.isAuditioningEffects == true { pausedPlayer?.setSolo(Set(project.tracks.filter(\.solo).map(\.id))) }
         update()
     }
     func effectsChanged() {
@@ -1628,7 +1629,7 @@ final class Editor: NSObject {
         var destination = projectURL
         if destination == nil || `as` {
             let panel = NSSavePanel(); panel.nameFieldStringValue = suggestedFilename; panel.canCreateDirectories = true
-            guard panel.runModal() == .OK else { return false }; destination = panel.url
+            guard EditorModalBackdrop.run({ panel.runModal() }) == .OK else { return false }; destination = panel.url
         }
         do { try save(to: destination!); return true }
         catch { self.error(error); return false }
@@ -1687,7 +1688,7 @@ final class Editor: NSObject {
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.canChooseFiles = true; panel.treatsFilePackagesAsDirectories = false
         panel.allowedContentTypes = [UTType(filenameExtension: "sounder")!]
         panel.allowsOtherFileTypes = false
-        guard panel.runModal() == .OK, let url = panel.url, url.pathExtension.lowercased() == "sounder" else { return }
+        guard EditorModalBackdrop.run({ panel.runModal() }) == .OK, let url = panel.url, url.pathExtension.lowercased() == "sounder" else { return }
         do { try startProjectOpen(from: url) }
         catch { self.error(error) }
     }
@@ -1721,7 +1722,7 @@ final class Editor: NSObject {
         let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(filenameExtension: settings.format.rawValue) ?? .audio]
         panel.allowsOtherFileTypes = false
         panel.nameFieldStringValue = projectName.replacingOccurrences(of: "/", with: "-") + "." + settings.format.rawValue
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard EditorModalBackdrop.run({ panel.runModal() }) == .OK, let url = panel.url else { return }
         do { try startAudioExport(to: url, settings: settings, range: options.selectedRange, metadata: options.metadata) } catch { self.error(error) }
     }
     func startAudioExport(to url: URL, settings: ExportSettings, range: Range<Double>? = nil, metadata: AudioMetadata? = nil) throws {

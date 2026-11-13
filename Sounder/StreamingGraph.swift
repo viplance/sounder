@@ -27,6 +27,8 @@ final class SampleDelay {
 final class StreamingGraph {
     private final class Bus {
         var muted: Bool
+        var muteOverridden = false
+        var effectivelyMuted: Bool { muted && !muteOverridden }
         var soloDry = true
         var soloBus = true
         var peak = StereoLevels()
@@ -97,7 +99,7 @@ final class StreamingGraph {
                 }
                 if rampRemaining > 0 { rampRemaining -= 1 }
             }
-            let output = muted || !soloBus ? [Float](repeating: 0, count: input.count) : input
+            let output = effectivelyMuted || !soloBus ? [Float](repeating: 0, count: input.count) : input
             let metered = mode.includesSource ? (meterDelay?.apply(output) ?? output) : output
             peak = StereoLevels()
             for frame in 0..<frames {
@@ -192,7 +194,7 @@ final class StreamingGraph {
     func setTrackMix(_ track: Track) { buses[track.id]?.setMix(track); outputCache.invalidate() }
     func setSolo(_ ids: Set<UUID>) {
         let routing = TrackSoloRouting(tracks: tracks, soloIDs: ids)
-        for (id, bus) in buses { bus.soloDry = routing.dry.contains(id); bus.soloBus = routing.buses.contains(id) }
+        for (id, bus) in buses { bus.soloDry = routing.dry.contains(id); bus.soloBus = routing.buses.contains(id); bus.muteOverridden = routing.muteOverrides.contains(id) }
     }
     // Seeking is a discontinuity in source time, not in the output clock.
     // Keep live processors (including their tails), but flush routing delays.
@@ -277,7 +279,7 @@ final class StreamingGraph {
         for (id, bus) in buses {
             var ancestor: UUID? = id, audible = true
             while let current = ancestor {
-                if let node = buses[current], node.muted || !node.soloBus { audible = false; break }
+                if let node = buses[current], node.effectivelyMuted || !node.soloBus { audible = false; break }
                 ancestor = parents[current]
             }
             trackPeaks[id] = audible ? bus.peak : StereoLevels()

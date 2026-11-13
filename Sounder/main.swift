@@ -71,13 +71,71 @@ final class EditorWindow: NSWindow {
     }
 }
 
+/// Keep the editor visibly unavailable for the lifetime of a blocking dialog.
+enum EditorModalBackdrop {
+    private static var depth = 0
+    private static var overlays: [NSView] = []
+
+    static func run<T>(_ action: () -> T) -> T {
+        if depth == 0 {
+            for window in NSApp.windows where window is EditorWindow && window.isVisible {
+                guard let surface = window.contentView?.superview ?? window.contentView else { continue }
+                let overlay: NSView
+                if #available(macOS 26.0, *), !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency {
+                    // Liquid Glass samples the live editor behind this sibling.
+                    // A popover material adds a largely opaque fill here instead.
+                    let glass = NSGlassEffectView(frame: surface.bounds)
+                    glass.style = .regular
+                    glass.cornerRadius = 0
+                    overlay = glass
+                } else {
+                    let shade = NSView(frame: surface.bounds)
+                    shade.wantsLayer = true
+                    shade.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.30).cgColor
+                    overlay = shade
+                }
+                overlay.autoresizingMask = [.width, .height]
+                surface.addSubview(overlay, positioned: .above, relativeTo: nil)
+                overlays.append(overlay)
+                window.displayIfNeeded()
+            }
+        }
+        depth += 1
+        defer {
+            depth -= 1
+            if depth == 0 {
+                overlays.forEach { $0.removeFromSuperview() }
+                overlays.removeAll()
+            }
+        }
+        return action()
+    }
+}
+
 class PointerButton: NSButton {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // Use the same borderless cell as the mixer controls. System rounded
+        // bezels can move their title during Glass hover transitions.
+        isBordered = false
+    }
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        isBordered = false
+    }
     private var pointerTracking: NSTrackingArea?
     private(set) var isHovering = false
     var contentPadding = NSSize.zero { didSet { invalidateIntrinsicContentSize() } }
     override var intrinsicContentSize: NSSize {
-        let size = super.intrinsicContentSize
-        return NSSize(width: size.width + contentPadding.width * 2, height: size.height + contentPadding.height * 2)
+        let size: NSSize
+        if drawsMixerFace && contentPadding != .zero {
+            let textSize = (title as NSString).size(withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 11)])
+            let iconSize = imagePosition == .imageLeft ? image?.size ?? .zero : .zero
+            size = NSSize(width: textSize.width + (iconSize.width > 0 ? iconSize.width + 4 : 0), height: max(textSize.height, iconSize.height))
+        } else {
+            size = super.intrinsicContentSize
+        }
+        return NSSize(width: ceil(size.width) + contentPadding.width * 2, height: ceil(size.height) + contentPadding.height * 2)
     }
     private func drawHover() {
         let rect: NSRect
@@ -94,8 +152,40 @@ class PointerButton: NSButton {
         if isBordered { NSColor.labelColor.withAlphaComponent(0.16).setStroke(); path.lineWidth = 0.7; path.stroke() }
     }
     var activeAppearanceColor: NSColor? { didSet { needsDisplay = true } }
+    var faceColor: NSColor? { didSet { needsDisplay = true } }
+    var drawsMixerFace = false { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    func useStandardTextStyle() {
+        setButtonType(.momentaryPushIn)
+        isBordered = false
+        font = .systemFont(ofSize: 11)
+        contentPadding = NSSize(width: 12, height: 6)
+        drawsMixerFace = true
+    }
     override func draw(_ dirtyRect: NSRect) {
         let hover = isHovering && isEnabled && window?.isKeyWindow == true
+        if drawsMixerFace {
+            let rect = bounds.insetBy(dx: 0.5, dy: 1)
+            let active = state == .on && activeAppearanceColor != nil
+            let color = activeAppearanceColor ?? .secondaryLabelColor
+            ButtonStyle.drawFace(rect, activeColor: faceColor ?? (active ? color : nil), hovered: hover)
+            if isHighlighted { fill(rect, NSColor.white.withAlphaComponent(0.08), radius: 5) }
+            let textColor: NSColor = !isEnabled ? .disabledControlTextColor : (faceColor ?? (active ? color : .secondaryLabelColor))
+            let attributes: [NSAttributedString.Key: Any] = [.font: font ?? NSFont.systemFont(ofSize: 11), .foregroundColor: textColor]
+            let size = (title as NSString).size(withAttributes: attributes)
+            let icon = imagePosition == .imageLeft ? image : nil
+            let iconWidth = icon.map { $0.size.width + 4 } ?? 0
+            let startX = bounds.midX - (size.width + iconWidth) / 2
+            if let icon {
+                let tinted = NSImage(size: icon.size, flipped: false) { rect in
+                    icon.draw(in: rect)
+                    textColor.setFill(); rect.fill(using: .sourceAtop)
+                    return true
+                }
+                tinted.draw(in: NSRect(x: startX, y: bounds.midY - icon.size.height / 2, width: icon.size.width, height: icon.size.height))
+            }
+            (title as NSString).draw(at: NSPoint(x: startX + iconWidth, y: bounds.midY - size.height / 2), withAttributes: attributes)
+            return
+        }
         defer { if hover { drawHover() } }
         guard state == .on, isEnabled, let color = activeAppearanceColor else { super.draw(dirtyRect); return }
         if imagePosition == .imageOnly, let image {
@@ -287,7 +377,8 @@ class PopupWindow: NSWindow {
         titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
         titleLabel.lineBreakMode = .byTruncatingMiddle
         titleLabel.toolTip = title
-        titleLabel.frame = NSRect(x: 20, y: size.height + 15, width: max(0, size.width - 80), height: 24)
+        let headingHeight = titleLabel.intrinsicContentSize.height
+        titleLabel.frame = NSRect(x: 52, y: size.height + 27 - headingHeight / 2, width: max(0, size.width - 72), height: headingHeight)
         titleLabel.autoresizingMask = [.width, .minYMargin]
         root.addSubview(titleLabel)
         heading = titleLabel
@@ -299,8 +390,8 @@ class PopupWindow: NSWindow {
         button.toolTip = "Close"
         button.setAccessibilityLabel("Close")
         button.keyEquivalent = "\u{1b}"
-        button.frame = NSRect(x: size.width - 44, y: size.height + 11, width: 28, height: 28)
-        button.autoresizingMask = [.minXMargin, .minYMargin]
+        button.frame = NSRect(x: 16, y: titleLabel.frame.midY - 14, width: 28, height: 28)
+        button.autoresizingMask = [.maxXMargin, .minYMargin]
         root.addSubview(button)
         let popupSize = root.frame.size
         contentView = root
@@ -368,6 +459,7 @@ class CompactSettingsAlert: NSAlert {
     var minimumButtonWidth: CGFloat = 96
     var buttonSpacing: CGFloat = 12
     var leadingButton: NSButton?
+    var closeButtonResponseIndex: Int?
     private var prepared = false
     override func layout() {
         if !prepared { prepared = true; super.layout() }
@@ -383,7 +475,21 @@ class CompactSettingsAlert: NSAlert {
         panel.setContentSize(root.frame.size); panel.contentView = root
         let heading = NSTextField(labelWithString: messageText)
         heading.font = .systemFont(ofSize: 17, weight: .semibold)
-        heading.frame = NSRect(x: 20, y: titleY, width: width - 40, height: 24); root.addSubview(heading)
+        let showsClose = closeButtonResponseIndex.map { buttons.indices.contains($0) } ?? false
+        let headingX: CGFloat = showsClose ? 52 : 20
+        let headingHeight = heading.intrinsicContentSize.height
+        heading.frame = NSRect(x: headingX, y: titleY + 12 - headingHeight / 2, width: width - headingX - 20, height: headingHeight); root.addSubview(heading)
+        if showsClose, let index = closeButtonResponseIndex {
+            let close = PointerButton(title: "", target: self, action: #selector(chosen(_:)))
+            close.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close")
+            close.imagePosition = .imageOnly
+            close.isBordered = false
+            close.contentTintColor = .secondaryLabelColor
+            close.toolTip = "Close"; close.setAccessibilityLabel("Close")
+            close.tag = index
+            close.frame = NSRect(x: 16, y: heading.frame.midY - 14, width: 28, height: 28)
+            root.addSubview(close)
+        }
         if let form { form.removeFromSuperview(); form.frame.origin = NSPoint(x: 20, y: formY); root.addSubview(form) }
         if !informativeText.isEmpty {
             let error = NSTextField(wrappingLabelWithString: informativeText)
@@ -415,7 +521,7 @@ class CompactSettingsAlert: NSAlert {
         if let responder { window.initialFirstResponder = responder }
         window.makeKeyAndOrderFront(nil)
         if let responder { window.makeFirstResponder(responder) }
-        let response = NSApp.runModal(for: window)
+        let response = EditorModalBackdrop.run { NSApp.runModal(for: window) }
         window.orderOut(nil)
         return response
     }
@@ -691,10 +797,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         metronomeButton.setAccessibilityLabel("Metronome")
         (metronomeButton as? PointerButton)?.activeAppearanceColor = .systemOrange
         tempoButton = PointerButton(title: "Tempo", target: self, action: #selector(toggleTempo))
-        tempoButton.bezelStyle = .rounded; tempoButton.setButtonType(.pushOnPushOff); tempoButton.controlSize = .small
-        tempoButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        (tempoButton as? PointerButton)?.useStandardTextStyle()
+        tempoButton.setButtonType(.pushOnPushOff)
         (tempoButton as? PointerButton)?.activeAppearanceColor = .systemOrange
-        tempoButton.widthAnchor.constraint(equalToConstant: 47).isActive = true
         bpmButton = textButton("120 BPM", size: 18, action: #selector(editTempo), cursor: .iBeam)
         bpmButton.contentTintColor = .systemOrange; bpmButton.toolTip = "Edit tempo (4/4)"; bpmButton.isHidden = true
         timeLabel = NSTextField(labelWithString: "00:00.000"); timeLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .light); timeLabel.textColor = accent
@@ -755,10 +860,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         projectNameView = ProjectNameView(label: projectLabel, field: projectNameField)
         qualityButton = textButton(ProjectAudioFormat().label, size: 10, action: #selector(audioSettings)); qualityButton.toolTip = "Project audio settings"
         (qualityButton as? PointerButton)?.contentPadding = NSSize(width: 10, height: 5)
-        let export = PointerButton(title: "Export", target: self, action: #selector(exportAudio)); export.bezelStyle = .rounded
-        export.widthAnchor.constraint(equalToConstant: export.intrinsicContentSize.width + 16).isActive = true
+        let export = PointerButton(title: "Export", target: self, action: #selector(exportAudio))
+        export.useStandardTextStyle()
+        export.faceColor = accent
         exportButton = export
-        let io = PointerButton(title: "In | Out", target: self, action: #selector(showAudioRouting)); io.bezelStyle = .rounded
+        let io = PointerButton(title: "In | Out", target: self, action: #selector(showAudioRouting))
+        io.useStandardTextStyle()
         masterVolumeControl.widthAnchor.constraint(equalToConstant: 200).isActive = true
         masterVolumeControl.heightAnchor.constraint(equalToConstant: 26).isActive = true
         masterVolumeControl.slider.target = self; masterVolumeControl.slider.action = #selector(changeMasterVolume(_:))
@@ -790,9 +897,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         for (id, label, view) in controls {
             let identifier = NSToolbarItem.Identifier(id)
             let item = NSToolbarItem(itemIdentifier: identifier)
-            item.label = label; item.toolTip = label; item.view = view
+            item.label = label; item.toolTip = label
+            if ["quality", "io", "export"].contains(id) {
+                let spacing = NSStackView(views: [view])
+                spacing.orientation = .horizontal
+                spacing.edgeInsets = NSEdgeInsets(top: 0, left: 3, bottom: 0, right: 3)
+                item.view = spacing
+            } else {
+                item.view = view
+            }
             // Custom toolbar views still receive the system glass bezel unless explicitly opted out.
-            if ["project", "files", "master", "masterFX"].contains(id) { item.isBordered = false }
+            item.isBordered = false
             if ["files", "export", "io", "quality", "master", "masterFX"].contains(id) { item.autovalidates = false }
             item.visibilityPriority = .high
             titlebarItems[identifier] = item
@@ -1097,7 +1212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let timer = Timer(timeInterval: 0.1, repeats: false) { _ in automate(alert) }
             RunLoop.main.add(timer, forMode: .modalPanel)
         }
-        return alert.runModal()
+        return EditorModalBackdrop.run { alert.runModal() }
     }
     func verifySettingsUI() throws {
         let originalDirty = editor.dirty
@@ -1191,6 +1306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func audioSettings() {
         guard !editor.busy else { return }
         let alert = CompactSettingsAlert(); alert.messageText = "Audio settings"
+        alert.closeButtonResponseIndex = 1
         alert.icon = NSImage(size: .zero)
         let form = NSView(frame: NSRect(x: 0, y: 0, width: 350, height: 122))
         let rateLabel = NSTextField(labelWithString: "Sample rate"); rateLabel.frame = NSRect(x: 0, y: 90, width: 115, height: 22); form.addSubview(rateLabel)
@@ -1239,8 +1355,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         bpmButton.toolTip = showingBeatPosition ? "Current bar.beat · Click to edit tempo" : "Edit tempo (4/4)"
         bpmButton.setAccessibilityLabel(showingBeatPosition ? "Current bar and beat: \(bpmButton.title)" : "Tempo: \(bpmButton.title)")
         tempoButton.state = editor.project.tempoMode ? .on : .off
-        tempoButton.bezelColor = editor.project.tempoMode ? .systemOrange : nil
-        tempoButton.contentTintColor = editor.project.tempoMode ? .white : .labelColor
         metronomeButton.state = editor.project.metronomeEnabled ? .on : .off
         metronomeButton.image = NSImage(systemSymbolName: editor.project.metronomeEnabled ? "metronome.fill" : "metronome", accessibilityDescription: "Metronome")
         metronomeButton.contentTintColor = editor.project.metronomeEnabled ? .systemOrange : .secondaryLabelColor

@@ -58,13 +58,7 @@ final class MixerFXButton: PointerButton {
     }
     override var intrinsicContentSize: NSSize { NSSize(width: Self.controlWidth, height: 20) }
     private static func drawFace(in rect: NSRect, title: String, active: Bool, color: NSColor, hovered: Bool, flipped: Bool) {
-        fill(rect, active ? color.withAlphaComponent(0.18) : NSColor.white.withAlphaComponent(0.06), radius: 5)
-        if hovered {
-            fill(rect, NSColor.white.withAlphaComponent(0.10), radius: 5)
-            NSColor.white.withAlphaComponent(0.16).setStroke()
-            let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.4, dy: 0.4), xRadius: 5, yRadius: 5)
-            path.lineWidth = 0.7; path.stroke()
-        }
+        ButtonStyle.drawFace(rect, activeColor: active ? color : nil, hovered: hovered)
         centeredControlLabel(title, NSRect(x: rect.minX, y: rect.minY, width: max(0, rect.width - 18), height: rect.height), size: 9,
                              color: active ? color : .secondaryLabelColor, flipped: flipped)
     }
@@ -425,10 +419,7 @@ final class MixerPeakChannelReadout: NSView {
 final class TrackRecordButton: PointerButton {
     override func draw(_ dirtyRect: NSRect) {
         let active = state == .on
-        fill(bounds, active ? NSColor.systemRed.withAlphaComponent(0.3) : NSColor.white.withAlphaComponent(0.06), radius: 5)
-        if isEnabled && isHovering && window?.isKeyWindow == true {
-            fill(bounds, NSColor.white.withAlphaComponent(0.10), radius: 5)
-        }
+        ButtonStyle.drawFace(bounds, activeColor: active ? .systemRed : nil, hovered: isEnabled && isHovering && window?.isKeyWindow == true)
         centeredControlLabel("REC", bounds, size: 9, color: active ? .systemRed : .secondaryLabelColor, flipped: isFlipped)
     }
 }
@@ -968,9 +959,7 @@ final class Timeline: NSView {
     private func drawTrackControlHover(_ id: UUID, kind: Int, rect: NSRect) {
         guard window?.isKeyWindow == true, hoveredTrackControl?.id == id, hoveredTrackControl?.kind == kind,
               !editor.isRecording, !editor.isShuttling, !editor.requestingMic, !editor.isExporting, !editor.isImporting && !editor.isOpening else { return }
-        fill(rect, NSColor.white.withAlphaComponent(0.10), radius: 5)
-        NSColor.white.withAlphaComponent(0.16).setStroke()
-        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.4, dy: 0.4), xRadius: 5, yRadius: 5); path.lineWidth = 0.7; path.stroke()
+        ButtonStyle.drawHover(rect)
     }
     func installHeaderControls(_ view: NSView) {
         headerControls?.removeFromSuperview(); headerControls = view
@@ -1611,7 +1600,8 @@ final class Timeline: NSView {
     }
     private func dimmedTrackIDs() -> Set<UUID> {
         let tracks = trackPreview ?? editor.project.tracks
-        var dimmed = Set(tracks.filter(\.muted).map(\.id))
+        let routing = TrackSoloRouting(tracks: tracks)
+        var dimmed = Set(tracks.filter { routing.isMuted($0) }.map(\.id))
         var previous: Set<UUID> = []
         while previous != dimmed {
             previous = dimmed
@@ -1767,11 +1757,11 @@ final class Timeline: NSView {
             let title = editing ? (depth > 0 ? "↳  " : "") : (depth > 0 ? "↳  \(track.name)" : track.name)
             label(title, trackNameRect(row: index, depth: depth), size: 13, color: trackDimmed ? .secondaryLabelColor : .labelColor, weight: .semibold)
             let muteRect = trackMuteRect(row: index, depth: depth)
-            fill(muteRect, track.muted ? NSColor.systemOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+            ButtonStyle.drawFace(muteRect, activeColor: track.muted ? .systemOrange : nil)
             drawTrackControlHover(track.id, kind: 0, rect: muteRect)
             centeredControlLabel(track.muted ? "MUTED" : "MUTE", muteRect, size: 9, color: track.muted ? .systemOrange : .secondaryLabelColor, flipped: isFlipped)
             let soloRect = trackSoloRect(row: index, depth: depth)
-            fill(soloRect, track.solo ? NSColor.systemBlue.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06), radius: 5)
+            ButtonStyle.drawFace(soloRect, activeColor: track.solo ? .systemBlue : nil)
             drawTrackControlHover(track.id, kind: 1, rect: soloRect)
             centeredControlLabel("SOLO", soloRect, size: 9, color: track.solo ? .systemBlue : .secondaryLabelColor, flipped: isFlipped)
             line(NSPoint(x: pinnedHeaderX, y: y + rowHeight), NSPoint(x: fragmentLeft, y: y + rowHeight), .white.withAlphaComponent(0.065))

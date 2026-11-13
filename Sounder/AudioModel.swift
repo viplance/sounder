@@ -179,6 +179,8 @@ struct Track: Codable, Identifiable {
 struct TrackSoloRouting {
     var dry: Set<UUID>
     var buses: Set<UUID> = []
+    var muteOverrides: Set<UUID> = []
+    func isMuted(_ track: Track) -> Bool { track.muted && !muteOverrides.contains(track.id) }
     init(tracks: [Track], soloIDs: Set<UUID>? = nil) {
         let all = Set(tracks.map(\.id))
         let selected = (soloIDs ?? Set(tracks.filter(\.solo).map(\.id))).intersection(all)
@@ -195,6 +197,7 @@ struct TrackSoloRouting {
             previous = buses
             for track in tracks where buses.contains(track.id) { if let parent = track.parent { buses.insert(parent) } }
         }
+        muteOverrides = buses
     }
 }
 struct FragmentClipboard: Codable {
@@ -636,7 +639,7 @@ final class AudioStore {
         let solo = TrackSoloRouting(tracks: processingTracks)
         var activeTracks = Set<UUID>()
         func collect(_ track: Track) {
-            guard !track.muted, solo.buses.contains(track.id), activeTracks.insert(track.id).inserted else { return }
+            guard !solo.isMuted(track), solo.buses.contains(track.id), activeTracks.insert(track.id).inserted else { return }
             for child in processingTracks where child.parent == track.id { collect(child) }
         }
         for root in processingTracks where root.parent == nil { collect(root) }

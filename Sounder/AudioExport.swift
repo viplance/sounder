@@ -72,7 +72,9 @@ final class ExportOptionsController: NSObject {
         super.init()
         alert.messageText = "Export audio"
         alert.icon = NSImage(size: .zero)
-        alert.addButton(withTitle: "Export…"); alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Export"); alert.addButton(withTitle: "Cancel")
+        alert.closeButtonResponseIndex = 1
+        alert.buttonSpacing = 6
         let rangeHeight: CGFloat = availableRange == nil ? 0 : 32
         let form = NSView(frame: NSRect(x: 0, y: 0, width: 390, height: 154 + rangeHeight))
         let rows: [(String, NSPopUpButton)] = [("Format", formats), ("Sample rate", rates), ("Bit depth", depths), ("MP3 bitrate", bitrates)]
@@ -93,7 +95,7 @@ final class ExportOptionsController: NSObject {
         selectedRangeCheckbox.frame = NSRect(x: 0, y: 0, width: 390, height: 24)
         selectedRangeCheckbox.isHidden = availableRange == nil; form.addSubview(selectedRangeCheckbox)
         alert.accessoryView = form
-        metadataButton.bezelStyle = .rounded
+        metadataButton.useStandardTextStyle()
         metadataButton.imagePosition = .imageLeft
         metadataButton.target = self; metadataButton.action = #selector(toggleMetadata)
         metadataButton.setAccessibilityLabel("Show or hide metadata")
@@ -263,7 +265,7 @@ enum AudioExporter {
         let tracks = project.processingTracks, solo = TrackSoloRouting(tracks: project.processingTracks)
         var audible = Set<UUID>()
         func include(_ track: Track) {
-            guard !track.muted, solo.buses.contains(track.id), audible.insert(track.id).inserted else { return }
+            guard !solo.isMuted(track), solo.buses.contains(track.id), audible.insert(track.id).inserted else { return }
             for child in tracks where child.parent == track.id { include(child) }
         }
         for root in tracks where root.parent == nil { include(root) }

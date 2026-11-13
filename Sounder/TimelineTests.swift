@@ -20,10 +20,11 @@ extension AppDelegate {
         guard popup.contentView?.frame.size == NSSize(width: 480, height: 290),
               body.frame == NSRect(x: 0, y: 0, width: 480, height: 240),
               let close = popup.contentView?.subviews.compactMap({ $0 as? PointerButton }).first,
-              close.frame.maxX == 464, close.frame.minY > body.frame.maxY,
+              close.frame.minX == 16, close.frame.minY > body.frame.maxY,
               close.title.isEmpty, close.image != nil, close.imagePosition == .imageOnly,
               let heading = popup.contentView?.subviews.compactMap({ $0 as? NSTextField }).first,
-              heading.frame.minY > body.frame.maxY, heading.frame.maxX < close.frame.minX else {
+              heading.frame.minY > body.frame.maxY, close.frame.maxX < heading.frame.minX,
+              heading.frame.maxX <= 460 else {
             throw SounderError.message("Popup heading or close icon overlaps a resized native plugin editor")
         }
         close.performClick(nil)

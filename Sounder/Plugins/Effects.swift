@@ -406,7 +406,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
             }
             RunLoop.main.add(capture, forMode: .modalPanel)
         }
-        if snapshotMode { NSApp.runModal(for: window); window.orderOut(nil) }
+        if snapshotMode { EditorModalBackdrop.run { NSApp.runModal(for: window) }; window.orderOut(nil) }
     }
     private func focusEmptyPicker() {
         guard effects.isEmpty else { return }
@@ -561,7 +561,7 @@ final class EffectsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NS
     }
     @objc func browse() {
         let panel = makeBrowsePanel()
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard EditorModalBackdrop.run({ panel.runModal() }) == .OK, let url = panel.url else { return }
         guard ["vst", "vst3"].contains(url.pathExtension.lowercased()) else { editor.error(SounderError.message("Choose a .vst or .vst3 plug-in bundle.")); return }; add(url)
     }
     func editPlugin(native: Bool) {

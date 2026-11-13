@@ -19,7 +19,7 @@ final class DryShuttleSource {
             var ancestor: Track? = track
             var visited = Set<UUID>()
             while let current = ancestor {
-                if current.muted || !visited.insert(current.id).inserted { return false }
+                if routing.isMuted(current) || !visited.insert(current.id).inserted { return false }
                 ancestor = current.parent.flatMap { parents[$0] }
             }
             return true
