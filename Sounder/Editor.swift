@@ -2,6 +2,46 @@ import AppKit
 import AVFoundation
 import UniformTypeIdentifiers
 
+
+/// Persist only successful opens/saves; tests can supply an isolated preferences suite.
+final class RecentProjectHistory {
+    struct Entry: Codable, Equatable {
+        var path: String
+        var name: String
+        var url: URL { URL(fileURLWithPath: path) }
+    }
+    private static let key = "Sounder.recentProjects"
+    private let preferences: UserDefaults?
+    private(set) var entries: [Entry]
+    var changed: (() -> Void)?
+
+    init(preferences: UserDefaults?) {
+        self.preferences = preferences
+        let data = preferences?.data(forKey: Self.key)
+        var seen = Set<String>()
+        entries = Array(((data.flatMap { try? JSONDecoder().decode([Entry].self, from: $0) }) ?? [])
+            .filter { $0.path.hasPrefix("/") && seen.insert($0.path).inserted }.prefix(100))
+    }
+    func remember(_ url: URL, name: String) {
+        let path = url.standardizedFileURL.path
+        entries.removeAll { $0.path == path }
+        entries.insert(Entry(path: path, name: name), at: 0)
+        entries = Array(entries.prefix(100))
+        persist()
+    }
+    func removeIfMissing(_ url: URL) {
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        let path = url.standardizedFileURL.path
+        guard entries.contains(where: { $0.path == path }) else { return }
+        entries.removeAll { $0.path == path }
+        persist()
+    }
+    private func persist() {
+        if let data = try? JSONEncoder().encode(entries) { preferences?.set(data, forKey: Self.key) }
+        changed?()
+    }
+}
+
 /// Main-thread preview state for one input; each writer owns conversion and disk I/O.
 final class TrackRecording {
     let track: UUID?
@@ -361,6 +401,8 @@ final class Editor: NSObject {
     var redoStack: [Project] = []
     var dirty = false
     var projectURL: URL?
+    let recentProjects: RecentProjectHistory
+    var projectOpened: (() -> Void)?
     var player: LivePlayback?
     private var pausedPlayer: LivePlayback?
     private var pausedMixKey: Data?
@@ -468,6 +510,7 @@ final class Editor: NSObject {
     init(store: AudioStore, notifications: ToastCenter = ToastCenter(), preferences: UserDefaults? = nil,
          makeRecorder: ((URL, ProjectAudioFormat) throws -> LiveRecorder)? = nil,
          makePlayback: @escaping (StreamingGraph, ProjectAudioFormat, Double) throws -> LivePlayback = { LivePlayback(graph: $0, format: $1, start: $2) }) {
+        recentProjects = RecentProjectHistory(preferences: preferences)
         audio = store; self.notifications = notifications; self.preferences = preferences
         self.makeRecorder = makeRecorder; self.makePlayback = makePlayback
         super.init()
@@ -1665,6 +1708,7 @@ final class Editor: NSObject {
             if let target = saved.sources[source], source != target { recordedSourceCleanup[source] = target }
         }
         pendingRecordedSources.subtract(saved.sources.keys)
+        recentProjects.remember(url, name: saved.project.name ?? url.deletingPathExtension().lastPathComponent)
         projectURL = url; dirty = false; notifications.show("Saved \(url.lastPathComponent)", style: .saved); update()
         preferences?.set(project.playbackBufferSize, forKey: Self.playbackBufferPreference)
         // Commit paths before removing temporary takes: saved media always survives a failure.
@@ -1694,11 +1738,14 @@ final class Editor: NSObject {
     }
     func open(from url: URL) throws {
         guard !busy else { throw SounderError.message("Stop the current operation before opening a project") }
+        recentProjects.removeIfMissing(url)
         let prepared = try PreparedProject.load(from: url)
         finishProjectOpen(prepared, from: url)
     }
     func startProjectOpen(from url: URL) throws {
         guard !busy else { throw SounderError.message("Stop the current operation before opening a project") }
+        recentProjects.removeIfMissing(url)
+        guard FileManager.default.fileExists(atPath: url.path) else { throw CocoaError(.fileReadNoSuchFile) }
         cancelPlaybackPreparation(); discardStandbyPlayback()
         projectOpener?.close()
         let job = ProjectOpenController(editor: self, url: url)
@@ -1713,7 +1760,9 @@ final class Editor: NSObject {
         zoom = project.timelineView?.zoom ?? 70
         timelineViewRestoreID &+= 1
         lastPlaybackStart = nil; range = project.timelineRange; dirty = false
+        recentProjects.remember(url, name: projectName)
         reconcile(); update()
+        projectOpened?()
     }
     func export() {
         guard canExport else { return }

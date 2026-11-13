@@ -402,6 +402,115 @@ class PopupWindow: NSWindow {
     }
 }
 
+
+final class RecentProjectsWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    private let editor: Editor
+    let window = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 460))
+    private let search = NSSearchField()
+    private let table = NSTableView()
+    private var matches: [RecentProjectHistory.Entry] = []
+
+    init(editor: Editor) {
+        self.editor = editor
+        super.init()
+        window.title = "Projects"
+        let body = NSView(frame: NSRect(x: 0, y: 0, width: 540, height: 460))
+        window.contentView = body
+        let open = PointerButton(title: "Open project", target: self, action: #selector(openProject))
+        open.useStandardTextStyle()
+        open.frame = NSRect(x: 20, y: 410, width: 500, height: 30)
+        body.addSubview(open)
+        search.frame = NSRect(x: 20, y: 370, width: 500, height: 28)
+        search.placeholderString = "Search projects"
+        search.font = .systemFont(ofSize: 12)
+        search.delegate = self
+        search.sendsSearchStringImmediately = true
+        search.setAccessibilityLabel("Search projects")
+        body.addSubview(search)
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("project"))
+        column.width = 494
+        table.addTableColumn(column)
+        table.headerView = nil; table.rowHeight = 44
+        table.usesAlternatingRowBackgroundColors = false
+        table.backgroundColor = .clear
+        table.allowsEmptySelection = true
+        table.dataSource = self; table.delegate = self
+        table.target = self; table.action = #selector(openSelected)
+        table.setAccessibilityLabel("Recent projects")
+        let scroll = NSScrollView(frame: NSRect(x: 20, y: 20, width: 500, height: 338))
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        scroll.drawsBackground = false; scroll.documentView = table
+        body.addSubview(scroll)
+        window.installHeader()
+        window.initialFirstResponder = search
+        editor.recentProjects.changed = { [weak self] in self?.reload() }
+        reload()
+    }
+    func show() {
+        reload(); window.center(); window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(search)
+    }
+    private func reload() {
+        let words = search.stringValue.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        matches = editor.recentProjects.entries.filter { entry in
+            words.allSatisfy { word in
+                entry.name.range(of: word, options: [.caseInsensitive, .diacriticInsensitive]) != nil ||
+                entry.path.range(of: word, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+            }
+        }
+        table.reloadData()
+        if !matches.isEmpty { table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
+    }
+    func controlTextDidChange(_ obj: Notification) { reload() }
+    func numberOfRows(in tableView: NSTableView) -> Int { matches.count }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard matches.indices.contains(row) else { return nil }
+        let entry = matches[row]
+        let cell = NSTableCellView()
+        let name = NSTextField(labelWithString: entry.name)
+        name.font = .systemFont(ofSize: 12)
+        name.lineBreakMode = .byTruncatingTail
+        let path = NSTextField(labelWithString: entry.path)
+        path.font = .systemFont(ofSize: 10); path.textColor = .secondaryLabelColor
+        path.lineBreakMode = .byTruncatingMiddle
+        for field in [name, path] { field.translatesAutoresizingMaskIntoConstraints = false; cell.addSubview(field) }
+        NSLayoutConstraint.activate([
+            name.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            name.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
+            path.leadingAnchor.constraint(equalTo: name.leadingAnchor),
+            path.trailingAnchor.constraint(equalTo: name.trailingAnchor),
+            path.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 2)
+        ])
+        cell.textField = name; cell.toolTip = entry.path
+        return cell
+    }
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        switch selector {
+        case #selector(NSResponder.moveDown(_:)), #selector(NSResponder.moveUp(_:)):
+            guard !matches.isEmpty else { return true }
+            let step = selector == #selector(NSResponder.moveDown(_:)) ? 1 : -1
+            let row = max(0, min(matches.count - 1, table.selectedRow + step))
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            table.scrollRowToVisible(row); return true
+        case #selector(NSResponder.insertNewline(_:)):
+            openSelected(); return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            window.performClose(nil); return true
+        default: return false
+        }
+    }
+    @objc private func openProject() { editor.open() }
+    @objc private func openSelected() {
+        let row = table.selectedRow
+        guard matches.indices.contains(row), !editor.busy else { return }
+        let url = matches[row].url
+        guard editor.confirmDiscard() else { return }
+        do { try editor.startProjectOpen(from: url) }
+        catch { editor.error(error) }
+    }
+}
+
 // Button-only confirmations support keyboard choice regardless of the macOS
 // keyboard-navigation preference. Form dialogs retain their normal field keys.
 final class ActionChoiceAlert: CompactSettingsAlert {
@@ -638,7 +747,7 @@ final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate, NSMenuDelegate {
     var window: NSWindow!
     var editor: Editor!
     var timeline: Timeline!
@@ -663,6 +772,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var masterFXButton: MixerFXButton!
     let masterLabel = NSTextField(labelWithString: "MASTER")
     var masterGroup: NSStackView!
+    private var recentProjectsWindow: RecentProjectsWindow?
+    private let recentProjectsMenu = NSMenu(title: "Open Recent")
     private var titlebarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     private(set) var projectFileButtons: [String: NSButton] = [:]
     private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("files"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("quality"), NSToolbarItem.Identifier("io"), NSToolbarItem.Identifier("export")]
@@ -843,7 +954,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let path = CommandLine.arguments[index + 1]
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.playbackCPUProfile(path: path) }; return
         }
-        if CommandLine.arguments.contains("--ui-test") { uiTest() }
+        if CommandLine.arguments.contains("--ui-test") { uiTest(); return }
+        let projects = RecentProjectsWindow(editor: editor)
+        recentProjectsWindow = projects
+        editor.projectOpened = { [weak projects] in projects?.window.orderOut(nil) }
+        projects.show()
     }
     private func installTitlebarControls() {
         let icon = Bundle.main.url(forResource: "AppIcon", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
@@ -1434,6 +1549,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         menu("Sounder", [("About Sounder", #selector(about), ""), ("Quit Sounder", #selector(quit), "q")])
         menu("File", [("Rename Project…", #selector(renameProject), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Import Audio…", #selector(importAudio), "i"), ("Export…", #selector(exportAudio), "e")])
+        if let file = main.items.last?.submenu,
+           let openIndex = file.items.firstIndex(where: { $0.action == #selector(openProject) }) {
+            let recent = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
+            recent.submenu = recentProjectsMenu
+            recentProjectsMenu.delegate = self
+            file.insertItem(recent, at: openIndex + 1)
+        }
         menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v")])
         menu("Fragments", [("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Mute Fragments", #selector(muteFragments), ""), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
         if let fragments = main.items.last?.submenu { fragments.items.filter { [#selector(split), #selector(normalize)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
@@ -1442,6 +1564,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd)].contains($0.action) ? [.command] : [] } }
         menu("View", [("Zoom In", #selector(zoomIn), "\u{f700}"), ("Zoom Out", #selector(zoomOut), "\u{f701}")])
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
+    }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === recentProjectsMenu else { return }
+        menu.removeAllItems()
+        for entry in editor.recentProjects.entries {
+            let item = NSMenuItem(title: entry.name, action: #selector(openRecentProject(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = entry.url
+            item.toolTip = entry.path
+            menu.addItem(item)
+        }
+        if menu.items.isEmpty {
+            let empty = NSMenuItem(title: "No Recent Projects", action: nil, keyEquivalent: "")
+            empty.isEnabled = false; menu.addItem(empty)
+        }
+    }
+    @objc private func openRecentProject(_ sender: NSMenuItem) {
+        guard !editor.busy, NSApp.modalWindow == nil, let url = sender.representedObject as? URL,
+              editor.confirmDiscard() else { return }
+        do { try editor.startProjectOpen(from: url) }
+        catch { editor.error(error) }
     }
     private var shuttleKey: UInt16?
     private var releasedShuttleKey: UInt16?
@@ -1524,7 +1666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             menuItem.state = editor.project.loopEnabled ? .on : .off
             return editor.canToggleLoop && NSApp.modalWindow == nil && editorKeyboardContext
         }
-        if [#selector(openProject), #selector(saveProject), #selector(saveAs)].contains(menuItem.action) {
+        if [#selector(openProject), #selector(openRecentProject(_:)), #selector(saveProject), #selector(saveAs)].contains(menuItem.action) {
             return !editor.busy && NSApp.modalWindow == nil
         }
         if [#selector(selectAll(_:)), #selector(copy(_:)), #selector(paste(_:))].contains(menuItem.action) {

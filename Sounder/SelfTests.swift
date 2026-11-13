@@ -228,6 +228,7 @@ func runAudioTests() throws {
     }
     try runRecordedMediaMoveTests()
     try runProjectStorageTests()
+    try runRecentProjectHistoryTests()
     try runMulticoreTests()
     try runPerformanceTests()
     try runAudioRoutingTests()
@@ -1076,4 +1077,36 @@ func runMasterMixTests() throws {
     try check(abs(dry[0] - Float(0.4 * pow(10, -12.0 / 20))) < 1e-7, "Uncached dry shuttle honors master volume")
     let raw = try store.renderAudio(project, onlyTrack: a.id)
     try check(abs(raw.channels[0][2000] - 0.2) < 1e-7, "Fragment source rendering remains independent of master processing")
+}
+
+func runRecentProjectHistoryTests() throws {
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let suite = "SounderRecentTests-" + UUID().uuidString
+    let preferences = UserDefaults(suiteName: suite)!
+    defer { preferences.removePersistentDomain(forName: suite) }
+    let history = RecentProjectHistory(preferences: preferences)
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    for index in 0..<105 {
+        history.remember(root.appendingPathComponent("\(index).sounder"), name: "Project \(index)")
+    }
+    try check(history.entries.count == 100 && history.entries.first?.name == "Project 104" && history.entries.last?.name == "Project 5", "Recent projects retain the latest 100 in recency order")
+    let url = root.appendingPathComponent("50.sounder")
+    history.remember(url, name: "Renamed 🎵")
+    let restored = RecentProjectHistory(preferences: preferences)
+    try check(restored.entries == history.entries && restored.entries.first?.name == "Renamed 🎵" && restored.entries.filter { $0.url == url }.count == 1, "Recent history persists, updates names and deduplicates reopened projects")
+    try Data().write(to: url)
+    restored.removeIfMissing(url)
+    try check(restored.entries.first?.url == url, "Existing project files remain in history")
+    try FileManager.default.removeItem(at: url)
+    restored.removeIfMissing(url)
+    try check(!RecentProjectHistory(preferences: preferences).entries.contains { $0.url == url }, "Missing project removal persists across launches")
+    let editor = Editor(store: try AudioStore(directory: root.appendingPathComponent("audio")), preferences: preferences)
+    editor.recentProjects.remember(url, name: "Missing")
+    do { try editor.startProjectOpen(from: url); throw SounderError.message("Opening a missing project unexpectedly succeeded") }
+    catch let error as CocoaError { try check(error.code == .fileReadNoSuchFile, "Opening a missing recent project reports the missing file") }
+    try check(!editor.recentProjects.entries.contains { $0.url == url }, "The shared project-open path removes missing recent entries")
 }

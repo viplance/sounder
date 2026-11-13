@@ -295,6 +295,7 @@ final class ProjectOpenController: NSObject, NSWindowDelegate {
                 editor?.finishProjectOpen(prepared, from: url)
             case .failure(let error):
                 failure = error
+                if !(error is CancellationError) { editor?.recentProjects.removeIfMissing(url) }
                 row.update(fraction: fraction, phase: error is CancellationError ? "Cancelled" : "Failed: " + error.localizedDescription)
                 editor?.update()
                 if !(error is CancellationError) { editor?.error(error) }
