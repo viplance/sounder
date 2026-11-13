@@ -90,6 +90,19 @@ func runAtomicStopPositionTests() throws {
 }
 
 func runRecordingOutputAnchorTests() throws {
+    // The device clock advances during starvation; recovered output must keep
+    // the source frozen over the gap and move every future loop/seek boundary.
+    var recovered = PlaybackClock()
+    recovered.segments = [(0, ShuttleMotion(start: 2, direction: 1, end: 100, initialSpeed: 1, target: 1)),
+                          (1200, ShuttleMotion(start: 0, direction: 1, end: 100, initialSpeed: 1, target: 1))]
+    recovered.insertOutputGap(at: 1000, frames: 95_056, sampleRate: 48_000, fallback: 0)
+    let held = 2 + 1000.0 / 48_000
+    guard abs(recovered.position(at: 50_000, sampleRate: 48_000, fallback: -1) - held) < 1e-9,
+          abs(recovered.position(at: 96_056, sampleRate: 48_000, fallback: -1) - held) < 1e-9,
+          recovered.position(at: 96_256, sampleRate: 48_000, fallback: -1) == 0 else {
+        throw SounderError.message("Output starvation recovery lost the source/DAC mapping or loop boundary")
+    }
+    print("PASS: Output gap recovery preserves absolute clock alignment and queued loop boundaries")
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderOutputAnchor-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = try AudioStore(directory: directory)

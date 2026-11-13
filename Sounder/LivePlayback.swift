@@ -616,8 +616,26 @@ final class LivePlayback {
         // Stop may arrive while this buffer's DSP is blocked. Do not publish
         // that obsolete PCM or give its callback ownership of the new queue.
         guard !isStopping, effectsOnly || !isAuditioningEffects else { return }
+        var scheduledStart = outputFrames - Int(buffer.frameLength)
+        // A player node's sample clock continues through underruns. Schedule
+        // resumed PCM explicitly on that clock and move its source mapping by
+        // the same gap; counting only PCM frames permanently loses sync.
+        if !effectsOnly, shuttleRenderer == nil, !engine.isInManualRenderingMode,
+           node.isPlaying, let played = PlaybackClock.playerFrame(node: node, sampleRate: format.sampleRate), played > scheduledStart {
+            let gap = played + max(512, Int((recordingOutputLatency * format.sampleRate).rounded())) - scheduledStart
+            transportLock.lock()
+            clock.insertOutputGap(at: scheduledStart, frames: gap, sampleRate: format.sampleRate,
+                                  fallback: Double(firstFrame + scheduledStart) / format.sampleRate)
+            if let request = seekRequest, let boundary = request.outputFrame, boundary >= scheduledStart {
+                seekRequest = (request.id, request.time, boundary + gap)
+            }
+            transportLock.unlock()
+            outputFrames += gap; scheduledStart += gap
+            meterBuffer.clear()
+        }
         transportLock.lock(); clock.renderedFrames = outputFrames; transportLock.unlock()
-        outputQueue.schedule(buffer, on: node, worker: queue, final: last || pauseFinal, manual: engine.isInManualRenderingMode) { [weak self] in
+        let scheduleTime = !effectsOnly && shuttleRenderer == nil ? AVAudioTime(sampleTime: AVAudioFramePosition(scheduledStart), atRate: format.sampleRate) : nil
+        outputQueue.schedule(buffer, on: node, worker: queue, final: last || pauseFinal, manual: engine.isInManualRenderingMode, at: scheduleTime) { [weak self] in
             guard let self, self.running else { return }
             do {
                 if self.pausing {

@@ -54,9 +54,9 @@ final class PlaybackOutputQueue {
         final ? (manual ? .dataRendered : .dataPlayedBack) : .dataConsumed
     }
     func schedule(_ buffer: AVAudioPCMBuffer, on node: AVAudioPlayerNode, worker: DispatchQueue,
-                  final: Bool, manual: Bool, completion: @escaping () -> Void) {
+                  final: Bool, manual: Bool, at time: AVAudioTime? = nil, completion: @escaping () -> Void) {
         let ticket = register(frames: Int(buffer.frameLength))
-        node.scheduleBuffer(buffer, completionCallbackType: Self.completionType(final: final, manual: manual)) { [weak self] _ in
+        node.scheduleBuffer(buffer, at: time, options: [], completionCallbackType: Self.completionType(final: final, manual: manual)) { [weak self] _ in
             guard let self else { return }
             self.consumed(ticket)
             worker.async {
