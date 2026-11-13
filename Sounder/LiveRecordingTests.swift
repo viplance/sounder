@@ -125,6 +125,20 @@ func runRecordingOutputAnchorTests() throws {
                 throw SounderError.message("Recording adds queue capacity or device latency twice")
             }
         }
+        // Reproduce a DSP worker that stopped replenishing output while the
+        // device clock advanced by the 1.98 s gap found in the reported take.
+        let blocked = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        live.queue.async { blocked.signal(); release.wait() }
+        blocked.wait()
+        let lateFrame = capacity + 95_056
+        let lateStamp = AVAudioTime(hostTime: AVAudioTime.hostTime(forSeconds: 100 + Double(lateFrame) / 48_000))
+        let latePlayer = AVAudioTime(sampleTime: AVAudioFramePosition(lateFrame), atRate: 48_000)
+        let unsafeAnchor = live.recordingAnchor(renderTime: lateStamp, playerTime: latePlayer, outputLatency: 0.037)
+        release.signal()
+        guard unsafeAnchor == nil else {
+            throw SounderError.message("Starved playback fabricated a recording anchor in the past instead of rejecting an untrustworthy clock")
+        }
+        print("PASS: DSP starvation cannot fabricate a late recording anchor with a \(capacity)-sample queue")
         // Enter's replacement take starts when the queued seek reaches output,
         // even when the old source has the same time on a different loop pass.
         live.seek(to: 0.5); live.queue.sync {}

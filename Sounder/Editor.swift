@@ -897,7 +897,7 @@ final class Editor: NSObject {
             guard !pending.isEmpty else { throw SounderError.message("Select a track for recording") }
             let timedCapture = pending.contains { $0.recorder.usesHardwareClock } && !player.engine.isInManualRenderingMode
             if wasPlaying && timedCapture {
-                guard liveHost != nil else { throw SounderError.message("The playback audio clock is not ready for recording. Try Record again.") }
+                guard liveHost != nil else { throw SounderError.message("Recording could not start because playback has no reliable audio clock. Stop playback, then try Record again.") }
             }
             for take in pending { try take.recorder.start() }
             if !wasPlaying {

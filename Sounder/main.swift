@@ -1775,6 +1775,15 @@ if let index = CommandLine.arguments.firstIndex(of: "--plugin-buffer-test"), ind
     do { setbuf(stdout, nil); try runPluginBufferBoundaryTests(path: CommandLine.arguments[index + 1]); exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
+if CommandLine.arguments.contains("--recording-anchor-test") {
+    do {
+        setbuf(stdout, nil)
+        try runRecordingOutputAnchorTests()
+        try runRecordingSynchronizationTests()
+        try runRecordedTrackAlignmentTests()
+        exit(0)
+    } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
 if CommandLine.arguments.contains("--buffer-regression-test") {
     do {
         setbuf(stdout, nil)

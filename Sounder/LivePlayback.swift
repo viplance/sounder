@@ -195,7 +195,12 @@ final class LivePlayback {
         guard stamp.isHostTimeValid, played.isSampleTimeValid, played.sampleRate > 0 else { return nil }
         let frame = Int((Double(played.sampleTime) * format.sampleRate / played.sampleRate).rounded())
         transportLock.lock()
-        let boundedFrame = max(0, min(clock.renderedFrames, frame))
+        // Device time can advance through an output underrun while DSP is
+        // blocked. Clamping only its sample coordinate would move the paired
+        // host time into the past and pad the new take with fictitious silence.
+        // There is no trustworthy source/DAC pair beyond scheduled output.
+        guard frame >= 0, frame <= clock.renderedFrames else { transportLock.unlock(); return nil }
+        let boundedFrame = frame
         let origin = sourceTime ?? sourceTimeLocked(at: boundedFrame)
         let targetFrame: Double
         if let seekRequest, abs(seekRequest.time - origin) < 0.5 / format.sampleRate, sourceTime != nil {
