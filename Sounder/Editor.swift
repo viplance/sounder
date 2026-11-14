@@ -1811,6 +1811,7 @@ final class Editor: NSObject {
             guard checkpoint() else { return }; project.exportSettings = settings; project.exportSettingsConfirmed = true
             project.metadata = metadata
         }
-        update("Exported \(url.lastPathComponent)")
+        notifications.show("Exported \(url.lastPathComponent)", style: .saved)
+        update()
     }
 }
