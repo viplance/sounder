@@ -46,8 +46,18 @@ struct ExportSettings: Codable, Equatable {
     var sampleRate: Double
     var bitDepth: Int
     var mp3Bitrate = 320
+    var selectionRangeOnly = false
     init(projectFormat: ProjectAudioFormat) {
         sampleRate = projectFormat.sampleRate; bitDepth = projectFormat.bitDepth
+    }
+    enum CodingKeys: String, CodingKey { case format, sampleRate, bitDepth, mp3Bitrate, selectionRangeOnly }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        format = try values.decode(ExportFormat.self, forKey: .format)
+        sampleRate = try values.decode(Double.self, forKey: .sampleRate)
+        bitDepth = try values.decode(Int.self, forKey: .bitDepth)
+        mp3Bitrate = try values.decode(Int.self, forKey: .mp3Bitrate)
+        selectionRangeOnly = try values.decodeIfPresent(Bool.self, forKey: .selectionRangeOnly) ?? false
     }
     func validate() throws {
         guard ProjectAudioFormat.supportedRates.contains(sampleRate), [16, 24, 32].contains(bitDepth), [128, 192, 256, 320].contains(mp3Bitrate) else {
@@ -91,7 +101,7 @@ final class ExportOptionsController: NSObject {
         depths.addItems(withTitles: ["16 bit", "24 bit", "32 bit (Float)"]); depths.selectItem(at: [16,24,32].firstIndex(of: settings.bitDepth) ?? 1)
         bitrates.addItems(withTitles: ["128 kbps", "192 kbps", "256 kbps", "320 kbps"]); bitrates.selectItem(at: [128,192,256,320].firstIndex(of: settings.mp3Bitrate) ?? 3)
         note.frame = NSRect(x: 0, y: rangeHeight, width: 390, height: 54); note.font = .systemFont(ofSize: 11); note.textColor = .secondaryLabelColor; form.addSubview(note)
-        selectedRangeCheckbox.setButtonType(.switch); selectedRangeCheckbox.state = .off
+        selectedRangeCheckbox.setButtonType(.switch); selectedRangeCheckbox.state = settings.selectionRangeOnly ? .on : .off
         selectedRangeCheckbox.frame = NSRect(x: 0, y: 0, width: 390, height: 24)
         selectedRangeCheckbox.isHidden = availableRange == nil; form.addSubview(selectedRangeCheckbox)
         alert.accessoryView = form
@@ -123,6 +133,7 @@ final class ExportOptionsController: NSObject {
     var settings: ExportSettings {
         var value = ExportSettings(projectFormat: ProjectAudioFormat(sampleRate: ProjectAudioFormat.supportedRates[rates.indexOfSelectedItem], bitDepth: [16,24,32][depths.indexOfSelectedItem]))
         value.format = ExportFormat.allCases[formats.indexOfSelectedItem]; value.mp3Bitrate = [128,192,256,320][bitrates.indexOfSelectedItem]
+        value.selectionRangeOnly = selectedRangeCheckbox.state == .on
         return value
     }
     @objc func changed() {

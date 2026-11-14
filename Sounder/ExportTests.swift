@@ -201,6 +201,17 @@ extension AppDelegate {
         guard !ranged.selectedRangeCheckbox.isHidden, ranged.selectedRange == nil else { throw SounderError.message("Selected range must be visible and initially unchecked for a timeline range") }
         ranged.selectedRangeCheckbox.performClick(nil)
         guard ranged.selectedRange == 1..<3 else { throw SounderError.message("Selected range checkbox did not enable interval export") }
+        let stored = try JSONDecoder().decode(ExportSettings.self, from: JSONEncoder().encode(ranged.settings))
+        let restored = ExportOptionsController(settings: stored, range: 4...6)
+        guard restored.selectedRange == 4..<6 else { throw SounderError.message("Export range preference was not restored using the current timeline selection") }
+        let noRange = ExportOptionsController(settings: stored)
+        guard noRange.selectedRange == nil, noRange.settings.selectionRangeOnly else { throw SounderError.message("An absent timeline selection must preserve the export range preference without exporting a range") }
+        restored.selectedRangeCheckbox.performClick(nil)
+        guard !restored.settings.selectionRangeOnly else { throw SounderError.message("Export range preference could not be cleared") }
+        var legacySettings = try JSONSerialization.jsonObject(with: JSONEncoder().encode(stored)) as! [String: Any]
+        legacySettings.removeValue(forKey: "selectionRangeOnly")
+        let legacyExport = try JSONDecoder().decode(ExportSettings.self, from: JSONSerialization.data(withJSONObject: legacySettings))
+        guard !legacyExport.selectionRangeOnly else { throw SounderError.message("Older export settings must default to the full project") }
         ranged.rates.selectItem(at: 3); ranged.changed()
         guard !ranged.note.isHidden, ranged.selectedRangeCheckbox.frame.maxY <= ranged.note.frame.minY, ranged.selectedRange == 1..<3 else { throw SounderError.message("Export validation overlaps or resets the range checkbox") }
         ranged.formats.selectItem(at: 1); ranged.changed()
