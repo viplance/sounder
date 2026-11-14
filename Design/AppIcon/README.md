@@ -1,10 +1,10 @@
 # Sounder app icon
 
-The active 1254 × 1254 RGBA master is `Sounder-master-transparent.png`. The mark is an oversized folded S-shaped sound wave in acid lime, mint and cyan with transparent surroundings and open negative spaces. It was edited with the built-in image generation tool. `Sounder-master.png` preserves the original navy-background artwork for reference.
+The active master is `Sounder-master.png`: the original lime, mint and cyan folded S artwork with an opaque midnight navy background. The background is part of every rendition so Spotlight and Dock display the same dark fill. `Sounder-master-transparent.png` is retained as a transparent reference.
 
 Run `npm run build:icons` on macOS to regenerate `Sounder/Assets.xcassets/AppIcon.appiconset`. Every slot is resized directly from the master with macOS `sips`, never from a smaller derivative.
 
-The catalog includes 16, 32, 128, 256 and 512 point icons at both 1× and 2×: 10 images in total. `Sounder-AppStore-1024.png` beside the master is a separate lossless 1024 × 1024 PNG for App Store use. The 64, 128, 256, 512 and 1024 pixel catalog renditions use HEIC at quality 85; the 16 and 32 pixel renditions retain PNG. Each rendition is resized directly from the PNG master before encoding. All current catalog renditions preserve the transparent alpha channel, including HEIC variants. HEIC inputs were verified with the installed Xcode 27.1 asset compiler for the macOS 14 deployment target. The catalog is included in the Sounder target's Resources phase and selected by `ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon` in Debug and Release.
+The catalog includes 16, 32, 128, 256 and 512 point icons at both 1× and 2×: 10 images in total. `Sounder-AppStore-1024.png` beside the master is a separate lossless 1024 × 1024 PNG for App Store use. The 64, 128, 256, 512 and 1024 pixel catalog renditions use HEIC at quality 85; the 16 and 32 pixel renditions retain PNG. Each rendition is resized directly from the PNG master before encoding. All current catalog renditions use the opaque dark-background master, including HEIC variants. HEIC inputs were verified with the installed Xcode 27.1 asset compiler for the macOS 14 deployment target. The catalog is included in the Sounder target's Resources phase and selected by `ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon` in Debug and Release.
 
 This supplies app icon artwork, not App Store submission or signing configuration.
 
