@@ -99,9 +99,16 @@ func runMulticoreTests(benchmark: Bool = false) throws {
               "Parallel offline mix preserves exact PCM, dependency order and monotonic export progress")
     var settings = ExportSettings(projectFormat: project.audioFormat); settings.format = .wav; settings.bitDepth = 32
     let exported = directory.appendingPathComponent("multicore.wav")
-    try AudioExporter.write(project: project, store: store, settings: settings, to: exported)
+    // Export now uses live hosts rather than AudioStore's offline test hook.
+    // Keep synthetic processors in the graph tests above; exercise file export
+    // with the same nested routing and gains, without fake plug-in paths.
+    var exportProject = project
+    exportProject.masterEffects = []
+    for index in exportProject.tracks.indices { exportProject.tracks[index].effects = [] }
+    let exportExpected = try store.renderAudio(exportProject, parallel: false)
+    try AudioExporter.write(project: exportProject, store: store, settings: settings, to: exported)
     let decoded = try AudioStore.decode(exported, sampleRate: 48_000)
-    try check(decoded.channels == expected.channels, "WAV export uses the same verified multicore mix")
+    try check(decoded.channels == exportExpected.channels, "WAV export preserves the verified nested routing and mix gains")
 
     if benchmark {
         var benchmarkProject = Project(tracks: tracks.map { track in var t = track; t.parent = nil; return t })

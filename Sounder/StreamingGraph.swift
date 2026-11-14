@@ -294,3 +294,34 @@ final class StreamingGraph {
 
 }
 
+
+/// Builds the same DSP graph for live playback and offline export. Live callers
+/// supply authoritative editor hosts; export creates isolated snapshot hosts.
+extension StreamingGraph {
+    static func make(project: Project, store: AudioStore, hosts: [UUID: SNPluginHost]? = nil,
+                     dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil,
+                     progress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false },
+                     preservePluginState: Bool = false, includeAudioSources: Bool = true) throws -> StreamingGraph {
+        try StreamingGraph(project: project, store: store, dryGraph: dryGraph, processedCache: processedCache,
+                           preparationProgress: progress, cancelled: cancelled, includeAudioSources: includeAudioSources) { effect in
+            if cancelled() { throw CancellationError() }
+            let host: SNPluginHost
+            if let hosts {
+                guard let existing = hosts[effect.id] else { throw SounderError.message("Effect processor is unavailable") }
+                host = existing
+            } else {
+                host = try SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: project.audioFormat.sampleRate)
+            }
+            let channels = project.audioFormat.channels
+            if preservePluginState { try host.ensureStreaming(channels) }
+            else { try host.beginStreaming(channels) }
+            // Live transport owns its clock, including paused/retained hosts.
+            if hosts == nil { host.setTransportPlaying(true, position: 0, tempo: project.tempo) }
+            guard host.latency <= Int(store.sampleRate * 30) else { throw SounderError.message("Plug-in latency exceeds the supported 30-second maximum") }
+            return StreamingEffect(latency: host.latency, tail: host.tail) { input in
+                let data = try host.processBlock(input.withUnsafeBytes { Data($0) }, channels: channels)
+                return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            }
+        }
+    }
+}

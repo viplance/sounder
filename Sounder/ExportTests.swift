@@ -295,3 +295,32 @@ extension AppDelegate {
         print("PASS: Export shows shared progress UI immediately, keeps the main run loop responsive, cancels safely and commits choices only on success")
     }
 }
+
+// Compare the two production render paths using identical saved plug-in state.
+func runExportParityTest(path: String) throws {
+    let project = try ProjectStorage.load(from: URL(fileURLWithPath: path))
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SounderParity-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try AudioStore(directory: directory)
+    store.configure(project.audioFormat)
+    print("Rendering offline mix")
+    // Bootstrap plug-in frameworks on the main thread before parallel work.
+    for effect in project.activeEffects {
+        _ = try SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: project.audioFormat.sampleRate)
+    }
+    let offline = try AudioExporter.render(project: project, store: store)
+    print("Preparing streaming mix")
+    let graph = try StreamingGraph.make(project: project, store: store)
+    try graph.seek(to: 0)
+    var difference = 0.0, reference = 0.0
+    for first in stride(from: 0, to: offline.frameCount, by: 512) {
+        let count = min(512, offline.frameCount - first)
+        let actual = try graph.render(frames: count)
+        for frame in 0..<count { for channel in 0..<project.audioFormat.channels {
+            let expected = Double(offline.channels[channel][first + frame])
+            let delta = Double(actual[frame * project.audioFormat.channels + channel]) - expected
+            difference += delta * delta; reference += expected * expected
+        } }
+    }
+    print("Streaming/offline relative RMS difference: \(sqrt(difference / max(reference, 1e-30)))")
+}

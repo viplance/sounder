@@ -211,7 +211,7 @@ final class Editor: NSObject {
                     try job.check()
                     processors[effect.id] = try hosts[effect.id] ?? SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: snapshot.audioFormat.sampleRate)
                 }
-                let graph = try Self.makeGraph(project: snapshot, store: store, hosts: processors, cancelled: { job.isCancelled }, preservePluginState: true, includeAudioSources: false)
+                let graph = try StreamingGraph.make(project: snapshot, store: store, hosts: processors, cancelled: { job.isCancelled }, preservePluginState: true, includeAudioSources: false)
                 try job.check()
                 let ready = processors
                 DispatchQueue.main.async { [weak self] in
@@ -1290,23 +1290,9 @@ final class Editor: NSObject {
         for effect in project.activeEffects { hosts[effect.id] = try pluginHost(effect) }
         return hosts
     }
-    private static func makeGraph(project: Project, store: AudioStore, hosts: [UUID: SNPluginHost], dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil, progress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false }, preservePluginState: Bool = false, includeAudioSources: Bool = true) throws -> StreamingGraph {
-        try StreamingGraph(project: project, store: store, dryGraph: dryGraph, processedCache: processedCache, preparationProgress: progress, cancelled: cancelled, includeAudioSources: includeAudioSources) { effect in
-            guard !cancelled() else { throw CancellationError() }
-            guard let host = hosts[effect.id] else { throw SounderError.message("Effect processor is unavailable") }
-            if preservePluginState { try host.ensureStreaming(project.audioFormat.channels) }
-            else { try host.beginStreaming(project.audioFormat.channels) }
-            guard host.latency <= Int(store.sampleRate * 30) else { throw SounderError.message("Plug-in latency exceeds the supported 30-second maximum") }
-            let channels = project.audioFormat.channels
-            return StreamingEffect(latency: host.latency, tail: host.tail) { samples in
-                let data = try host.processBlock(samples.withUnsafeBytes { Data($0) }, channels: channels)
-                return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-            }
-        }
-    }
     private func playbackGraph() throws -> StreamingGraph {
         let previous = mixCache?.key == (try mixCacheKey()) ? mixCache?.graph : nil
-        return try Self.makeGraph(project: project, store: audio, hosts: playbackHosts(), dryGraph: previous, processedCache: previous?.outputCache)
+        return try StreamingGraph.make(project: project, store: audio, hosts: playbackHosts(), dryGraph: previous, processedCache: previous?.outputCache)
     }
     func beginShuttle(direction: Double) {
         guard !isPreparingPlayback, !isRecording, !requestingMic, !isExporting, !isImporting, !isOpening, !isNormalizing, duration > 0 else { return }
@@ -1364,7 +1350,7 @@ final class Editor: NSObject {
                 self.updateTransportPosition()
             }
             player.releaseShuttle { cancelled in
-                try Self.makeGraph(project: snapshot, store: store, hosts: hosts, dryGraph: previous, cancelled: cancelled)
+                try StreamingGraph.make(project: snapshot, store: store, hosts: hosts, dryGraph: previous, cancelled: cancelled)
             }
             update()
         } catch { endShuttle(resume: false); self.error(error) }
@@ -1528,7 +1514,7 @@ final class Editor: NSObject {
                     try job.check()
                     hosts[effect.id] = try existingHosts[effect.id] ?? SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: snapshot.audioFormat.sampleRate)
                 }
-                let graph = try Self.makeGraph(project: snapshot, store: store, hosts: hosts, dryGraph: previous, processedCache: previous?.outputCache, progress: { job.advance(frames: Double($0)) }, cancelled: { job.isCancelled }, preservePluginState: liveState)
+                let graph = try StreamingGraph.make(project: snapshot, store: store, hosts: hosts, dryGraph: previous, processedCache: previous?.outputCache, progress: { job.advance(frames: Double($0)) }, cancelled: { job.isCancelled }, preservePluginState: liveState)
                 try job.check()
                 guard forRecording || loop.map({ start <= $0.upperBound }) == true || start < Double(graph.totalFrames) / snapshot.audioFormat.sampleRate else {
                     DispatchQueue.main.async { [weak self] in

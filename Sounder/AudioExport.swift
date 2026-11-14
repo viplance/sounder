@@ -262,6 +262,27 @@ enum AudioExporter {
         try file.seek(toOffset: 4)
         try withUnsafeBytes(of: &size) { try file.write(contentsOf: Data($0)) }
     }
+    /// Use the playback graph for export so bus routing, latency and plug-in
+    /// block processing follow the same path as the audible mix.
+    static func render(project: Project, store: AudioStore, cancelled: () -> Bool = { false },
+                       progress: (Double, String) -> Void = { _, _ in }) throws -> AudioSignal {
+        store.configure(project.audioFormat)
+        let channels = project.audioFormat.channels
+        let graph = try StreamingGraph.make(project: project, store: store, cancelled: cancelled)
+        try graph.seek(to: 0)
+        var output = Array(repeating: [Float](repeating: 0, count: graph.totalFrames), count: channels)
+        for first in stride(from: 0, to: graph.totalFrames, by: PlaybackBufferSize.blockFrames) {
+            if cancelled() { throw CancellationError() }
+            let count = min(PlaybackBufferSize.blockFrames, graph.totalFrames - first)
+            let block = try graph.render(frames: count)
+            for frame in 0..<count { for channel in 0..<channels {
+                output[channel][first + frame] = block[frame * channels + channel]
+            } }
+            progress(Double(first + count) / Double(max(1, graph.totalFrames)), "Mixing audio")
+        }
+        return AudioSignal(channels: output)
+    }
+
     static func write(project: Project, store: AudioStore, settings: ExportSettings, to destination: URL, range: Range<Double>? = nil, progress: (Double, String) -> Void = { _, _ in }, cancelled: () -> Bool = { false }) throws {
         try settings.validate()
         try project.metadata.validate()
@@ -292,7 +313,7 @@ enum AudioExporter {
         }
         // Mix and process effects at the project rate, then resample the final mix once.
         progress(0.15, "Mixing audio")
-        var signal = try store.renderAudio(project, cancelled: cancelled, renderProgress: {
+        var signal = try render(project: project, store: store, cancelled: cancelled, progress: {
             progress(0.15 + 0.5 * $0, $1)
         })
         if cancelled() { throw CancellationError() }
