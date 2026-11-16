@@ -80,6 +80,28 @@ func runAudioTests() throws {
     editor.split(); try check(editor.project.tracks[0].clips.count == 4, "Split creates two source fragments")
     let splitMix = try store.render(editor.project); try check(splitMix == mix, "Split preserves exact rendered audio")
     editor.undo(); try check(editor.project.tracks[0].clips.count == 3, "Undo restores fragments")
+    let splitEncoder = JSONEncoder(); splitEncoder.outputFormatting = .sortedKeys
+    for baked in [false, true] {
+        var original = track.clips[0]
+        original.fadeInMS = 80; original.fadeOutMS = 120
+        original.fadeInCurve = .exponential; original.fadeOutCurve = .smooth
+        original.fadeInBaked = baked; original.fadeOutBaked = baked
+        let splitEditor = Editor(store: store)
+        splitEditor.project = Project(tracks: [Track(name: "Split fades", clips: [original])])
+        splitEditor.selection = [original.id]; splitEditor.cursor = 0.5
+        let originalMix = try store.render(splitEditor.project)
+        splitEditor.split()
+        let parts = splitEditor.project.tracks[0].clips
+        try check(parts[0].fadeInMS == 80 && parts[0].fadeInCurve == .exponential && parts[0].fadeInBaked == baked && parts[0].fadeOutMS == 0 && !parts[0].fadeOutBaked,
+                  "Split retains the original fade-in only on the first part (baked: \(baked))")
+        try check(parts[1].fadeOutMS == 120 && parts[1].fadeOutCurve == .smooth && parts[1].fadeOutBaked == baked && parts[1].fadeInMS == 0 && !parts[1].fadeInBaked,
+                  "Split retains the original fade-out only on the second part (baked: \(baked))")
+        try check(try store.render(splitEditor.project) == originalMix, "Split adds no fades at the cut (baked: \(baked))")
+        splitEditor.undo()
+        try check(try splitEncoder.encode(splitEditor.project.tracks[0].clips) == splitEncoder.encode([original]), "Undo restores both original fades")
+        splitEditor.redo()
+        try check(try splitEncoder.encode(splitEditor.project.tracks[0].clips) == splitEncoder.encode(parts), "Redo restores split fade placement")
+    }
     editor.redo(); editor.range = 0.2...0.8; editor.trim()
     let trimmed = editor.project.tracks[0].clips.filter { editor.selection.contains($0.id) }
     try check(trimmed.allSatisfy { $0.start >= 0.2 && $0.end <= 0.800001 }, "Trim keeps selected range with source offsets")

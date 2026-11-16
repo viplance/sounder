@@ -1648,7 +1648,10 @@ final class Editor: NSObject {
             for clip in project.tracks[i].clips {
                 if targets.contains(where: { $0.id == clip.id }) {
                     var left = clip; var right = clip; right.id = UUID()
-                    left.duration = cursor - clip.start; left.fadeOutBaked = false; right.fadeInBaked = false; right.start = cursor; right.offset += left.duration; right.duration -= left.duration
+                    left.duration = cursor - clip.start
+                    left.fadeOutMS = 0; left.fadeOutBaked = false
+                    right.fadeInMS = 0; right.fadeInBaked = false
+                    right.start = cursor; right.offset += left.duration; right.duration -= left.duration
                     next += [left, right]; selection.insert(right.id)
                 } else { next.append(clip) }
             }; project.tracks[i].clips = next
