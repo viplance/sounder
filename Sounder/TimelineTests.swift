@@ -340,7 +340,35 @@ extension AppDelegate {
         try check(editor.undoStack.count == beforeCancel, "An edge click without resizing does not create an Undo entry")
         send(.leftMouseDown, x: rect.midX); send(.leftMouseDragged, x: rect.midX + 35); send(.leftMouseUp, x: rect.midX + 35)
         try check(current().start == 2.5 && current().offset == 1 && current().duration == 3, "Dragging the fragment body still moves it without resizing")
-        editor.undo(); editor.project = original; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
+        editor.undo()
+        scroll.contentView.scroll(to: .zero)
+        let edgeHistory = editor.undoStack.count
+        send(.leftMouseDown, x: rect.midX)
+        send(.leftMouseDragged, x: timeline.viewportRect.maxX - 2)
+        let beforeScrollStart = current().start
+        timeline.advanceFragmentEdgeScroll(at: ProcessInfo.processInfo.systemUptime + 0.05)
+        try check(timeline.viewportRect.minX > 0 && current().start > beforeScrollStart,
+                  "Holding a fragment at the right viewport edge scrolls and moves it without another mouse event")
+        send(.leftMouseUp, x: timeline.viewportRect.maxX - 2)
+        try check(!timeline.isFragmentEdgeScrolling && editor.undoStack.count == edgeHistory + 1,
+                  "Edge scrolling stops on drop and the whole fragment move remains one Undo step")
+        editor.undo(); scroll.contentView.scroll(to: NSPoint(x: 100, y: 0))
+        send(.leftMouseDown, x: left)
+        send(.leftMouseDragged, x: timeline.fragmentLeft + 1)
+        timeline.advanceFragmentEdgeScroll(at: ProcessInfo.processInfo.systemUptime + 0.05)
+        try check(timeline.viewportRect.minX < 100 && timeline.resizedFragment != nil,
+                  "Holding a fragment edge beside the pinned track controls scrolls the timeline left")
+        stop()
+        try check(!timeline.isFragmentEdgeScrolling && current().start == 2,
+                  "Cancelling a resize also stops its edge scrolling without editing the fragment")
+        scroll.contentView.scroll(to: .zero)
+        send(.leftMouseDown, x: right)
+        send(.leftMouseDragged, x: timeline.viewportRect.maxX - 2)
+        timeline.advanceFragmentEdgeScroll(at: ProcessInfo.processInfo.systemUptime + 0.05)
+        try check(timeline.viewportRect.minX > 0 && timeline.resizedFragment != nil,
+                  "Holding a fragment's right edge at the viewport boundary scrolls right")
+        stop(); scroll.contentView.scroll(to: .zero)
+        editor.project = original; editor.selectedTrack = original.tracks[0].id; editor.dirty = false; refresh()
     }
 }
 

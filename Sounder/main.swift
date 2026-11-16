@@ -827,16 +827,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             link.add(to: .main, forMode: .modalPanel)
             transportDisplayLink = link
         }
-        transportDisplayLink?.isPaused = (editor.timer == nil && !timeline.isEasingPlaybackScroll && !timeline.isAudioDropScrolling) || !window.isVisible || window.isMiniaturized || !window.occlusionState.contains(.visible)
+        transportDisplayLink?.isPaused = (editor.timer == nil && !timeline.isEasingPlaybackScroll && !timeline.isAudioDropScrolling && !timeline.isFragmentEdgeScrolling) || !window.isVisible || window.isMiniaturized || !window.occlusionState.contains(.visible)
     }
     @objc private func displayTransportFrame(_ link: CADisplayLink) {
-        guard editor.timer != nil || timeline.isEasingPlaybackScroll || timeline.isAudioDropScrolling else { link.isPaused = true; return }
+        guard editor.timer != nil || timeline.isEasingPlaybackScroll || timeline.isAudioDropScrolling || timeline.isFragmentEdgeScrolling else { link.isPaused = true; return }
         editor.updateTransportFrame()
         timeline.presentTransportFrame()
         timeline.advanceAudioDropScroll()
+        timeline.advanceFragmentEdgeScroll()
         updatePositionLabel()
         transportFrameCount += 1
-        if editor.timer == nil && !timeline.isEasingPlaybackScroll && !timeline.isAudioDropScrolling { link.isPaused = true }
+        if editor.timer == nil && !timeline.isEasingPlaybackScroll && !timeline.isAudioDropScrolling && !timeline.isFragmentEdgeScrolling { link.isPaused = true }
     }
     func windowDidChangeOcclusionState(_ notification: Notification) { synchronizeDisplayLink() }
     private var hiddenProjectWindows: [NSWindow] = []

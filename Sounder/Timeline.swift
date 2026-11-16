@@ -809,6 +809,32 @@ final class Timeline: NSView {
     private(set) var fragmentSnapTime: Double?
     private(set) var audioDropTime: Double?
     private var audioDropScrollTimestamp: Double?
+    private var fragmentEdgeScroll: (point: NSPoint, flags: NSEvent.ModifierFlags, timestamp: Double)?
+    var isFragmentEdgeScrolling: Bool { fragmentEdgeScroll != nil }
+    private func stopFragmentEdgeScroll() {
+        guard fragmentEdgeScroll != nil else { return }
+        fragmentEdgeScroll = nil; scrollAnimationChanged?()
+    }
+    private func updateFragmentEdgeScroll(with event: NSEvent) {
+        let point = documentPoint(fromWindow: event.locationInWindow)
+        guard point.x <= fragmentLeft + 24 || point.x >= viewportRect.maxX - 24 else { stopFragmentEdgeScroll(); return }
+        playbackScroll = nil
+        fragmentEdgeScroll = (event.locationInWindow, event.modifierFlags, fragmentEdgeScroll?.timestamp ?? ProcessInfo.processInfo.systemUptime)
+        scrollAnimationChanged?()
+    }
+    func advanceFragmentEdgeScroll(at time: Double = ProcessInfo.processInfo.systemUptime) {
+        guard let state = fragmentEdgeScroll else { return }
+        guard !editor.busy, (fragmentResize != nil && didResizeFragment) || (dragClip != nil && didCheckpoint) else { stopFragmentEdgeScroll(); return }
+        let point = documentPoint(fromWindow: state.point)
+        let direction: CGFloat = point.x <= fragmentLeft + 24 ? -1 : 1
+        let oldOrigin = viewportRect.minX
+        scrollHorizontally(to: oldOrigin + direction * 480 * min(0.1, max(0, time - state.timestamp)))
+        fragmentEdgeScroll?.timestamp = time
+        let updated = documentPoint(fromWindow: state.point)
+        if fragmentResize != nil { updateFragmentResize(at: updated, flags: state.flags) }
+        else { updateFragmentMove(at: updated, flags: state.flags) }
+        if viewportRect.minX == oldOrigin { stopFragmentEdgeScroll() }
+    }
     var isAudioDropScrolling: Bool { audioDropScrollTimestamp != nil }
     private func stopAudioDropScrolling() {
         guard isAudioDropScrolling else { return }
@@ -1455,6 +1481,7 @@ final class Timeline: NSView {
                 NSRect(x: rect.maxX - width, y: rect.minY, width: width, height: rect.height)]
     }
     @discardableResult func cancelFragmentResize() -> Bool {
+        stopFragmentEdgeScroll()
         if fadeDrag != nil { fadeDrag = nil; fadedFragment = nil; didDragFade = false; refresh(); return true }
         guard fragmentResize != nil else { return false }
         fragmentResize = nil; resizedFragment = nil; pendingFragmentClick = nil; didResizeFragment = false; lastFragmentDragPoint = nil; refresh(); return true
@@ -1475,6 +1502,7 @@ final class Timeline: NSView {
         refresh()
     }
     override func flagsChanged(with event: NSEvent) {
+        fragmentEdgeScroll?.flags = event.modifierFlags
         if selectingRange, didDragRange, canSelectRange, let point = lastRangeDragPoint {
             updateTimeRange(to: point, flags: event.modifierFlags)
         }
@@ -2056,8 +2084,8 @@ final class Timeline: NSView {
         if fragmentResize != nil {
             guard !editor.busy else { cancelFragmentResize(); return }
             guard didResizeFragment || abs(p.x - dragStart.x) > 2 else { return }
-            didResizeFragment = true; autoscrollRange(with: event)
-            updateFragmentResize(at: convert(event.locationInWindow, from: nil), flags: event.modifierFlags); return
+            didResizeFragment = true; updateFragmentEdgeScroll(with: event)
+            updateFragmentResize(at: documentPoint(fromWindow: event.locationInWindow), flags: event.modifierFlags); return
         }
         if marqueeAnchor != nil {
             guard canSelectRange else { cancelMarqueeSelection(); return }
@@ -2086,14 +2114,16 @@ final class Timeline: NSView {
                 guard editor.checkpoint() else { return }; didCheckpoint = true
             }
             if copyingFragments { NSCursor.dragCopy.set() }
-            updateFragmentMove(at: p, flags: event.modifierFlags)
+            updateFragmentEdgeScroll(with: event)
+            updateFragmentMove(at: documentPoint(fromWindow: event.locationInWindow), flags: event.modifierFlags)
         }
-        if trackDrag != nil {
+        if trackDrag != nil || dragClip != nil {
             let point = NSPoint(x: viewportRect.midX, y: p.y)
             if let verticalEvent = NSEvent.mouseEvent(with: .leftMouseDragged, location: convert(point, to: nil), modifierFlags: event.modifierFlags, timestamp: event.timestamp, windowNumber: event.windowNumber, context: nil, eventNumber: event.eventNumber, clickCount: event.clickCount, pressure: event.pressure) { autoscroll(with: verticalEvent) }
-        } else { autoscroll(with: event) }
+        } else if dragClip == nil { autoscroll(with: event) }
     }
     override func mouseUp(with event: NSEvent) {
+        stopFragmentEdgeScroll()
         synchronizeScrollPresentation()
         let p = convert(event.locationInWindow, from: nil); let row = Int((p.y - ruler) / rowHeight)
         if let drag = fadeDrag {
