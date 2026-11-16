@@ -1238,8 +1238,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         print("PASS: 100-character name limit, paste, typing, emoji and visible end caret in \(field.accessibilityLabel() ?? "name")")
     }
     func verifyTrackNameUI() throws {
-        func event(_ type: NSEvent.EventType, _ point: NSPoint) -> NSEvent {
-            NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        func event(_ type: NSEvent.EventType, _ point: NSPoint, clicks: Int = 1) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: timeline.convertDocumentPoint(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
         }
         func type(_ text: String, into field: InlineNameField) {
             if let input = field.currentEditor() as? NSTextView { input.selectAll(nil); input.insertText(text, replacementRange: input.selectedRange()) }
@@ -1270,6 +1270,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let inkDuring = try nameInkRows()
         guard inkBefore == inkDuring else { throw SounderError.message("Track-name glyphs shift when editing begins: \(inkBefore) → \(inkDuring)") }
         print("PASS: Track-name glyphs retain identical vertical pixel bounds when editing begins")
+        guard let nameInput = timeline.nameField.currentEditor() as? NSTextView,
+              nameInput.selectedRange().location < (nameInput.string as NSString).length else { throw SounderError.message("Track-name click moved the caret to the end") }
+        type("Lead Voice", into: timeline.nameField)
+        NSApp.sendEvent(event(.leftMouseDown, name, clicks: 2))
+        NSApp.sendEvent(event(.leftMouseUp, name, clicks: 2))
+        guard nameInput.selectedRange() == NSRange(location: 0, length: (nameInput.string as NSString).length) else { throw SounderError.message("Track-name double click did not select the entire name") }
+        nameInput.insertText("Voice", replacementRange: nameInput.selectedRange())
+        guard nameInput.string == "Voice" else { throw SounderError.message("Typing did not replace the whole selected track name") }
+        timeline.nameField.placeCaret(with: event(.leftMouseUp, name))
+        print("PASS: Track-name click places the caret at the pointer and double click selects the entire name for replacement")
         let initialNameWidth = timeline.nameField.frame.width
         guard !timeline.nameField.drawsBackground, initialNameWidth <= timeline.trackNameHitRect(row: 0, depth: 0).width + 5,
               (timeline.nameField.currentEditor() as? NSTextView)?.selectedRange().length == 0 else { throw SounderError.message("Track editor changes the label appearance or selects its text") }

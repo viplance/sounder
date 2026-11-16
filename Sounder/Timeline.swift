@@ -516,6 +516,7 @@ func line(_ from: NSPoint, _ to: NSPoint, _ color: NSColor, width: CGFloat = 1) 
 final class InlineNameField: NSTextField, NSTextFieldDelegate {
     private var commitName: ((String) -> Void)?
     private var ended: (() -> Void)?
+    private var nameClickMonitor: Any?
     private(set) var isRenaming = false
     var textChanged: (() -> Void)?
     override init(frame frameRect: NSRect) {
@@ -526,14 +527,37 @@ final class InlineNameField: NSTextField, NSTextFieldDelegate {
         (cell as? NSTextFieldCell)?.isScrollable = true
     }
     required init?(coder: NSCoder) { fatalError() }
-    func begin(_ name: String, commit: @escaping (String) -> Void, end: @escaping () -> Void) {
+    func placeCaret(with event: NSEvent) {
+        guard let input = currentEditor() as? NSTextView else { return }
+        if event.clickCount == 2 { input.selectAll(nil) }
+        else {
+            let point = input.convert(event.locationInWindow, from: nil)
+            input.setSelectedRange(NSRange(location: input.characterIndexForInsertion(at: point), length: 0))
+        }
+        revealCaret()
+    }
+    func enableWholeNameDoubleClick() {
+        guard nameClickMonitor == nil else { return }
+        nameClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self, self.isRenaming, event.window === self.window, event.clickCount == 2,
+                  let input = self.currentEditor() as? NSTextView,
+                  input.visibleRect.contains(input.convert(event.locationInWindow, from: nil)) else { return event }
+            self.placeCaret(with: event)
+            return nil
+        }
+    }
+    func begin(_ name: String, click: NSEvent? = nil, commit: @escaping (String) -> Void, end: @escaping () -> Void) {
         guard !isRenaming else { return }
         stringValue = String(name.prefix(NameRules.maximumLength)); commitName = commit; ended = end; isRenaming = true; isHidden = false
         textChanged?()
         window?.makeFirstResponder(self)
         if let input = currentEditor() as? NSTextView {
             input.drawsBackground = false
-            input.setSelectedRange(NSRange(location: (input.string as NSString).length, length: 0))
+            input.setSelectedRange(NSRange(location: click == nil ? (input.string as NSString).length : 0, length: 0))
+            if let click {
+                input.scrollRangeToVisible(NSRange(location: 0, length: 0))
+                placeCaret(with: click)
+            }
         }
         revealCaret()
     }
@@ -542,6 +566,7 @@ final class InlineNameField: NSTextField, NSTextFieldDelegate {
         let name = NameRules.normalized(stringValue)
         if commit && requireValid && name.isEmpty { NSSound.beep(); return false }
         let save = commitName, end = ended
+        if let nameClickMonitor { NSEvent.removeMonitor(nameClickMonitor); self.nameClickMonitor = nil }
         isRenaming = false; commitName = nil; ended = nil
         // Clear the field editor before hiding the field; end-editing may reenter.
         window?.endEditing(for: self)
@@ -1508,17 +1533,18 @@ final class Timeline: NSView {
         enumerateCursorRects { rect, candidate in if rect.contains(point) { cursor = candidate } }
         return cursor
     }
-    func renameTrack(_ id: UUID) {
+    func renameTrack(_ id: UUID, click: NSEvent? = nil) {
         guard !editor.busy, let index = editor.project.tracks.firstIndex(where: { $0.id == id }) else { return }
         nameField.finish(commit: true)
         renamingTrack = id
         sidebarSurface.needsDisplay = true
         layoutNameField()
         guard renamingTrack != nil else { return }
-        nameField.begin(editor.project.tracks[index].name, commit: { [weak self] name in
+        nameField.begin(editor.project.tracks[index].name, click: click, commit: { [weak self] name in
             guard let self, let index = self.editor.project.tracks.firstIndex(where: { $0.id == id }), self.editor.project.tracks[index].name != name else { return }
             guard self.editor.checkpoint() else { return }; self.editor.project.tracks[index].name = name; self.editor.update("Track renamed")
         }, end: { [weak self] in self?.renamingTrack = nil; self?.sidebarSurface.needsDisplay = true })
+        nameField.enableWholeNameDoubleClick()
     }
     private func layoutNameField() {
         guard let id = renamingTrack else { return }
@@ -2114,7 +2140,9 @@ final class Timeline: NSView {
         dragClip = nil; dragTrack = nil; dragDestination = nil; fragmentSnapTime = nil; movingFragments = []; fragmentDestinations = [:]
         trackDrag = nil; pendingTrackRename = nil; selectingRange = false
         needsDisplay = true
-        if let renameID { renameTrack(renameID) }
+        if let renameID {
+            renameTrack(renameID, click: event)
+        }
     }
     private var centeredPlayheadOrigin: CGFloat {
         let width = viewportSize.width
