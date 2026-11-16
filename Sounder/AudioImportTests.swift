@@ -90,9 +90,27 @@ func runAudioImportTests() throws {
     let dropPoint = NSPoint(x: timeline.header + 3.5 * dropEditor.zoom, y: timeline.ruler + timeline.rowHeight * 1.5)
     try check(timeline.audioDropDestination(at: dropPoint)?.track == child.id,
               "File drops resolve tracks in visible hierarchy order")
-    try check(timeline.audioDropDestination(at: NSPoint(x: 20, y: dropPoint.y)) == nil &&
-              timeline.audioDropDestination(at: NSPoint(x: dropPoint.x, y: 10)) == nil,
-              "Pinned track headers and the ruler reject file drops")
+    let headerDrop = NSPoint(x: 20, y: dropPoint.y)
+    try check(timeline.audioDropDestination(at: headerDrop)?.start == 0 &&
+              timeline.audioDropDestination(at: headerDrop)?.track == child.id,
+              "Dropping over track controls targets that track at timeline zero")
+    scroll.contentView.scroll(to: NSPoint(x: 240, y: 0))
+    let scrolledHeader = NSPoint(x: timeline.viewportRect.minX + 20, y: dropPoint.y)
+    let edgeTime = timeline.viewportRect.minX / dropEditor.zoom
+    try check(timeline.audioDropDestination(at: scrolledHeader)?.start == edgeTime,
+              "A drop over scrolled track controls targets the visible left timeline edge")
+    timeline.updateAudioDropScrolling(at: scrolledHeader)
+    let scrollClock = ProcessInfo.processInfo.systemUptime
+    timeline.advanceAudioDropScroll(at: scrollClock + 0.05)
+    try check(timeline.viewportRect.minX > 0 && timeline.viewportRect.minX < 240 &&
+              timeline.audioDropTime == timeline.viewportRect.minX / dropEditor.zoom,
+              "Finder drag scrolls left while its guide remains at the fragment area's left edge")
+    for frame in 1...100 { timeline.advanceAudioDropScroll(at: scrollClock + 0.05 + Double(frame) / 60) }
+    try check(timeline.viewportRect.minX == 0 && timeline.audioDropTime == 0 && !timeline.isAudioDropScrolling,
+              "Finder drag scrolling stops exactly at timeline zero")
+    timeline.draggingExited(nil)
+    try check(timeline.audioDropDestination(at: NSPoint(x: dropPoint.x, y: 10)) == nil,
+              "The ruler rejects file drops")
     try check(timeline.importDroppedAudio(from: pasteboard, at: dropPoint), "Dropping audio starts the shared asynchronous import")
     let dropped = dropEditor.importer!
     try check(dropped.window.isVisible && dropped.targetTrack == child.id && dropped.start == 3.5 && dropEditor.cursor == 9,
@@ -104,6 +122,11 @@ func runAudioImportTests() throws {
               "Dropped audio imports at the pointer rather than the active track or playhead")
     dropEditor.undo()
     try check(dropEditor.project.tracks.allSatisfy { $0.clips.isEmpty }, "A dropped batch is one Undo step")
+    try check(timeline.importDroppedAudio(from: pasteboard, at: headerDrop), "Track controls accept a Finder audio drop")
+    try wait(dropEditor.importer!)
+    try check(dropEditor.project.tracks.first(where: { $0.id == child.id })?.clips.first?.start == 0,
+              "Audio dropped over track controls is imported at the beginning of the song")
+    dropEditor.undo()
     timeline.refresh()
     let blankPoint = NSPoint(x: dropPoint.x, y: timeline.ruler + timeline.rowHeight * 3.5)
     try check(timeline.audioDropDestination(at: blankPoint)?.track == nil && timeline.importDroppedAudio(from: pasteboard, at: blankPoint),

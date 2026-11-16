@@ -651,14 +651,22 @@ private final class TransportPlayheadView: NSView {
 /// This is a sibling of the scroll view, so scrolling the document does not
 /// invalidate the geometry and tracking areas of every mixer control.
 private final class TimelineControlsOverlay: NSView {
+    weak var audioDropTimeline: Timeline?
     override var isFlipped: Bool { true }
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {}
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true; layer?.masksToBounds = true
+        registerForDraggedTypes(AudioFileDrop.types)
     }
     required init?(coder: NSCoder) { fatalError() }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { audioDropTimeline?.draggingEntered(sender) ?? [] }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { audioDropTimeline?.draggingUpdated(sender) ?? [] }
+    override func draggingExited(_ sender: NSDraggingInfo?) { audioDropTimeline?.draggingExited(sender) }
+    override func draggingEnded(_ sender: NSDraggingInfo) { audioDropTimeline?.draggingEnded(sender) }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { audioDropTimeline?.prepareForDragOperation(sender) ?? false }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { audioDropTimeline?.performDragOperation(sender) ?? false }
     override func hitTest(_ point: NSPoint) -> NSView? {
         let hit = super.hitTest(point)
         return hit === self ? nil : hit
@@ -799,6 +807,22 @@ final class Timeline: NSView {
     private var copyingFragments = false
     private var fragmentCopyPreviews: [UUID: Clip] = [:]
     private(set) var fragmentSnapTime: Double?
+    private(set) var audioDropTime: Double?
+    private var audioDropScrollTimestamp: Double?
+    var isAudioDropScrolling: Bool { audioDropScrollTimestamp != nil }
+    private func stopAudioDropScrolling() {
+        guard isAudioDropScrolling else { return }
+        audioDropScrollTimestamp = nil
+        scrollAnimationChanged?()
+    }
+    func advanceAudioDropScroll(at time: Double = ProcessInfo.processInfo.systemUptime) {
+        guard let previous = audioDropScrollTimestamp else { return }
+        guard !editor.busy else { stopAudioDropScrolling(); setAudioDropTime(nil); return }
+        audioDropScrollTimestamp = time
+        scrollHorizontally(to: viewportRect.minX - 480 * min(0.1, max(0, time - previous)))
+        setAudioDropTime(max(0, viewportRect.minX / editor.zoom))
+        if viewportRect.minX <= 0 { stopAudioDropScrolling() }
+    }
     var didCheckpoint = false
     private var fadeDrag: (original: Clip, left: Bool)?
     private(set) var fadedFragment: Clip?
@@ -853,6 +877,7 @@ final class Timeline: NSView {
             return TimelineViewState(zoom: self.editor.zoom, x: max(0, self.viewportRect.minX), y: max(0, self.viewportRect.minY))
         }
         registerForDraggedTypes(AudioFileDrop.types)
+        controlsOverlay.audioDropTimeline = self
         controlsOverlay.addSubview(scrollSurface)
         controlsOverlay.addSubview(sidebarSurface); controlsOverlay.addSubview(rulerSurface)
         controlsOverlay.addSubview(playheadView); controlsOverlay.addSubview(nameField)
@@ -865,25 +890,51 @@ final class Timeline: NSView {
         nameField.setAccessibilityLabel("Track name")
         nameField.textChanged = { [weak self] in self?.layoutNameField() }
     }
-    /// Uses displayed document coordinates so pinned headers/rulers never accept audio.
+    /// Track controls accept audio at timeline zero; the ruler remains excluded.
     func audioDropDestination(at point: NSPoint, flags: NSEvent.ModifierFlags = []) -> (track: UUID?, start: Double)? {
         guard !editor.busy, viewportRect.contains(point), bounds.contains(point),
-              point.x >= fragmentLeft, isTrackPoint(point) else { return nil }
+              isTrackPoint(point) else { return nil }
         let row = Int((point.y - ruler) / rowHeight)
         let track = rows.indices.contains(row) ? rows[row].0.id : nil
-        return (track, timelineTime(at: point, flags: flags))
+        return (track, point.x < fragmentLeft ? max(0, viewportRect.minX / editor.zoom) : timelineTime(at: point, flags: flags))
     }
     private func audioDropOperation(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard sender.draggingSourceOperationMask.contains(.copy),
-              audioDropDestination(at: documentPoint(fromWindow: sender.draggingLocation)) != nil,
-              !AudioFileDrop.urls(from: sender.draggingPasteboard).isEmpty else { return [] }
+        let point = documentPoint(fromWindow: sender.draggingLocation)
+        let destination = audioDropDestination(at: point,
+                                               flags: NSApp.currentEvent?.modifierFlags ?? [])
+        guard sender.draggingSourceOperationMask.contains(.copy), let destination,
+              !AudioFileDrop.urls(from: sender.draggingPasteboard).isEmpty else {
+            setAudioDropTime(nil)
+            return []
+        }
+        setAudioDropTime(destination.start)
+        updateAudioDropScrolling(at: point)
         return .copy
+    }
+    func updateAudioDropScrolling(at point: NSPoint) {
+        if point.x < fragmentLeft && viewportRect.minX > 0 {
+            if !isAudioDropScrolling {
+                audioDropScrollTimestamp = ProcessInfo.processInfo.systemUptime
+                scrollAnimationChanged?()
+            }
+        } else { stopAudioDropScrolling() }
+    }
+    private func setAudioDropTime(_ time: Double?) {
+        if time == nil { stopAudioDropScrolling() }
+        guard audioDropTime != time else { return }
+        audioDropTime = time
+        invalidateScrollTiles()
+        needsDisplay = true
     }
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { audioDropOperation(sender) }
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { audioDropOperation(sender) }
+    override func draggingExited(_ sender: NSDraggingInfo?) { setAudioDropTime(nil) }
+    override func draggingEnded(_ sender: NSDraggingInfo) { setAudioDropTime(nil) }
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { audioDropOperation(sender) == .copy }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        defer { setAudioDropTime(nil) }
         guard audioDropOperation(sender) == .copy else { return false }
+        setAudioDropTime(nil)
         synchronizeScrollPresentation()
         return importDroppedAudio(from: sender.draggingPasteboard, at: documentPoint(fromWindow: sender.draggingLocation),
                                   flags: NSApp.currentEvent?.modifierFlags ?? [])
@@ -1673,10 +1724,10 @@ final class Timeline: NSView {
             let alpha = editor.project.tempoMode ? (tick.isBar ? 0.10 : 0.035) : 0.045
             line(NSPoint(x: x, y: ruler), NSPoint(x: x, y: bounds.height), NSColor.white.withAlphaComponent(alpha))
         }
-        if let fragmentSnapTime {
+        if let guideTime = audioDropTime ?? fragmentSnapTime {
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(rect: visibleFragmentRect.intersection(visibleTrackRect)).addClip()
-            let x = header + fragmentSnapTime * editor.zoom
+            let x = header + guideTime * editor.zoom
             let guide = NSBezierPath(); guide.move(to: NSPoint(x: x, y: pinnedRulerRect.maxY))
             guide.line(to: NSPoint(x: x, y: viewportRect.maxY))
             guide.lineWidth = 1.5; guide.setLineDash([4, 4], count: 2, phase: 0)
