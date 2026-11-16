@@ -832,7 +832,11 @@ final class Editor: NSObject {
         switch placement {
         case .singleTrack:
             var target = project.tracks.firstIndex { $0.id == track }
-            if target == nil { project.tracks.append(Track(name: "Audio 01")); target = project.tracks.count - 1 }
+            if target == nil {
+                let name = imported.count == 1 ? NameRules.normalized(imported[0].name) : ""
+                project.tracks.append(Track(name: name.isEmpty ? "Audio 01" : name))
+                target = project.tracks.count - 1
+            }
             targets = Array(repeating: project.tracks[target!].id, count: imported.count)
         case .separateTracks:
             // Use the same hierarchy order as the visible timeline, including children.

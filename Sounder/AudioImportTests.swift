@@ -134,6 +134,8 @@ func runAudioImportTests() throws {
     try wait(dropEditor.importer!)
     try check(dropEditor.project.tracks.count == 4 && dropEditor.project.tracks.last?.clips.first?.start == 3.5,
               "Dropping below existing tracks creates a root track at the requested time")
+    try check(dropEditor.project.tracks.last?.name == source.deletingPathExtension().lastPathComponent,
+              "A single Finder drop names its new track after the audio file")
     dropEditor.undo()
     dropEditor.finishAudioImport(prepared, track: nil, start: 2, placement: .separateTracks)
     try check(dropEditor.project.tracks.count == 5 && dropEditor.project.tracks.prefix(3).allSatisfy { $0.clips.isEmpty } &&
