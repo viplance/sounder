@@ -556,8 +556,9 @@ final class ActionChoiceAlert: CompactSettingsAlert {
         let enabled = buttons.indices.filter { buttons[$0].isEnabled }
         guard !enabled.isEmpty else { return false }
         switch event.keyCode {
-        case 48, 125, 126:
-            let step = event.keyCode == 126 || (event.keyCode == 48 && event.modifierFlags.contains(.shift)) ? -1 : 1
+        case 48, 123, 124, 125, 126:
+            // Buttons are laid out from right to left in response order.
+            let step = event.keyCode == 124 || event.keyCode == 126 || (event.keyCode == 48 && event.modifierFlags.contains(.shift)) ? -1 : 1
             let current = enabled.firstIndex(of: selectedButtonIndex) ?? 0
             selectButton(enabled[(current + step + enabled.count) % enabled.count]); return true
         case 36, 76:
@@ -1061,7 +1062,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let fileActions = [("open", "Open project", "folder", #selector(openProject)),
                            ("save", "Save project", "square.and.arrow.down", #selector(saveProject)),
                            ("reveal", "Show project in Finder", "folder.badge.gearshape", #selector(revealProjectFiles)),
-                           ("cleanup", "Clean Up Project Folder", "trash", #selector(cleanProjectFolder))]
+                           ("cleanup", "Clean up project folder", "broom", #selector(cleanProjectFolder))]
         let fileViews = fileActions.map { id, label, image, action -> NSButton in
             let control = button(label, image, action); projectFileButtons[id] = control; return control
         }
@@ -1517,8 +1518,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         do { try editor.setAudioFormat(ProjectAudioFormat(sampleRate: ProjectAudioFormat.supportedRates[rates.indexOfSelectedItem], channels: channels.indexOfSelectedItem + 1, bitDepth: [16, 24, 32][depths.indexOfSelectedItem])) }
         catch { editor.error(error) }
     }
+    private static let broomIcon: NSImage = {
+        // AppKit's symbol set has no broom; draw a template with matching strokes.
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            NSColor.black.setStroke()
+            let handle = NSBezierPath()
+            handle.lineWidth = 1.6; handle.lineCapStyle = .round
+            handle.move(to: NSPoint(x: 9, y: 9)); handle.line(to: NSPoint(x: 16, y: 16)); handle.stroke()
+            let head = NSBezierPath()
+            head.lineWidth = 1.2; head.lineJoinStyle = .round
+            head.move(to: NSPoint(x: 7, y: 10)); head.line(to: NSPoint(x: 11, y: 6))
+            head.line(to: NSPoint(x: 7, y: 1)); head.line(to: NSPoint(x: 1, y: 7)); head.close(); head.stroke()
+            let bristles = NSBezierPath(); bristles.lineWidth = 1; bristles.lineCapStyle = .round
+            for (start, end) in [(NSPoint(x: 3, y: 5), NSPoint(x: 7, y: 8)),
+                                 (NSPoint(x: 5, y: 3), NSPoint(x: 9, y: 6))] {
+                bristles.move(to: start); bristles.line(to: end)
+            }
+            bristles.stroke(); return true
+        }
+        image.isTemplate = true; return image
+    }()
     func button(_ title: String, _ icon: String, _ selector: Selector) -> NSButton {
-        let button = PointerButton(image: NSImage(systemSymbolName: icon, accessibilityDescription: title) ?? NSImage(), target: self, action: selector)
+        let image = icon == "broom" ? Self.broomIcon : NSImage(systemSymbolName: icon, accessibilityDescription: title) ?? NSImage()
+        let button = PointerButton(image: image, target: self, action: selector)
         button.bezelStyle = .texturedRounded; button.isBordered = false; button.contentTintColor = .labelColor; button.toolTip = title; button.setAccessibilityLabel(title)
         button.widthAnchor.constraint(equalToConstant: 32).isActive = true; button.heightAnchor.constraint(equalToConstant: 28).isActive = true; return button
     }

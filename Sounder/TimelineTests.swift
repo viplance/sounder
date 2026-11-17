@@ -50,6 +50,9 @@ extension AppDelegate {
         }
         let cases: [(String, [String], [(UInt16, NSEvent.ModifierFlags)], Int, Bool)] = [
             ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(125, []), (126, []), (36, [])], 0, false),
+            ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(123, []), (36, [])], 1, false),
+            ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(124, []), (36, [])], 2, false),
+            ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(123, []), (124, []), (76, [])], 0, false),
             ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(48, []), (36, [])], 1, false),
             ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(48, [.shift]), (76, [])], 2, false),
             ("Save changes to this project?", ["Save", "Discard", "Cancel"], [(125, []), (53, [])], 2, false),

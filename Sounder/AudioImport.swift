@@ -71,7 +71,7 @@ final class ProjectMediaCleanupController: NSObject, NSWindowDelegate {
     func start() {
         isRunning = true
         window = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 130))
-        window.title = "Clean Up Project Folder"; window.delegate = self; window.isReleasedWhenClosed = false
+        window.title = "Clean up project folder"; window.delegate = self; window.isReleasedWhenClosed = false
         let root = PopupBackgroundView(); window.contentView = root
         status.frame = NSRect(x: 22, y: 91, width: 516, height: 20)
         status.font = .systemFont(ofSize: 12); status.lineBreakMode = .byTruncatingMiddle; root.addSubview(status)
