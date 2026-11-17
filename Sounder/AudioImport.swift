@@ -59,7 +59,7 @@ final class ProjectMediaCleanupController: NSObject, NSWindowDelegate {
     private(set) var isRunning = false
     private(set) var window: NSWindow!
     private let progress = NSProgressIndicator()
-    private let status = NSTextField(labelWithString: "Scanning project media…")
+    private let status = NSTextField(labelWithString: "Scanning project media")
     private let button = PointerButton()
     private let lock = NSLock()
     private var cancelled = false
@@ -121,7 +121,7 @@ final class ProjectMediaCleanupController: NSObject, NSWindowDelegate {
     }
     func cancel() {
         lock.lock(); cancelled = true; lock.unlock()
-        button.title = "Cancelling…"; button.isEnabled = false
+        button.title = "Cancelling"; button.isEnabled = false
     }
     @objc private func pressButton() { cancel() }
     func windowShouldClose(_ sender: NSWindow) -> Bool { cancel(); return false }
@@ -325,7 +325,7 @@ final class AudioImportController: NSObject, NSWindowDelegate {
     }
     func cancel() {
         cancellationLock.lock(); cancelled = true; cancellationLock.unlock()
-        if isRunning { button.title = "Cancelling…"; button.isEnabled = false }
+        if isRunning { button.title = "Cancelling"; button.isEnabled = false }
     }
     @objc private func pressButton() { if isRunning { cancel() } else { close() } }
     func close() {
@@ -431,7 +431,7 @@ final class ProjectOpenController: NSObject, NSWindowDelegate {
     }
     func cancel() {
         lock.lock(); cancelled = true; lock.unlock()
-        if isRunning { button.title = "Cancelling…"; button.isEnabled = false }
+        if isRunning { button.title = "Cancelling"; button.isEnabled = false }
     }
     @objc private func pressButton() { if isRunning { cancel() } else { close() } }
     func close() {

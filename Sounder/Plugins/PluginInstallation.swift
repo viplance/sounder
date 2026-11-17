@@ -285,7 +285,7 @@ final class PluginInstallController: NSObject, NSWindowDelegate, URLSessionDownl
     func cancel() {
         lock.lock(); cancelled = true; let task = download, active = process; lock.unlock()
         task?.cancel(); if active?.isRunning == true { active?.terminate() }
-        if isRunning { button.title = "Cancelling…"; button.isEnabled = false }
+        if isRunning { button.title = "Cancelling"; button.isEnabled = false }
     }
     @objc private func pressButton() { if isRunning { cancel() } else { close() } }
     func close() {

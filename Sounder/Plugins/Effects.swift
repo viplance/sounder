@@ -186,7 +186,7 @@ final class PluginPicker: PointerButton, NSSearchFieldDelegate, NSTableViewDataS
     private var prepared = false
     override init(frame: NSRect) {
         super.init(frame: frame)
-        title = "Choose plug-in…"; bezelStyle = .rounded; font = effectsControlFont
+        title = "Choose plug-in"; bezelStyle = .rounded; font = effectsControlFont
         search.font = effectsControlFont
         alignment = .left; lineBreakMode = .byTruncatingTail
         image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil); imagePosition = .imageTrailing
@@ -203,7 +203,7 @@ final class PluginPicker: PointerButton, NSSearchFieldDelegate, NSTableViewDataS
     private func updateSelection() {
         let urls = available
         if !urls.contains(where: { $0 == selectedURL }) { selectedURL = urls.first }
-        title = selectedURL.map(Self.displayName) ?? (catalog.isEmpty ? (vst3Only.state == .on ? "No installed VST3 effects found" : "No installed VST / VST3 effects found") : "Choose plug-in…")
+        title = selectedURL.map(Self.displayName) ?? (catalog.isEmpty ? (vst3Only.state == .on ? "No installed VST3 effects found" : "No installed VST / VST3 effects found") : "Choose plug-in")
         applyEffectsButtonFont(self)
     }
     func setPlugins(_ urls: [URL]) {
@@ -227,7 +227,7 @@ final class PluginPicker: PointerButton, NSSearchFieldDelegate, NSTableViewDataS
             search.frame = NSRect(x: 12, y: 278, width: 278, height: 28)
             vst3Only.frame = NSRect(x: 300, y: 279, width: 108, height: 26)
             controller.view.addSubview(vst3Only)
-            search.placeholderString = "Search plug-ins…"; search.delegate = self
+            search.placeholderString = "Search plug-ins"; search.delegate = self
             search.sendsSearchStringImmediately = true
             controller.view.addSubview(search)
             let scroll = NSScrollView(frame: NSRect(x: 12, y: 12, width: 396, height: 256)); scroll.hasVerticalScroller = true

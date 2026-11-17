@@ -524,7 +524,7 @@ extension AppDelegate {
         func perform(_ item: NSMenuItem) { _ = NSApp.sendAction(item.action!, to: item.target, from: item) }
         func order() -> [UUID] { editor.project.tracks[0].clips.sorted { $0.order < $1.order }.map(\.id) }
         let bottom = menu(time: 2, y: timeline.ruler + 9)!
-        try check(bottom.items.map(\.title) == ["Edit…", "Move up", "Move down", "Normalize…", "Mute", "Delete"] && bottom.items[1].isEnabled && !bottom.items[2].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
+        try check(bottom.items.map(\.title) == ["Edit", "Move up", "Move down", "Normalize", "Mute", "Delete"] && bottom.items[1].isEnabled && !bottom.items[2].isEnabled && editor.selection == [lower.id] && editor.cursor == 6, "Right-clicking an exposed lower fragment opens its own menu without moving the playhead")
         let history = editor.undoStack.count
         perform(bottom.items[1])
         try check(order() == [middle.id, lower.id, upper.id, isolated.id] && editor.undoStack.count == history + 1, "Move up raises the context fragment exactly one overlapping level and leaves other relative ordering intact")
@@ -742,7 +742,7 @@ extension AppDelegate {
             dialog.pan.stringValue = "90"; dialog.alert.buttons[1].performClick(nil)
         }
         let menu = timeline.menu(for: event(.rightMouseDown, clicks: 1))!
-        guard let edit = menu.items.first(where: { $0.title == "Edit…" }) else { throw SounderError.message("No Edit in fragment context menu") }
+        guard let edit = menu.items.first(where: { $0.title == "Edit" }) else { throw SounderError.message("No Edit in fragment context menu") }
         _ = NSApp.sendAction(edit.action!, to: edit.target, from: edit)
         if let failure { throw SounderError.message(failure) }
         guard opened == 2, FragmentSettings(editor.project.tracks[0].clips[0]) == FragmentSettings(edited), editor.undoStack.count == history + 1 else { throw SounderError.message("Context Edit cancellation changed settings or history") }
@@ -1598,7 +1598,7 @@ extension AppDelegate {
                   "FX chain remains floating while the main fragment editor has focus")
         let root = rack.window.contentView!
         let captions = root.subviews.compactMap { ($0 as? NSTextField)?.stringValue }
-        try check(!captions.contains("Track effects") && !captions.contains("Master effects") && !buttons(root).contains { $0.title == "Done" || $0.title == "Parameters…" || $0.title == "Open editor…" || $0.title == "Add" },
+        try check(!captions.contains("Track effects") && !captions.contains("Master effects") && !buttons(root).contains { $0.title == "Done" || $0.title == "Parameters" || $0.title == "Open editor" || $0.title == "Add" },
                   "FX window has no heading or bottom action strip")
         try check(rack.plugins.frame.maxY > root.bounds.maxY - 20 && rack.table.enclosingScrollView!.frame.minY < 20,
                   "Plug-in picker and Browse/Rescan occupy the top without a separate Add button")

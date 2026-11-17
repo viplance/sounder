@@ -797,7 +797,7 @@ final class ShortcutRecorder: PointerButton {
     }
     @objc private func recordShortcut() {
         Self.active?.stopRecording(); Self.active = self
-        title = "Press keys…"
+        title = "Press keys"
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             self.flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
@@ -838,7 +838,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     let masterLabel = NSTextField(labelWithString: "MASTER")
     var masterGroup: NSStackView!
     private var recentProjectsWindow: RecentProjectsWindow?
-    private let recentProjectsMenu = NSMenu(title: "Open Recent")
+    private let recentProjectsMenu = NSMenu(title: "Open recent")
     private var titlebarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     private(set) var projectFileButtons: [String: NSButton] = [:]
     private let titlebarOrder: [NSToolbarItem.Identifier] = [NSToolbarItem.Identifier("project"), NSToolbarItem.Identifier("files"), .flexibleSpace, NSToolbarItem.Identifier("master"), .flexibleSpace, NSToolbarItem.Identifier("quality"), NSToolbarItem.Identifier("io"), NSToolbarItem.Identifier("export")]
@@ -1650,22 +1650,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let root = NSMenuItem(); root.title = title; let submenu = NSMenu(title: title); root.submenu = submenu; main.addItem(root)
             for (title, action, key) in items { let item = NSMenuItem(title: title, action: action, keyEquivalent: key); item.target = self; submenu.addItem(item) }
         }
-        menu("Sounder", [("About Sounder", #selector(about), ""), ("Audio Settings…", #selector(audioSettings), ""), ("Keyboard Shortcuts…", #selector(keyboardShortcuts), ""), ("Quit Sounder", #selector(quit), "q")])
-        menu("File", [("Rename Project…", #selector(renameProject), ""), ("Open Project…", #selector(openProject), "o"), ("Save Project…", #selector(saveProject), "s"), ("Save Project As…", #selector(saveAs), ""), ("Export…", #selector(exportAudio), "e")])
+        menu("Sounder", [("About Sounder", #selector(about), ""), ("Audio settings", #selector(audioSettings), ""), ("Keyboard shortcuts", #selector(keyboardShortcuts), ""), ("Quit Sounder", #selector(quit), "q")])
+        menu("File", [("Rename project", #selector(renameProject), ""), ("Open project", #selector(openProject), "o"), ("Save project", #selector(saveProject), "s"), ("Save project as", #selector(saveAs), ""), ("Export", #selector(exportAudio), "e")])
         if let file = main.items.last?.submenu,
            let openIndex = file.items.firstIndex(where: { $0.action == #selector(openProject) }) {
-            let recent = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
+            let recent = NSMenuItem(title: "Open recent", action: nil, keyEquivalent: "")
             recent.submenu = recentProjectsMenu
             recentProjectsMenu.delegate = self
             file.insertItem(recent, at: openIndex + 1)
         }
-        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select All", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v")])
-        menu("Fragments", [("Import Audio…", #selector(importAudio), "i"), ("Split at Playhead", #selector(split), "s"), ("Trim to Selection", #selector(trim), ""), ("Join Fragments", #selector(join), "j"), ("Normalize…", #selector(normalize), "n"), ("Mute Fragments", #selector(muteFragments), "m"), ("Delete Fragments", #selector(deleteClips), "\u{8}")])
+        menu("Edit", [("Undo", #selector(undo), "z"), ("Redo", #selector(redo), "Z"), ("Select all", #selector(selectAll(_:)), "a"), ("Copy", #selector(copy(_:)), "c"), ("Paste", #selector(paste(_:)), "v")])
+        menu("Fragments", [("Import audio", #selector(importAudio), "i"), ("Split at playhead", #selector(split), "s"), ("Trim to selection", #selector(trim), ""), ("Join fragments", #selector(join), "j"), ("Normalize", #selector(normalize), "n"), ("Mute fragments", #selector(muteFragments), "m"), ("Delete fragments", #selector(deleteClips), "\u{8}")])
         if let fragments = main.items.last?.submenu { fragments.items.filter { [#selector(split), #selector(normalize), #selector(muteFragments), #selector(deleteClips)].contains($0.action) }.forEach { $0.keyEquivalentModifierMask = [] } }
-        menu("Track", [("Track Effects…", #selector(effects), "f"), ("Add Track", #selector(addTrack), "t"), ("Add Nested Track", #selector(nest), ""), ("Move Track to Root", #selector(unparent), ""), ("Delete Track…", #selector(removeTrack), "")])
-        menu("Transport", [("Play / Pause", #selector(play), " "), ("Play from Last Start", #selector(restartPlayback), "\r"), ("Seek Backward", #selector(seekBackward), "\u{f702}"), ("Seek Forward", #selector(seekForward), "\u{f703}"), ("Go to Start", #selector(seekToStart), "\u{f702}"), ("Go to End", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Loop", #selector(toggleLoop), "l"), ("Stop", #selector(stop), "\u{1b}")])
+        menu("Track", [("Track effects", #selector(effects), "f"), ("Add track", #selector(addTrack), "t"), ("Add nested track", #selector(nest), ""), ("Move track to root", #selector(unparent), ""), ("Delete track", #selector(removeTrack), "")])
+        menu("Transport", [("Play / pause", #selector(play), " "), ("Play from last start", #selector(restartPlayback), "\r"), ("Seek backward", #selector(seekBackward), "\u{f702}"), ("Seek forward", #selector(seekForward), "\u{f703}"), ("Go to start", #selector(seekToStart), "\u{f702}"), ("Go to end", #selector(seekToEnd), "\u{f703}"), ("Record", #selector(record), "r"), ("Loop", #selector(toggleLoop), "l"), ("Stop", #selector(stop), "\u{1b}")])
         if let transport = main.items.last?.submenu { transport.items.forEach { $0.keyEquivalentModifierMask = [#selector(seekToStart), #selector(seekToEnd), #selector(toggleLoop)].contains($0.action) ? [.command] : [] } }
-        menu("View", [("Zoom In", #selector(zoomIn), "\u{f700}"), ("Zoom Out", #selector(zoomOut), "\u{f701}")])
+        menu("View", [("Zoom in", #selector(zoomIn), "\u{f700}"), ("Zoom out", #selector(zoomOut), "\u{f701}")])
         if let view = main.items.last?.submenu { view.items.forEach { $0.keyEquivalentModifierMask = [] } }
         for item in shortcutMenuItems {
             guard let action = item.action else { continue }
@@ -1679,7 +1679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     private lazy var shuttleShortcutMenu: NSMenu = {
         let menu = NSMenu(title: "Transport")
-        for (title, action, key) in [("Shuttle Backward", #selector(shuttleBackwardShortcut), "\u{f702}"), ("Shuttle Forward", #selector(shuttleForwardShortcut), "\u{f703}")] {
+        for (title, action, key) in [("Shuttle backward", #selector(shuttleBackwardShortcut), "\u{f702}"), ("Shuttle forward", #selector(shuttleForwardShortcut), "\u{f703}")] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
             item.keyEquivalentModifierMask = [.shift]; menu.addItem(item)
         }
@@ -1693,9 +1693,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
     @objc func keyboardShortcuts() {
         let alert = NSAlert()
-        alert.messageText = "Keyboard Shortcuts"
+        alert.messageText = "Keyboard shortcuts"
         alert.informativeText = "Click a shortcut and press new keys. Escape clears it."
-        alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Restore Defaults")
+        alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Restore defaults")
         let items = shortcutMenuItems
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 6
         var controls: [ShortcutRecorder] = []
@@ -1750,7 +1750,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             menu.addItem(item)
         }
         if menu.items.isEmpty {
-            let empty = NSMenuItem(title: "No Recent Projects", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "No recent projects", action: nil, keyEquivalent: "")
             empty.isEnabled = false; menu.addItem(empty)
         }
     }
@@ -1863,7 +1863,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return !editor.busy && NSPasteboard.general.data(forType: Editor.fragmentPasteboardType) != nil
         }
         if [#selector(split), #selector(trim), #selector(join), #selector(normalize), #selector(muteFragments), #selector(deleteClips)].contains(menuItem.action) {
-            if menuItem.action == #selector(muteFragments) { menuItem.title = editor.fragmentsAreMuted(editor.selection) ? "Unmute Fragments" : "Mute Fragments" }
+            if menuItem.action == #selector(muteFragments) { menuItem.title = editor.fragmentsAreMuted(editor.selection) ? "Unmute fragments" : "Mute fragments" }
             return NSApp.modalWindow == nil && editorKeyboardContext && !(editorShortcutResponder is NSTextView) && !editor.busy
                 && editor.project.tracks.contains { $0.clips.contains { editor.selection.contains($0.id) } }
         }

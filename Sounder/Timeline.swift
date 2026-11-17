@@ -2329,10 +2329,10 @@ final class Timeline: NSView {
                 editor.update()
                 let menu = NSMenu(); menu.autoenablesItems = false
                 for (title, action, enabled) in [
-                    ("Edit…", #selector(editFragment(_:)), true),
+                    ("Edit", #selector(editFragment(_:)), true),
                     ("Move up", #selector(moveFragmentUp(_:)), editor.canMoveFragmentLayers(editor.selection, up: true)),
                     ("Move down", #selector(moveFragmentDown(_:)), editor.canMoveFragmentLayers(editor.selection, up: false)),
-                    ("Normalize…", #selector(normalizeFragments(_:)), true),
+                    ("Normalize", #selector(normalizeFragments(_:)), true),
                     (editor.fragmentsAreMuted(editor.selection) ? "Unmute" : "Mute", #selector(muteFragments(_:)), true),
                     ("Delete", #selector(deleteFragment(_:)), true)] {
                     let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -2346,7 +2346,7 @@ final class Timeline: NSView {
         }
         editor.selectedTrack = rows[row].0.id; editor.update()
         let menu = NSMenu()
-        for (title, action) in [("Track effects…", #selector(effects)), ("Add nested track", #selector(nest)), ("Move to root", #selector(unparent)), ("Delete track…", #selector(remove))] { let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item) }
+        for (title, action) in [("Track effects", #selector(effects)), ("Add nested track", #selector(nest)), ("Move to root", #selector(unparent)), ("Delete track", #selector(remove))] { let item = NSMenuItem(title: title, action: action, keyEquivalent: ""); item.target = self; menu.addItem(item) }
         return menu
     }
     @objc func editFragment(_ sender: NSMenuItem) {

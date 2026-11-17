@@ -445,7 +445,7 @@ final class AudioExportController: NSObject, NSWindowDelegate {
     }
     func cancel() {
         lock.lock(); cancelled = true; lock.unlock()
-        if isRunning { button.title = "Cancelling…"; button.isEnabled = false }
+        if isRunning { button.title = "Cancelling"; button.isEnabled = false }
     }
     @objc private func pressButton() { if isRunning { cancel() } else { close() } }
     func close() {
