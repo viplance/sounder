@@ -516,7 +516,8 @@ final class Editor: NSObject {
     var busy: Bool { isInstallingPlugin || isPreparingPlayback || isRecording || isPlaying || isShuttling || requestingMic || isExporting || isImporting || isOpening || isNormalizing }
     var canExport: Bool { !busy && duration > 0 }
     var duration: Double { project.tracks.flatMap(\.clips).map(\.end).max() ?? 0 }
-    var projectName: String { project.name ?? projectURL?.deletingPathExtension().lastPathComponent ?? "MY PROJECT" }
+    static let defaultProjectName = "MY PROJECT"
+    var projectName: String { project.name ?? projectURL?.deletingPathExtension().lastPathComponent ?? Self.defaultProjectName }
     var suggestedFilename: String { projectName.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-") + ".sounder" }
     var selectedIndex: Int? { project.tracks.firstIndex { $0.id == selectedTrack } }
     init(store: AudioStore, notifications: ToastCenter = ToastCenter(), preferences: UserDefaults? = nil,
@@ -1715,6 +1716,9 @@ final class Editor: NSObject {
         guard !busy else { throw SounderError.message("Wait for the current operation before saving") }
         try capturePluginStates(recordUndo: true)
         var snapshot = project; snapshot.name = projectName; snapshot.timelineRange = range; snapshot.timelineCursor = cursor
+        if projectURL == nil, projectName == Self.defaultProjectName {
+            snapshot.name = String(url.deletingPathExtension().lastPathComponent.prefix(100))
+        }
         snapshot.timelineView = captureTimelineView?() ?? TimelineViewState(zoom: zoom, x: project.timelineView?.x ?? 0, y: project.timelineView?.y ?? 0)
         try snapshot.timelineView?.validate()
         let saved = try ProjectStorage.save(snapshot, to: url, additionalSources: pendingRecordedSources)

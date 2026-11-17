@@ -1029,7 +1029,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func installTitlebarControls() {
         let icon = Bundle.main.url(forResource: "AppIcon", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
         if let icon { NSApp.applicationIconImage = icon }
-        projectLabel = ProjectNameLabel(labelWithString: "MY PROJECT")
+        projectLabel = ProjectNameLabel(labelWithString: Editor.defaultProjectName)
         projectLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         projectLabel.textColor = .secondaryLabelColor
         projectLabel.target = self; projectLabel.action = #selector(renameProject)
@@ -1442,7 +1442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         projectLabel.sendAction(projectLabel.action, to: projectLabel.target); projectNameField.stringValue = " "
         guard !projectNameField.finish(commit: true, requireValid: true), editor.projectName == "Studio Session" else { throw SounderError.message("Empty project name was accepted") }
         projectNameField.finish(commit: false)
-        editor.undo(); guard editor.projectName == "MY PROJECT" else { throw SounderError.message("Inline project rename cannot be undone") }
+        editor.undo(); guard editor.projectName == Editor.defaultProjectName else { throw SounderError.message("Inline project rename cannot be undone") }
         editor.redo()
         print("PASS: inline project name editing, Cancel, empty-name validation, Undo and Redo")
         dialogAutomation = { alert in
@@ -2030,6 +2030,9 @@ if CommandLine.arguments.contains("--plugin-install-test") {
     let archiveIndex = CommandLine.arguments.firstIndex(of: "--plugin-archives")
     let directory = archiveIndex.flatMap { $0 + 1 < CommandLine.arguments.count ? URL(fileURLWithPath: CommandLine.arguments[$0 + 1]) : nil }
     do { try runPluginInstallationTests(archives: directory); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if CommandLine.arguments.contains("--project-name-test") {
+    do { try runProjectNameSaveTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if CommandLine.arguments.contains("--media-cleanup-test") {
     do { try runProjectMediaCleanupTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }

@@ -191,7 +191,7 @@ func runAudioTests() throws {
     try check(editor.projectName == "Voice Session" && editor.dirty, "Project rename trims whitespace and marks changes")
     editor.renameProject("   ")
     try check(editor.projectName == "Voice Session", "Empty project names are ignored")
-    editor.undo(); try check(editor.projectName == "MY PROJECT", "Project rename supports Undo")
+    editor.undo(); try check(editor.projectName == Editor.defaultProjectName, "Project rename supports Undo")
     editor.redo()
     try editor.setAudioFormat(ProjectAudioFormat(sampleRate: 96_000, channels: 2))
     let metadata = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(editor.project))
@@ -787,6 +787,7 @@ func runTrackMeterTests() throws {
 }
 
 func runProjectStorageTests() throws {
+    try runProjectNameSaveTests()
     try runProjectMediaCleanupTests()
     func check(_ value: Bool, _ message: String) throws {
         guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
@@ -888,6 +889,35 @@ func runProjectStorageTests() throws {
     try JSONEncoder().encode(escape).write(to: escapeURL)
     rejected = false; do { _ = try ProjectStorage.load(from: escapeURL) } catch { rejected = true }
     try check(rejected, "Project media references cannot escape the containing project folder")
+}
+
+func runProjectNameSaveTests() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent("SounderProjectName-" + UUID().uuidString)
+    defer { try? fm.removeItem(at: root) }
+    let editor = Editor(store: try AudioStore(directory: root.appendingPathComponent("working")))
+    editor.preparesPlaybackInBackground = false
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    try check(editor.projectName == Editor.defaultProjectName, "New projects display the shared default name")
+    let first = root.appendingPathComponent("First session.sounder")
+    try editor.save(to: first)
+    try check(editor.projectName == "First session" && ProjectStorage.load(from: first).name == "First session",
+              "First save adopts the filename in memory and on disk")
+    editor.project.name = Editor.defaultProjectName
+    try editor.save(to: root.appendingPathComponent("Save As.sounder"))
+    try check(editor.projectName == Editor.defaultProjectName, "Later saves preserve a name equal to the default")
+    editor.projectURL = nil; editor.project.name = "Custom name"
+    try editor.save(to: root.appendingPathComponent("Different filename.sounder"))
+    try check(editor.projectName == "Custom name", "First save preserves a custom project name")
+    editor.projectURL = nil; editor.project.name = Editor.defaultProjectName
+    let invalid = root.appendingPathComponent("Invalid.sounder")
+    try fm.createDirectory(at: invalid, withIntermediateDirectories: true)
+    var failed = false
+    do { try editor.save(to: invalid) } catch { failed = true }
+    try check(failed && editor.projectName == Editor.defaultProjectName && editor.projectURL == nil,
+              "Failed first save retains the default name and unsaved state")
 }
 
 func runProjectMediaCleanupTests() throws {
