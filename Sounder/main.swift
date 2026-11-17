@@ -60,7 +60,31 @@ final class EditorContentView: NSView {
 
 final class EditorWindow: NSWindow {
     var prepareForPointerEvent: (() -> Void)?
+    private var consumesTitlebarMouseUp = false
+    private func isTitlebarBackground(_ point: NSPoint) -> Bool {
+        guard !styleMask.contains(.fullScreen), point.y >= contentLayoutRect.maxY,
+              let frameView = contentView?.superview else { return false }
+        var hit = frameView.hitTest(frameView.convert(point, from: nil))
+        while let view = hit {
+            // Keep native controls and inline project-name editing independent.
+            if view is NSControl || view is NSTextView || view is ProjectNameView { return false }
+            hit = view.superview
+        }
+        return true
+    }
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseUp, consumesTitlebarMouseUp {
+            consumesTitlebarMouseUp = false
+            return
+        }
+        if event.type == .leftMouseDown {
+            consumesTitlebarMouseUp = false
+            if event.clickCount == 2, isTitlebarBackground(event.locationInWindow) {
+                consumesTitlebarMouseUp = true
+                performZoom(nil)
+                return
+            }
+        }
         switch event.type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseDragged,
              .rightMouseDragged, .otherMouseDragged, .scrollWheel:
@@ -663,6 +687,7 @@ final class NormalizeDialog {
 
 final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
     let alert = CompactSettingsAlert()
+    let name = NSTextField()
     let volume = NSTextField(), pan = NSTextField(), fadeIn = NSTextField(), fadeOut = NSTextField()
     let volumeSlider = NSSlider(value: 0, minValue: -48, maxValue: 24, target: nil, action: nil)
     let panSlider = NSSlider(value: 0, minValue: -90, maxValue: 90, target: nil, action: nil)
@@ -676,8 +701,12 @@ final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
         volume.formatter = NumericInputFormatter(.signedDecimal); pan.formatter = NumericInputFormatter(.signedDecimal)
         fadeIn.formatter = NumericInputFormatter(.unsignedDecimal); fadeOut.formatter = NumericInputFormatter(.unsignedDecimal)
         alert.messageText = "Edit fragment \(clip.name)"
-        let form = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 190))
-        for (title, y) in [("Volume", CGFloat(156)), ("Pan", 112), ("Fade in", 56), ("Fade out", 12)] {
+        let form = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 234))
+        name.stringValue = clip.name
+        name.frame = NSRect(x: 116, y: 200, width: 362, height: 24)
+        name.setAccessibilityLabel("Fragment name")
+        form.addSubview(name)
+        for (title, y) in [("Name", CGFloat(200)), ("Volume", 156), ("Pan", 112), ("Fade in", 56), ("Fade out", 12)] {
             let label = NSTextField(labelWithString: title); label.frame = NSRect(x: 0, y: y + 2, width: 110, height: 24); form.addSubview(label)
         }
         for (slider, field, value, y, unit) in [(volumeSlider, volume, clip.volumeDB, CGFloat(156), "dB"), (panSlider, pan, clip.pan, 112, "°")] {
@@ -696,7 +725,7 @@ final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
         volumeSlider.setAccessibilityLabel("Volume"); panSlider.setAccessibilityLabel("Pan")
         inCurve.setAccessibilityLabel("Fade in curve"); outCurve.setAccessibilityLabel("Fade out curve")
         alert.accessoryView = form; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
-        alert.buttons[0].isEnabled = false; alert.window.initialFirstResponder = volume
+        alert.buttons[0].isEnabled = false; alert.window.initialFirstResponder = name
         if let peak { prepare(peak) }
     }
     private func number(_ field: NSTextField) -> Double? {
@@ -738,6 +767,7 @@ final class FragmentSettingsDialog: NSObject, NSTextFieldDelegate {
         while alert.runModal() == .alertFirstButtonReturn {
             guard let peak, let volumeDB = number(volume), let panValue = number(pan), let first = number(fadeIn), let last = number(fadeOut) else { alert.informativeText = "Enter valid numeric values."; continue }
             var settings = FragmentSettings(clip)
+            settings.name = name.stringValue
             settings.volumeDB = volumeDB; settings.pan = panValue; settings.fadeInMS = first; settings.fadeOutMS = last
             settings.fadeInCurve = FadeCurve.allCases[inCurve.indexOfSelectedItem]; settings.fadeOutCurve = FadeCurve.allCases[outCurve.indexOfSelectedItem]
             do { return FragmentSettings(try settings.applying(to: clip, peak: peak)) }
@@ -1561,6 +1591,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         projectNameView.updateSize()
     }
     func windowDidResize(_ notification: Notification) { updateProjectNameWidth(); timeline?.refresh() }
+    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
+        window.screen?.visibleFrame ?? newFrame
+    }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if editor.isInstallingPlugin { editor.pluginInstaller?.cancel(); return false }
         if editor.isExporting { editor.exporter?.cancel(); return false }

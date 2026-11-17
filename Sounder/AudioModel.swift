@@ -120,6 +120,7 @@ enum FragmentNormalization {
     }
 }
 struct FragmentSettings: Equatable {
+    var name: String
     var volumeDB: Double
     var pan: Double
     var fadeInMS: Double
@@ -127,6 +128,7 @@ struct FragmentSettings: Equatable {
     var fadeInCurve: FadeCurve
     var fadeOutCurve: FadeCurve
     init(_ clip: Clip) {
+        name = clip.name
         volumeDB = clip.volumeDB; pan = clip.pan; fadeInMS = clip.fadeInMS; fadeOutMS = clip.fadeOutMS
         fadeInCurve = clip.fadeInCurve; fadeOutCurve = clip.fadeOutCurve
     }
@@ -139,6 +141,8 @@ struct FragmentSettings: Equatable {
         guard volumeDB.isFinite, pan.isFinite, fadeInMS.isFinite, fadeOutMS.isFinite,
               fadeInMS >= 0, fadeOutMS >= 0 else { throw SounderError.message("Enter valid volume, pan and nonnegative fade times.") }
         var result = clip
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedName.isEmpty { result.name = trimmedName }
         result.volumeDB = max(-48, min(volumeDB, try Self.maximumVolume(clip: clip, peak: peak)))
         result.pan = max(-90, min(90, pan)); result.fadeInMS = fadeInMS; result.fadeOutMS = fadeOutMS
         result.fadeInCurve = fadeInCurve; result.fadeOutCurve = fadeOutCurve
