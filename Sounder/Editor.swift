@@ -492,9 +492,21 @@ final class Editor: NSObject {
         }
         job.start()
     }
+    var mediaCleaner: ProjectMediaCleanupController?
+    func cleanProjectMedia() {
+        guard !busy, let projectURL else { return }
+        var sources = Set(([project] + undoStack + redoStack).flatMap { $0.tracks.flatMap(\.clips).map(\.source) })
+        sources.formUnion(pendingRecordedSources)
+        if let data = NSPasteboard.general.data(forType: Self.fragmentPasteboardType),
+           let payload = try? JSONDecoder().decode(FragmentClipboard.self, from: data) {
+            sources.formUnion(payload.items.map { $0.clip.source })
+        }
+        let cleaner = ProjectMediaCleanupController(editor: self, projectURL: projectURL, sources: sources)
+        mediaCleaner = cleaner; cleaner.start()
+    }
     var importer: AudioImportController?
     private(set) var isNormalizing = false
-    var isImporting: Bool { importer?.isRunning == true }
+    var isImporting: Bool { importer?.isRunning == true || mediaCleaner?.isRunning == true }
     var exporter: AudioExportController?
     var isExporting: Bool { exporter?.isRunning == true }
     var requestingMic = false

@@ -874,7 +874,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var projectAuxiliaryWindows: [NSWindow] {
         Array(editor.effectsWindows.values).compactMap { $0.window } +
         Array(editor.pluginWindows.values).compactMap { $0.window } +
-        [editor.pluginInstaller?.window, editor.projectOpener?.window, editor.importer?.window, editor.exporter?.window, audioRoutingWindow?.window].compactMap { $0 }
+        [editor.pluginInstaller?.window, editor.projectOpener?.window, editor.mediaCleaner?.window, editor.importer?.window, editor.exporter?.window, audioRoutingWindow?.window].compactMap { $0 }
     }
     func windowWillMiniaturize(_ notification: Notification) {
         guard notification.object as? NSWindow === window else { return }
@@ -1060,7 +1060,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         masterGroup.heightAnchor.constraint(equalToConstant: 26).isActive = true
         let fileActions = [("open", "Open project", "folder", #selector(openProject)),
                            ("save", "Save project", "square.and.arrow.down", #selector(saveProject)),
-                           ("reveal", "Show project in Finder", "folder.badge.gearshape", #selector(revealProjectFiles))]
+                           ("reveal", "Show project in Finder", "folder.badge.gearshape", #selector(revealProjectFiles)),
+                           ("cleanup", "Clean Up Project Folder", "trash", #selector(cleanProjectFolder))]
         let fileViews = fileActions.map { id, label, image, action -> NSButton in
             let control = button(label, image, action); projectFileButtons[id] = control; return control
         }
@@ -1563,6 +1564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             projectFileButtons[name]?.isEnabled = !editor.busy
         }
         projectFileButtons["reveal"]?.isEnabled = editor.projectURL != nil
+        projectFileButtons["cleanup"]?.isEnabled = editor.projectURL != nil && !editor.busy
         exportButton.isEnabled = editor.canExport
         masterVolumeControl.configure(track: editor.project.masterTrack, meter: editor.displayedTrackMeter(editor.project.masterTrack),
                                       active: editor.isMeteringAudio, recording: false, enabled: editor.canAdjustTrackMix, showsPeaks: true)
@@ -1597,7 +1599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if editor.isInstallingPlugin { editor.pluginInstaller?.cancel(); return false }
         if editor.isExporting { editor.exporter?.cancel(); return false }
-        if editor.isImporting { editor.importer?.cancel(); return false }
+        if editor.isImporting { editor.importer?.cancel(); editor.mediaCleaner?.cancel(); return false }
         if editor.isOpening { editor.projectOpener?.cancel(); return false }
         if editor.isRecording { editor.stop() }
         closingConfirmed = editor.confirmDiscard()
@@ -1613,7 +1615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if editor.isInstallingPlugin { editor.pluginInstaller?.cancel(); return .terminateCancel }
         if editor.isExporting { editor.exporter?.cancel(); return .terminateCancel }
-        if editor.isImporting { editor.importer?.cancel(); return .terminateCancel }
+        if editor.isImporting { editor.importer?.cancel(); editor.mediaCleaner?.cancel(); return .terminateCancel }
         if editor.isOpening { editor.projectOpener?.cancel(); return .terminateCancel }
         if closingConfirmed { editor.shutdownLivePlugins(); return .terminateNow }
         if editor.isRecording { editor.stop() }
@@ -1807,6 +1809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         return false
     }
+    @objc func cleanProjectFolder() { finishNameEditing(); editor.cleanProjectMedia() }
     @objc func revealProjectFiles() {
         guard let url = editor.projectURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
@@ -2027,6 +2030,9 @@ if CommandLine.arguments.contains("--plugin-install-test") {
     let archiveIndex = CommandLine.arguments.firstIndex(of: "--plugin-archives")
     let directory = archiveIndex.flatMap { $0 + 1 < CommandLine.arguments.count ? URL(fileURLWithPath: CommandLine.arguments[$0 + 1]) : nil }
     do { try runPluginInstallationTests(archives: directory); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+if CommandLine.arguments.contains("--media-cleanup-test") {
+    do { try runProjectMediaCleanupTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if CommandLine.arguments.contains("--self-test") {
     do { try runAudioTests(); exit(0) } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }

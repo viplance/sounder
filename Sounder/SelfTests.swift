@@ -787,6 +787,7 @@ func runTrackMeterTests() throws {
 }
 
 func runProjectStorageTests() throws {
+    try runProjectMediaCleanupTests()
     func check(_ value: Bool, _ message: String) throws {
         guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
     }
@@ -887,6 +888,59 @@ func runProjectStorageTests() throws {
     try JSONEncoder().encode(escape).write(to: escapeURL)
     rejected = false; do { _ = try ProjectStorage.load(from: escapeURL) } catch { rejected = true }
     try check(rejected, "Project media references cannot escape the containing project folder")
+}
+
+func runProjectMediaCleanupTests() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("SounderCleanup-" + UUID().uuidString)
+    defer { try? fm.removeItem(at: root) }
+    let media = root.appendingPathComponent("media")
+    try fm.createDirectory(at: media.appendingPathComponent("nested"), withIntermediateDirectories: true)
+    func file(_ name: String) throws -> URL {
+        let url = media.appendingPathComponent(name)
+        try Data([0, 1, 2]).write(to: url); return url
+    }
+    func check(_ value: Bool, _ message: String) throws {
+        guard value else { throw SounderError.message(message) }; print("PASS: \(message)")
+    }
+    let live = try file("live.wav"), history = try file("history.wav"), clipboard = try file("clipboard.wav")
+    let saved = try file("saved.wav"), shared = try file("shared.wav"), unused = try file("nested/unused.wav")
+    let note = try file("notes.txt")
+    let outside = root.appendingPathComponent("outside.wav"); try Data([3]).write(to: outside)
+    let link = media.appendingPathComponent("linked.wav")
+    try fm.createSymbolicLink(at: link, withDestinationURL: outside)
+    func document(_ name: String, source: URL) throws -> URL {
+        var track = Track(name: name)
+        track.clips = [Clip(name: name, source: "media/" + source.lastPathComponent, start: 0, duration: 1, order: 1)]
+        let url = root.appendingPathComponent(name + ".sounder")
+        try JSONEncoder().encode(Project(tracks: [track])).write(to: url); return url
+    }
+    let project = try document("Current", source: saved)
+    _ = try document("Other", source: shared)
+    let candidates = try ProjectMediaCleanup.candidates(projectURL: project, sources: [live.path, history.path, clipboard.path])
+    try check(candidates.map { $0.standardizedFileURL.resolvingSymlinksInPath().path } == [unused.standardizedFileURL.resolvingSymlinksInPath().path], "Cleanup preserves live, history, clipboard and all saved-project references; finds nested unused audio")
+    try check(fm.fileExists(atPath: note.path) && fm.fileExists(atPath: outside.path) && fm.fileExists(atPath: link.path), "Cleanup scanning leaves non-audio files and external symlinks intact")
+    var cancelled = false
+    do { _ = try ProjectMediaCleanup.candidates(projectURL: project, sources: [], cancelled: { true }) }
+    catch is CancellationError { cancelled = true }
+    try check(cancelled, "Media cleanup scanning supports cancellation before deleting files")
+    let broken = root.appendingPathComponent("Broken.sounder"); try Data("invalid".utf8).write(to: broken)
+    var rejected = false
+    do { _ = try ProjectMediaCleanup.candidates(projectURL: project, sources: []) } catch { rejected = true }
+    try check(rejected && fm.fileExists(atPath: unused.path), "Unreadable shared projects abort cleanup without deleting media")
+    try fm.removeItem(at: broken)
+    rejected = false
+    do { try ProjectMediaCleanup.moveToTrash(outside, projectURL: project) } catch { rejected = true }
+    try check(rejected && fm.fileExists(atPath: outside.path), "Cleanup refuses to trash files outside project media")
+    let trashed = try ProjectMediaCleanup.moveToTrash(candidates[0], projectURL: project)
+    defer { if let trashed { try? fm.removeItem(at: trashed) } }
+    try check(!fm.fileExists(atPath: unused.path) && trashed.map { fm.fileExists(atPath: $0.path) } == true,
+              "Unused media moves to macOS Trash and remains recoverable")
+    try fm.removeItem(at: media)
+    try fm.createSymbolicLink(at: media, withDestinationURL: root)
+    rejected = false
+    do { _ = try ProjectMediaCleanup.candidates(projectURL: project, sources: []) } catch { rejected = true }
+    try check(rejected, "Cleanup refuses a media folder linked to another directory")
 }
 
 func runRecordedMediaMoveTests() throws {

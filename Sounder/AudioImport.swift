@@ -1,6 +1,132 @@
 import AppKit
 import UniformTypeIdentifiers
 
+enum ProjectMediaCleanup {
+    @discardableResult static func moveToTrash(_ file: URL, projectURL: URL) throws -> URL? {
+        let media = projectURL.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath().appendingPathComponent("media")
+        let values = try file.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+        guard values.isSymbolicLink != true, values.isRegularFile == true,
+              file.standardizedFileURL.path.hasPrefix(media.path + "/"),
+              file.resolvingSymlinksInPath().path == file.standardizedFileURL.path else {
+            throw SounderError.message("Media changed during cleanup. Please try again.")
+        }
+        var destination: NSURL?
+        try FileManager.default.trashItem(at: file, resultingItemURL: &destination)
+        return destination as URL?
+    }
+    static func candidates(projectURL: URL, sources: Set<String>, cancelled: () -> Bool = { false },
+                           progress: (String) -> Void = { _ in }) throws -> [URL] {
+        let fm = FileManager.default
+        let folder = projectURL.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+        let media = folder.appendingPathComponent("media", isDirectory: true)
+        guard fm.fileExists(atPath: media.path) else { return [] }
+        guard try media.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+            throw SounderError.message("Cannot clean a linked media folder.")
+        }
+        var retained = Set(sources.map { URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path })
+        // Several saved documents may share the sibling media directory. Read all
+        // references before touching any file; unreadable documents abort cleanup.
+        for document in try fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) where document.pathExtension.lowercased() == "sounder" {
+            if cancelled() { throw CancellationError() }
+            let project = try ProjectStorage.load(from: document)
+            retained.formUnion(project.tracks.flatMap(\.clips).map { URL(fileURLWithPath: $0.source).standardizedFileURL.resolvingSymlinksInPath().path })
+        }
+        var enumerationError: Error?
+        guard let enumerator = fm.enumerator(at: media, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], options: [], errorHandler: { _, error in
+            enumerationError = error; return false
+        }) else { throw SounderError.message("Cannot read the project media folder.") }
+        var unused: [URL] = []
+        for case let file as URL in enumerator {
+            if cancelled() { throw CancellationError() }
+            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            if values.isSymbolicLink == true { enumerator.skipDescendants(); continue }
+            guard values.isRegularFile == true,
+                  UTType(filenameExtension: file.pathExtension)?.conforms(to: .audio) == true else { continue }
+            progress(file.lastPathComponent)
+            let path = file.standardizedFileURL.resolvingSymlinksInPath().path
+            guard path.hasPrefix(media.path + "/"), !retained.contains(path) else { continue }
+            unused.append(file)
+        }
+        if let enumerationError { throw enumerationError }
+        return unused
+    }
+}
+
+final class ProjectMediaCleanupController: NSObject, NSWindowDelegate {
+    weak var editor: Editor?
+    let projectURL: URL
+    let sources: Set<String>
+    private(set) var isRunning = false
+    private(set) var window: NSWindow!
+    private let progress = NSProgressIndicator()
+    private let status = NSTextField(labelWithString: "Scanning project media…")
+    private let button = PointerButton()
+    private let lock = NSLock()
+    private var cancelled = false
+    private var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    init(editor: Editor, projectURL: URL, sources: Set<String>) {
+        self.editor = editor; self.projectURL = projectURL; self.sources = sources
+        super.init()
+    }
+    func start() {
+        isRunning = true
+        window = PopupWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 130))
+        window.title = "Clean Up Project Folder"; window.delegate = self; window.isReleasedWhenClosed = false
+        let root = PopupBackgroundView(); window.contentView = root
+        status.frame = NSRect(x: 22, y: 91, width: 516, height: 20)
+        status.font = .systemFont(ofSize: 12); status.lineBreakMode = .byTruncatingMiddle; root.addSubview(status)
+        progress.frame = NSRect(x: 22, y: 66, width: 516, height: 14)
+        progress.isIndeterminate = true; progress.maxValue = 1; root.addSubview(progress); progress.startAnimation(nil)
+        button.title = "Cancel"; button.target = self; button.action = #selector(pressButton)
+        button.frame = NSRect(x: 426, y: 12, width: 112, height: 30); root.addSubview(button)
+        window.center(); window.makeKeyAndOrderFront(nil); editor?.update()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var failure: Error?
+            do {
+                var lastUpdate = ProcessInfo.processInfo.systemUptime
+                let files = try ProjectMediaCleanup.candidates(projectURL: projectURL, sources: sources, cancelled: { self.isCancelled }, progress: { name in
+                    let now = ProcessInfo.processInfo.systemUptime
+                    if now - lastUpdate >= 0.05 {
+                        lastUpdate = now
+                        DispatchQueue.main.async { self.status.stringValue = "Scanning: " + name }
+                    }
+                })
+                DispatchQueue.main.async { self.progress.stopAnimation(nil); self.progress.isIndeterminate = false }
+                for (index, file) in files.enumerated() {
+                    if isCancelled { throw CancellationError() }
+                    // Recheck links immediately before moving the directory entry.
+                    try ProjectMediaCleanup.moveToTrash(file, projectURL: projectURL)
+                    let fraction = Double(index + 1) / Double(files.count)
+                    let now = ProcessInfo.processInfo.systemUptime
+                    if index == files.count - 1 || now - lastUpdate >= 0.05 {
+                        lastUpdate = now
+                        DispatchQueue.main.async {
+                            self.progress.doubleValue = fraction
+                            self.status.stringValue = "Moving unused media to Trash · \(index + 1)/\(files.count)"
+                        }
+                    }
+                }
+                if isCancelled { throw CancellationError() }
+            } catch { failure = error }
+            let result = failure
+            DispatchQueue.main.async { [self] in
+                isRunning = false; window.orderOut(nil)
+                if let result {
+                    if !(result is CancellationError) { editor?.error(result) }
+                } else { editor?.notifications.show("Project media folder cleaned up", style: .error) }
+                if editor?.mediaCleaner === self { editor?.mediaCleaner = nil }
+                editor?.update()
+            }
+        }
+    }
+    func cancel() {
+        lock.lock(); cancelled = true; lock.unlock()
+        button.title = "Cancelling…"; button.isEnabled = false
+    }
+    @objc private func pressButton() { cancel() }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { cancel(); return false }
+}
+
 /// Finder publishes file URLs; some file managers still publish a filename array.
 enum AudioFileDrop {
     static let filenames = NSPasteboard.PasteboardType("NSFilenamesPboardType")
