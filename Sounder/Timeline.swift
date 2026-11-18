@@ -908,7 +908,7 @@ final class Timeline: NSView {
         controlsOverlay.addSubview(sidebarSurface); controlsOverlay.addSubview(rulerSurface)
         controlsOverlay.addSubview(playheadView); controlsOverlay.addSubview(nameField)
         scrollSurface.paint = { [weak self] rect, ruler in
-            if ruler { self?.drawRulerContent(in: rect) } else { self?.draw(rect) }
+            if ruler { self?.drawRulerContent(in: rect) } else { self?.drawBody(in: rect) }
         }
         sidebarSurface.paint = { [weak self] in self?.drawTrackHeaders(in: $0) }
         rulerSurface.paint = { [weak self] in self?.drawRuler(in: $0) }
@@ -1715,13 +1715,39 @@ final class Timeline: NSView {
         return dimmed.union(Set(tracks.map(\.id)).subtracting(TrackSoloRouting(tracks: tracks).dry))
     }
     override func draw(_ dirtyRect: NSRect) {
-        fill(bounds, background)
+        // Submit completed pixels to AppKit. Window drawing may be deferred,
+        // whereas waveform tiles switch contexts while the body is being painted.
+        let area = dirtyRect.intersection(bounds)
+        guard !area.isEmpty else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        let left = floor(area.minX * scale) / scale, top = floor(area.minY * scale) / scale
+        let right = ceil(area.maxX * scale) / scale, bottom = ceil(area.maxY * scale) / scale
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSBezierPath(rect: area).addClip()
+        for y in stride(from: top, to: bottom, by: 512) {
+            for x in stride(from: left, to: right, by: 512) {
+                let tile = NSRect(x: x, y: y, width: min(512, right - x), height: min(512, bottom - y))
+                guard let bitmap = TimelineScrollSurface.raster(in: tile, scale: scale, paint: { drawBody(in: tile) }) else {
+                    drawBody(in: tile)
+                    continue
+                }
+                bitmap.size = tile.size
+                let image = NSImage(size: tile.size)
+                image.addRepresentation(bitmap)
+                image.draw(in: tile, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.none])
+            }
+        }
+    }
+    private func drawBody(in dirtyRect: NSRect) {
+        fill(dirtyRect, background)
         let dimmed = dimmedTrackIDs()
         for (index, item) in rows.enumerated() {
             let track = item.0; let y = ruler + CGFloat(index) * rowHeight
             let trackDimmed = dimmed.contains(track.id)
+            let separator = NSRect(x: dirtyRect.minX, y: y + rowHeight - 0.5, width: dirtyRect.width, height: 1).intersection(dirtyRect)
+            if !separator.isEmpty { fill(separator, .white.withAlphaComponent(0.065)) }
             if !NSRect(x: 0, y: y, width: bounds.width, height: rowHeight).intersects(dirtyRect) { continue }
-            line(NSPoint(x: 0, y: y + rowHeight), NSPoint(x: bounds.width, y: y + rowHeight), .white.withAlphaComponent(0.065))
             let clips = displayedClips(for: track)
             for (layer, clip) in clips.enumerated() {
                 guard clipRect(clip, row: index, layer: 0).insetBy(dx: -4, dy: -4).intersects(dirtyRect) else { continue }
@@ -1750,7 +1776,8 @@ final class Timeline: NSView {
         for tick in rulerTicks(in: dirtyRect) {
             let x = header + tick.time * editor.zoom
             let alpha = editor.project.tempoMode ? (tick.isBar ? 0.10 : 0.035) : 0.045
-            line(NSPoint(x: x, y: ruler), NSPoint(x: x, y: bounds.height), NSColor.white.withAlphaComponent(alpha))
+            let gridLine = NSRect(x: x - 0.5, y: ruler, width: 1, height: bounds.height - ruler).intersection(dirtyRect)
+            if !gridLine.isEmpty { fill(gridLine, .white.withAlphaComponent(alpha)) }
         }
         if let guideTime = audioDropTime ?? fragmentSnapTime {
             NSGraphicsContext.saveGraphicsState()

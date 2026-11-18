@@ -68,18 +68,22 @@ final class TimelineScrollSurface: NSView {
     private func makeTile(in rect: NSRect, ruler: Bool, scale: CGFloat) -> CALayer {
         let tile = CALayer()
         tile.frame.size = rect.size; tile.contentsScale = scale
-        guard rect.height > 0,
+        tile.contents = Self.raster(in: rect, scale: scale) { paint?(rect, ruler) }?.cgImage
+        return tile
+    }
+
+    static func raster(in rect: NSRect, scale: CGFloat, paint: () -> Void) -> NSBitmapImageRep? {
+        guard rect.width > 0, rect.height > 0,
               let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(ceil(rect.width * scale)), pixelsHigh: Int(ceil(rect.height * scale)), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
-              let graphics = NSGraphicsContext(bitmapImageRep: bitmap) else { return tile }
+              let graphics = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
         NSGraphicsContext.saveGraphicsState()
         let context = graphics.cgContext
         context.translateBy(x: 0, y: CGFloat(bitmap.pixelsHigh)); context.scaleBy(x: scale, y: -scale)
         context.translateBy(x: -rect.minX, y: -rect.minY)
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
         NSBezierPath(rect: rect).addClip()
-        paint?(rect, ruler)
+        paint()
         NSGraphicsContext.restoreGraphicsState()
-        tile.contents = bitmap.cgImage
-        return tile
+        return bitmap
     }
 }
