@@ -8,8 +8,8 @@ func runPluginInstallationTests(archives: URL? = nil) throws {
         guard condition else { throw SounderError.message(message) }; print("PASS: \(message)")
     }
     let catalog = try PluginCatalog.bundled.get()
-    try check(catalog.count == 9 && Set(catalog.map(\.bundleIdentifier)).count == 9,
-              "The bundled JSON contains nine distinct macOS VST3 plug-ins")
+    try check(catalog.count == 10 && Set(catalog.map(\.bundleIdentifier)).count == 10,
+              "The bundled JSON contains ten distinct macOS VST3 plug-ins")
     let nova = catalog.first { $0.id == "nova" }!
     let picker = PluginPicker(frame: NSRect(x: 0, y: 0, width: 221, height: 30))
     picker.results.dataSource = picker; picker.results.delegate = picker
@@ -82,8 +82,24 @@ func runPluginInstallationTests(archives: URL? = nil) throws {
     try check(activations == 2, "A microphone setup failure also releases the deferred plug-in selection")
     guard archives != nil || downloading else { return }
     let destination = directory.appendingPathComponent("VST3")
-    for plugin in (downloading ? Array(catalog.prefix(1)) : catalog) {
+    let selectedID = CommandLine.arguments.firstIndex(of: "--plugin-id").flatMap { $0 + 1 < CommandLine.arguments.count ? CommandLine.arguments[$0 + 1] : nil }
+    if let selectedID { try check(catalog.contains { $0.id == selectedID }, "The requested catalog plug-in exists") }
+    for plugin in (downloading ? Array(catalog.prefix(1)) : catalog).filter({ selectedID == nil || $0.id == selectedID }) {
         let source = archives?.appendingPathComponent(plugin.id + "." + plugin.archive.rawValue)
+        if plugin.archive == .dmg, let source {
+            let temporary = FileManager.default.temporaryDirectory
+            let before = Set(try FileManager.default.contentsOfDirectory(atPath: temporary.path).filter { $0.hasPrefix("SounderPlugin-") })
+            let cancellation = PluginInstallController(plugin: plugin, destinationDirectory: directory.appendingPathComponent("cancelled-dmg"))
+            cancellation.start(localArchive: source)
+            let deadline = Date().addingTimeInterval(10)
+            while cancellation.isRunning && cancellation.fraction < 0.80 && Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.005))
+            }
+            cancellation.cancel(); try wait(cancellation)
+            let after = Set(try FileManager.default.contentsOfDirectory(atPath: temporary.path).filter { $0.hasPrefix("SounderPlugin-") })
+            try check(cancellation.failure is CancellationError && after.subtracting(before).isEmpty && !FileManager.default.fileExists(atPath: cancellation.destinationDirectory.path),
+                      "Cancelling DMG preparation detaches the image and removes temporary files without installing")
+        }
         let job = PluginInstallController(plugin: plugin, destinationDirectory: destination)
         var installed: URL?
         job.completed = { if case .success(let url) = $0 { installed = url } }
@@ -112,9 +128,10 @@ extension AppDelegate {
         rack.plugins.setPlugins([]); rack.plugins.showPicker()
         let picker = rack.plugins
         picker.results.layoutSubtreeIfNeeded()
-        guard picker.results.numberOfRows == 9, picker.catalogMatches.count == 9,
+        let catalogCount = try PluginCatalog.bundled.get().count
+        guard picker.results.numberOfRows == catalogCount, picker.catalogMatches.count == catalogCount,
               let view = picker.popover.contentViewController?.view else { throw SounderError.message("Missing catalog rows") }
-        for index in 0..<9 {
+        for index in 0..<catalogCount {
             guard let row = picker.results.view(atColumn: 0, row: index, makeIfNecessary: true) as? CatalogPluginRow,
                   row.install.title == "Install", row.install.isEnabled else { throw SounderError.message("Missing Install action") }
             row.layoutSubtreeIfNeeded()
@@ -129,6 +146,6 @@ extension AppDelegate {
             let path = URL(fileURLWithPath: CommandLine.arguments[index + 1]).deletingPathExtension().appendingPathExtension("catalog.png")
             try bitmap.representation(using: .png, properties: [:])?.write(to: path)
         }
-        print("PASS: FX catalog renders nine right-aligned Install buttons and selection remains side-effect free")
+        print("PASS: FX catalog renders \(catalogCount) right-aligned Install buttons and selection remains side-effect free")
     }
 }

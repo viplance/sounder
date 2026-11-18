@@ -3,7 +3,7 @@ import CryptoKit
 import Foundation
 
 struct CatalogPlugin: Codable, Identifiable {
-    enum Archive: String, Codable { case zip, pkg }
+    enum Archive: String, Codable { case zip, pkg, dmg }
     let id: String
     let name: String
     let maker: String
@@ -146,22 +146,33 @@ final class PluginInstallController: NSObject, NSWindowDelegate, URLSessionDownl
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error { worker.async { [self] in finish(.failure(isCancelled ? CancellationError() : error)) } }
     }
-    private func run(_ executable: String, _ arguments: [String]) throws -> String {
-        try check()
+    // Only the installation worker accesses this mount. Attach/detach finish
+    // before honoring cancellation so a helper cannot mount it after cleanup.
+    private var mountedImage: URL?
+    private func run(_ executable: String, _ arguments: [String], cancellable: Bool = true) throws -> String {
+        if cancellable { try check() }
         let task = Process(); task.executableURL = URL(fileURLWithPath: executable); task.arguments = arguments
         let log = workDirectory.appendingPathComponent(UUID().uuidString + ".log")
         FileManager.default.createFile(atPath: log.path, contents: nil)
         let handle = try FileHandle(forWritingTo: log); defer { try? handle.close(); try? FileManager.default.removeItem(at: log) }
         task.standardOutput = handle; task.standardError = handle
         lock.lock()
-        do { if cancelled { throw CancellationError() }; process = task; try task.run(); lock.unlock() }
+        do { if cancellable && cancelled { throw CancellationError() }; if cancellable { process = task }; try task.run(); lock.unlock() }
         catch { process = nil; lock.unlock(); throw error }
         task.waitUntilExit()
         lock.lock(); process = nil; lock.unlock()
-        try check()
+        if cancellable { try check() }
         let output = String(decoding: (try? Data(contentsOf: log)) ?? Data(), as: UTF8.self)
         guard task.terminationStatus == 0 else { throw SounderError.message("Cannot prepare \(plugin.name): " + output.trimmingCharacters(in: .whitespacesAndNewlines)) }
         return output
+    }
+    private func detachImage() throws {
+        guard let mount = mountedImage else { return }
+        // A failed/cancelled attach may never have created a mounted volume.
+        guard (try? mount.resourceValues(forKeys: [.isVolumeKey]).isVolume) == true else { mountedImage = nil; return }
+        do { _ = try run("/usr/bin/hdiutil", ["detach", mount.path], cancellable: false) }
+        catch { _ = try run("/usr/bin/hdiutil", ["detach", "-force", mount.path], cancellable: false) }
+        mountedImage = nil
     }
     private func relativeFiles(in directory: URL) -> [(String, URL)] {
         // Keep the enumerator's relative names. URL enumerators can change
@@ -185,6 +196,23 @@ final class PluginInstallController: NSObject, NSWindowDelegate, URLSessionDownl
             let listing = try run("/usr/bin/unzip", ["-Z1", archive.path])
             guard listing.split(separator: "\n").allSatisfy({ !$0.hasPrefix("/") && !$0.split(separator: "/").contains("..") }) else { throw SounderError.message("Unsafe paths in the plug-in archive") }
             _ = try run("/usr/bin/ditto", ["-x", "-k", archive.path, root.path])
+        }
+        if plugin.archive == .dmg {
+            try check()
+            let mount = workDirectory.appendingPathComponent("mounted")
+            mountedImage = mount
+            _ = try run("/usr/bin/hdiutil", ["attach", archive.path, "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", mount.path], cancellable: false)
+            try check()
+            if let source = bundle(in: mount) {
+                try check(); try FileManager.default.copyItem(at: source, to: root.appendingPathComponent(plugin.bundleName))
+            } else {
+                let packages = files(in: mount).filter { $0.pathExtension == "pkg" && !$0.deletingLastPathComponent().path.contains(".pkg/") }
+                for (index, package) in packages.enumerated() {
+                    try check()
+                    try FileManager.default.copyItem(at: package, to: root.appendingPathComponent("installer-\(index).pkg"))
+                }
+            }
+            try detachImage()
         }
         if let bundle = bundle(in: root) { return bundle }
         let packages = plugin.archive == .pkg ? [archive] : files(in: root).filter { $0.pathExtension == "pkg" && !$0.deletingLastPathComponent().path.contains(".pkg/") }
@@ -267,18 +295,25 @@ final class PluginInstallController: NSObject, NSWindowDelegate, URLSessionDownl
         finish(result)
     }
     private func finish(_ result: Result<URL, Error>) {
-        try? FileManager.default.removeItem(at: workDirectory)
+        var result = result
+        if mountedImage != nil {
+            do { try detachImage() }
+            catch { if case .success = result { result = .failure(error) } }
+        }
+        // Never recurse into a disk image if macOS could not detach it.
+        if mountedImage == nil { try? FileManager.default.removeItem(at: workDirectory) }
+        let completedResult = result
         lock.lock(); let session = session; self.session = nil; download = nil; lock.unlock()
         session?.finishTasksAndInvalidate()
         DispatchQueue.main.async { [self] in
             guard isRunning else { return }
             isRunning = false; row.progress.isIndeterminate = false; row.progress.stopAnimation(nil)
             button.title = "Close"; button.isEnabled = true
-            switch result {
+            switch completedResult {
             case .success: fraction = 1; row.update(fraction: 1, phase: "Ready")
             case .failure(let error): failure = error; row.update(fraction: fraction, phase: error is CancellationError ? "Cancelled" : "Failed: " + error.localizedDescription)
             }
-            stateChanged?(); let callback = completed; completed = nil; callback?(result)
+            stateChanged?(); let callback = completed; completed = nil; callback?(completedResult)
             if failure == nil || failure is CancellationError { close() }
         }
     }

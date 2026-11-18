@@ -111,7 +111,7 @@
     "category": "Amp modeler",
     "version": "0.0.12",
     "homepage": "https://www.tone3000.com/plugin/download",
-    "description": "NAM amp/cab models. Online tones need a free account; local NAM/IR files work offline.",
+    "description": "NAM amp/cab models.",
     "downloadURL": "https://github.com/tone-3000/tone3000-plugin/releases/download/v0.0.12/TONE3000-v0.0.12-macos-universal.pkg",
     "archive": "pkg",
     "sha256": "c1f09461522076385e4060caa9bf583afb6a6ca96155acb5b52728d8a2266fa7",
@@ -133,5 +133,20 @@
     "downloadBytes": 40306232,
     "bundleName": "Auburn Sounds Renegate.vst3",
     "bundleIdentifier": "com.auburnsounds.vst3.Renegate"
+  },
+  {
+    "id": "spacemodulator",
+    "name": "Valhalla Space Modulator",
+    "maker": "Valhalla DSP",
+    "category": "Modulation",
+    "version": "1.2.8",
+    "homepage": "https://valhalladsp.com/shop/modulation/valhalla-space-modulator/",
+    "description": "Flanging, doubling, detuning and evolving modulation effects.",
+    "downloadURL": "https://valhallaproduction.s3.us-west-2.amazonaws.com/spacemod/ValhallaSpaceModulatorOSX_1_2_8.dmg",
+    "archive": "dmg",
+    "sha256": "12033f7f35e97e6e06e3852e42f50caff17165bc6e79696d6837d61b34858598",
+    "downloadBytes": 8905760,
+    "bundleName": "ValhallaSpaceModulator.vst3",
+    "bundleIdentifier": "com.ValhallaDSP.ValhallaSpaceModulator"
   }
 ]

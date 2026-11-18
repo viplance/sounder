@@ -1,6 +1,6 @@
 # Downloadable VST3 catalog
 
-`PluginCatalog.json` is the local source of truth and is copied into the app bundle by Xcode. Downloads were checked on 2026-11-09. All nine archives contain native Apple Silicon VST3 binaries. The app downloads directly from the manufacturer or the manufacturer's linked file host; it does not redistribute their binaries.
+`PluginCatalog.json` is the local source of truth and is copied into the app bundle by Xcode. The initial nine downloads were checked on 2026-11-09; Valhalla Space Modulator was checked on 2026-11-18. All ten archives contain native Apple Silicon VST3 binaries. The app downloads directly from the manufacturer or the manufacturer's linked file host; it does not redistribute their binaries.
 
 | Purpose | Plug-in | Official source | Selection evidence / notes |
 | --- | --- | --- | --- |
@@ -14,6 +14,8 @@
 | Amp modeling | TONE3000 0.0.12 | [Official download](https://www.tone3000.com/plugin/download) | Uses the producer's GitHub release linked by that page. [The producer's guide](https://www.tone3000.com/guides/tone3000-plugin) explains that loading online tones requires a free account; local NAM/IR files work offline. |
 | Noise gate | Auburn Sounds Renegate Free 1.6.0 | [Auburn Sounds](https://www.auburnsounds.com/products/Renegate.html) | [KVR user reviews](https://www.kvraudio.com/marketplace/renegate-by-auburn-sounds), including Free-edition feedback. Advanced Full-edition functions are not included. |
 
+| Flanger / modulation | Valhalla Space Modulator 1.2.8 | [Valhalla DSP](https://valhalladsp.com/shop/modulation/valhalla-space-modulator/) | Checked 2026-11-18: official DMG, SHA-256 `12033f7f35e97e6e06e3852e42f50caff17165bc6e79696d6837d61b34858598`, 8,905,760 bytes. The VST3 has native arm64 and a valid Valhalla DSP signature; no activation is required. Basic host DSP, parameter-state round-trip and 44.1/96 kHz stereo checks passed. The broader parallel-versus-serial DSP test exceeded its strict sample-comparison tolerance (maximum difference 0.0000218); sample-identical modulation across independent instances is not claimed. |
+
 ## Installation behavior
 
 The picker combines installed plug-ins with missing catalog entries. Search and arrow navigation never install anything. Only the row's **Install** button starts a download. After installation every open FX picker is rescanned; the selected plug-in is added once through the existing effect-add path and its editor opens. An installed plug-in has an ordinary row without Install. If a recording began while the download was in progress, insertion waits until recording finishes rather than interrupting the take.
@@ -24,11 +26,13 @@ Only the selected `.vst3` bundle is installed, under `~/Library/Audio/Plug-Ins/V
 
 ## Updating the catalog
 
-Each entry records a stable ID, display information, producer homepage, direct HTTPS download URL, archive type, SHA-256, byte count, expected VST3 bundle filename and bundle identifier. Some archives contain a macOS package; the app expands it as data without running installer scripts. Component packages whose payload starts at `Contents` are reconstructed only when their declared install location matches the expected VST3 filename.
+Each entry records a stable ID, display information, producer homepage, direct HTTPS download URL, archive type, SHA-256, byte count, expected VST3 bundle filename and bundle identifier. ZIP, PKG and DMG downloads are supported. DMGs are mounted read-only without opening Finder or running their contents; only the expected VST3 or contained packages are copied to temporary storage, then the image is detached, including on cancellation or failure. Some archives contain a macOS package; the app expands it as data without running installer scripts. Component packages whose payload starts at `Contents` are reconstructed only when their declared install location matches the expected VST3 filename.
 
 When updating an entry, download the producer's macOS archive, inspect the actual VST3/arm64 bundle, verify its signature, and update the version, size and SHA-256 together. Mutable producer download URLs intentionally fail verification when their contents change until the local catalog is updated. Do not substitute third-party mirrors or remove checksum verification.
 
-Run `Sounder --plugin-install-test` for picker/cancellation/corrupt-download checks. To exercise actual archives without touching the user's VST3 directory, put verified downloads in a temporary directory as `<id>.zip` / `<id>.pkg` and run `Sounder --plugin-install-test --plugin-archives /path/to/archives`. That optional check installs into a disposable directory and loads every bundle in the real VST3 host.
+Run `Sounder --plugin-install-test` for picker/cancellation/corrupt-download checks. To exercise actual archives without touching the user's VST3 directory, put verified downloads in a temporary directory as `<id>.zip` / `<id>.pkg` / `<id>.dmg` and run `Sounder --plugin-install-test --plugin-archives /path/to/archives`. That optional check installs into a disposable directory and loads every bundle in the real VST3 host.
 
 
 CanaryVoiceTune is downloaded from the developer HTTPS URL in PluginCatalog.json. No VST3 binaries or installation archives are shipped inside Sounder.app. Updates to the developer archive require a matching catalog checksum and byte count.
+
+To check only one downloaded archive, append `--plugin-id spacemodulator` (or another catalog ID) to the archive test command. The test destination remains disposable.
