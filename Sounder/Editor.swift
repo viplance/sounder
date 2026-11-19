@@ -1808,7 +1808,15 @@ final class Editor: NSObject {
         guard let settings = options.runModal() else { return }
         let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(filenameExtension: settings.format.rawValue) ?? .audio]
         panel.allowsOtherFileTypes = false
-        panel.nameFieldStringValue = projectName.replacingOccurrences(of: "/", with: "-") + "." + settings.format.rawValue
+        let previous = project.lastExportPath.map { URL(fileURLWithPath: $0) }
+        let previousFolder = previous?.deletingLastPathComponent()
+        if let previousFolder, (try? previousFolder.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+            panel.directoryURL = previousFolder
+        } else {
+            panel.directoryURL = projectURL?.deletingLastPathComponent()
+        }
+        let name = previous?.deletingPathExtension().lastPathComponent ?? projectName.replacingOccurrences(of: "/", with: "-")
+        panel.nameFieldStringValue = name + "." + settings.format.rawValue
         guard EditorModalBackdrop.run({ panel.runModal() }) == .OK, let url = panel.url else { return }
         do { try startAudioExport(to: url, settings: settings, range: options.selectedRange, metadata: options.metadata) } catch { self.error(error) }
     }
@@ -1830,9 +1838,11 @@ final class Editor: NSObject {
         finishAudioExport(to: url, settings: settings, metadata: exportedProject.metadata)
     }
     func finishAudioExport(to url: URL, settings: ExportSettings, metadata: AudioMetadata) {
-        if settings != project.exportSettings || !project.exportSettingsConfirmed || metadata != project.metadata {
+        let path = url.standardizedFileURL.path
+        if settings != project.exportSettings || !project.exportSettingsConfirmed || metadata != project.metadata || path != project.lastExportPath {
             guard checkpoint() else { return }; project.exportSettings = settings; project.exportSettingsConfirmed = true
             project.metadata = metadata
+            project.lastExportPath = path
         }
         notifications.show("Exported \(url.lastPathComponent)", style: .saved)
         update()

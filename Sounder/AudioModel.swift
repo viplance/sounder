@@ -355,6 +355,7 @@ struct Project: Codable {
     var playbackBufferSize: Int { playbackBufferFrames ?? PlaybackBufferSize.initialFrames }
     var exportSettings: ExportSettings?
     var exportSettingsConfirmed = false
+    var lastExportPath: String?
     var metadata = AudioMetadata()
     var tempo = 120.0
     var tempoMode = false
@@ -373,7 +374,7 @@ struct Project: Codable {
     }
 }
 extension Project {
-    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, masterEffectsBypassed, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, timelineRange, timelineCursor, timelineView, normalizationLevel, defaultInput, defaultOutput }
+    enum CodingKeys: String, CodingKey { case tracks, masterVolumeDB, masterEffects, masterEffectsBypassed, nextOrder, name, audioFormat, playbackBufferFrames, exportSettings, exportSettingsConfirmed, lastExportPath, metadata, tempo, tempoMode, metronomeEnabled, loopEnabled, timelineRange, timelineCursor, timelineView, normalizationLevel, defaultInput, defaultOutput }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         tracks = try values.decode([Track].self, forKey: .tracks)
@@ -389,6 +390,7 @@ extension Project {
         try audioFormat.validate()
         exportSettings = try values.decodeIfPresent(ExportSettings.self, forKey: .exportSettings)
         try exportSettings?.validate()
+        lastExportPath = try values.decodeIfPresent(String.self, forKey: .lastExportPath)
         metadata = try values.decodeIfPresent(AudioMetadata.self, forKey: .metadata) ?? AudioMetadata()
         try metadata.validate()
         // Earlier builds remembered dialog choices before a file was exported.

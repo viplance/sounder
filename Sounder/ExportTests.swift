@@ -107,12 +107,14 @@ func runExportTests() throws {
     do { try editor.export(to: directory.appendingPathComponent("invalid.mp3"), settings: invalid) } catch {}
     try check(editor.project.defaultExportSettings.sampleRate == 44_100 && !editor.project.exportSettingsConfirmed && editor.undoStack.count == priorUndo, "An unsuccessful export cannot replace the project's default export choices")
     settings.format = .wav; settings.sampleRate = 88_200
-    try editor.export(to: directory.appendingPathComponent("remembered.wav"), settings: settings)
+    let destination = directory.appendingPathComponent("remembered.wav")
+    try editor.export(to: destination, settings: settings)
     try check(editor.project.defaultExportSettings == settings && editor.project.exportSettingsConfirmed && editor.dirty, "A successful export becomes the next dialog's default and marks the project for Save")
     editor.projectURL = directory.appendingPathComponent("Saved.sounder")
     try check(editor.save(), "Project Save accepts the last selected export settings")
     let saved = try JSONDecoder().decode(Project.self, from: Data(contentsOf: editor.projectURL!))
     try check(saved.defaultExportSettings == settings && saved.exportSettingsConfirmed && saved.audioFormat == editor.project.audioFormat, "Saving and reopening preserves export choices independently of the project format")
+    try check(saved.lastExportPath == destination.standardizedFileURL.path, "Project Save persists the last successful export destination")
     var tagged = project
     tagged.metadata = AudioMetadata(trackName: "Ночной свет 🎵", artist: "Björk / Исполнитель", album: "Альбом", albumArtist: "Various — Артисты", composer: "Автор", genre: "Ambient", year: "2026", trackNumber: "3/12", discNumber: "1/2", copyright: "© 2026 Автор", comment: "Line one\nQuoted \"value=two\" \\")
     let expectedFrames = ["TIT2", "TPE1", "TALB", "TPE2", "TCOM", "TCON", "TYER", "TRCK", "TPOS", "TCOP", "COMM"]
