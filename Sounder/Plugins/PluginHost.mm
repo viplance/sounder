@@ -67,6 +67,7 @@ public:
 struct Engine {
     double rate;
     std::recursive_mutex mutex;
+    bool offline = false;
     int streamingChannels = 0;
     int64 streamingPosition = 0;
     VST3::Hosting::Module::Ptr module;
@@ -133,7 +134,7 @@ struct Engine {
             case 7: return self ? reinterpret_cast<intptr_t>(&self->legacyClock) : 0;
             case 16: return self ? self->rate : 48000;
             case 17: return blockSize;
-            case 23: return 2; // process in realtime mode on the render worker
+            case 23: return self && self->offline ? 4 : 2; // VST process level: offline or realtime
             case 32: if (ptr) std::strcpy((char *)ptr, "Sounder"); return 1;
             case 33: if (ptr) std::strcpy((char *)ptr, "Sounder"); return 1;
             case 34: return 1000;
@@ -270,7 +271,7 @@ struct Engine {
             for (int bus = 0; bus < component->getBusCount(kAudio, direction); ++bus) component->activateBus(kAudio, direction, bus, bus == 0);
             for (int bus = 0; bus < component->getBusCount(kEvent, direction); ++bus) component->activateBus(kEvent, direction, bus, direction == kInput && bus == 0);
         }
-        ProcessSetup setup {kRealtime, kSample32, blockSize, rate};
+        ProcessSetup setup {offline ? kOffline : kRealtime, kSample32, blockSize, rate};
         if (processor->setupProcessing(setup) != kResultOk) { fail(error, @"VST3 rejected the audio processing configuration."); return false; }
         if (!buffers.prepare(*component, blockSize, kSample32) || (ins > 0 && buffers.inputs[0].numChannels < 1) || buffers.outputs[0].numChannels < 1) { fail(error, @"VST3 audio buffers could not be configured."); return false; }
         if (component->setActive(true) != kResultOk) { fail(error, @"VST3 could not be activated."); return false; }
@@ -357,7 +358,7 @@ struct Engine {
         clock.projectTimeSamples = position; clock.continousTimeSamples = continuousPosition;
         clock.projectTimeMusic = double(position) / rate * clock.tempo / 60;
         continuousPosition += count;
-        buffers.numSamples = count; buffers.processMode = kRealtime; buffers.processContext = &clock;
+        buffers.numSamples = count; buffers.processMode = offline ? kOffline : kRealtime; buffers.processContext = &clock;
         buffers.inputParameterChanges = &changes; buffers.inputEvents = &events;
         auto result = processor->process(buffers);
         if (result != kResultOk) { fail(error, @"VST3 audio processing failed."); return false; }
@@ -456,13 +457,20 @@ struct Engine {
     if (_engine->streamingChannels == channels && (_engine->legacy || _engine->processing)) return YES;
     return [self beginStreaming:channels error:error];
 }
+- (BOOL)beginOfflineStreaming:(NSInteger)channels error:(NSError **)error {
+    return [self prepareStreaming:channels offline:YES error:error];
+}
 - (BOOL)beginStreaming:(NSInteger)channels error:(NSError **)error {
+    return [self prepareStreaming:channels offline:NO error:error];
+}
+- (BOOL)prepareStreaming:(NSInteger)channels offline:(BOOL)offline error:(NSError **)error {
     std::lock_guard<std::recursive_mutex> lock(_engine->mutex);
     if (channels != 1 && channels != 2) { fail(error, @"Invalid streaming channel count."); return NO; }
     if (_engine->legacy) { _engine->legacy->dispatch(_engine->legacy, 72, 0, 0, nullptr, 0); _engine->legacy->dispatch(_engine->legacy, 12, 0, 0, nullptr, 0); }
     if (_engine->processor && _engine->processing) _engine->processor->setProcessing(false);
     if (_engine->component && _engine->active) _engine->component->setActive(false);
     _engine->active = _engine->processing = false;
+    _engine->offline = offline;
     if (!_engine->prepare((int)channels, error)) return NO;
     _engine->streamingChannels = (int)channels; _engine->streamingPosition = 0;
     _engine->continuousPosition = 0; _engine->transportPlaying = true;

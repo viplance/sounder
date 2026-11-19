@@ -308,6 +308,14 @@ func runExportParityTest(path: String) throws {
     for effect in project.activeEffects {
         _ = try SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: project.audioFormat.sampleRate)
     }
+    if let index = CommandLine.arguments.firstIndex(of: "--selected-wav"), index + 1 < CommandLine.arguments.count,
+       let range = project.timelineRange {
+        var settings = ExportSettings(projectFormat: project.audioFormat)
+        settings.format = .wav
+        try AudioExporter.write(project: project, store: store, settings: settings,
+                                to: URL(fileURLWithPath: CommandLine.arguments[index + 1]), range: range.lowerBound..<range.upperBound)
+        return
+    }
     let offline = try AudioExporter.render(project: project, store: store)
     print("Preparing streaming mix")
     let graph = try StreamingGraph.make(project: project, store: store)

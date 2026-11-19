@@ -268,7 +268,7 @@ enum AudioExporter {
                        progress: (Double, String) -> Void = { _, _ in }) throws -> AudioSignal {
         store.configure(project.audioFormat)
         let channels = project.audioFormat.channels
-        let graph = try StreamingGraph.make(project: project, store: store, cancelled: cancelled)
+        let graph = try StreamingGraph.make(project: project, store: store, cancelled: cancelled, offline: true)
         try graph.seek(to: 0)
         var output = Array(repeating: [Float](repeating: 0, count: graph.totalFrames), count: channels)
         for first in stride(from: 0, to: graph.totalFrames, by: PlaybackBufferSize.blockFrames) {

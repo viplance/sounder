@@ -301,7 +301,7 @@ extension StreamingGraph {
     static func make(project: Project, store: AudioStore, hosts: [UUID: SNPluginHost]? = nil,
                      dryGraph: StreamingGraph? = nil, processedCache: ProcessedMixCache? = nil,
                      progress: (Int) -> Void = { _ in }, cancelled: () -> Bool = { false },
-                     preservePluginState: Bool = false, includeAudioSources: Bool = true) throws -> StreamingGraph {
+                     preservePluginState: Bool = false, includeAudioSources: Bool = true, offline: Bool = false) throws -> StreamingGraph {
         try StreamingGraph(project: project, store: store, dryGraph: dryGraph, processedCache: processedCache,
                            preparationProgress: progress, cancelled: cancelled, includeAudioSources: includeAudioSources) { effect in
             if cancelled() { throw CancellationError() }
@@ -313,7 +313,15 @@ extension StreamingGraph {
                 host = try SNPluginHost(path: effect.path, classID: effect.classID, state: effect.state, sampleRate: project.audioFormat.sampleRate)
             }
             let channels = project.audioFormat.channels
-            if preservePluginState { try host.ensureStreaming(channels) }
+            if offline {
+                try host.beginOfflineStreaming(channels)
+                // Restored VST3 parameters reach DSP in the first process call.
+                // Apply them on silence before fixing the graph's latency.
+                host.setTransportPlaying(false, position: 0, tempo: project.tempo)
+                let silence = Data(count: PlaybackBufferSize.blockFrames * channels * MemoryLayout<Float>.size)
+                _ = try host.processBlock(silence, channels: channels)
+            }
+            else if preservePluginState { try host.ensureStreaming(channels) }
             else { try host.beginStreaming(channels) }
             // Live transport owns its clock, including paused/retained hosts.
             if hosts == nil { host.setTransportPlaying(true, position: 0, tempo: project.tempo) }

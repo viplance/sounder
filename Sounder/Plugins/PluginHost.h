@@ -14,6 +14,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)sendMIDIStatus:(uint8_t)status data1:(uint8_t)data1 data2:(uint8_t)data2;
 - (void)allNotesOff;
 @property(nonatomic, readonly) uint64_t editRevision;
+- (BOOL)beginOfflineStreaming:(NSInteger)channels error:(NSError **)error;
 - (BOOL)beginStreaming:(NSInteger)channels error:(NSError **)error;
 - (nullable NSData *)processBlock:(NSData *)audio channels:(NSInteger)channels error:(NSError **)error;
 - (nullable instancetype)initWithPath:(NSString *)path classID:(NSString *)classID state:(nullable NSData *)state error:(NSError **)error;
